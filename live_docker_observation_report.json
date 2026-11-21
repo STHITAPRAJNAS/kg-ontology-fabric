@@ -1,0 +1,51 @@
+{
+  "docker_backends": {
+    "postgres_pgvector": "127.0.0.1:5434",
+    "neo4j_5": "127.0.0.1:7688"
+  },
+  "legacy_pgvector_tables_reverse_hydrated": 5,
+  "heterogeneous_vector_dims_live_sql": [
+    384,
+    768,
+    1024,
+    1536
+  ],
+  "postgres_unified_chunks_stored": 18,
+  "postgres_canonical_entity_vectors_stored": 23,
+  "neo4j_canonical_entities": 23,
+  "neo4j_active_edges": 19,
+  "neo4j_historical_superseded_edges": 2,
+  "pii_redaction_engine": "presidio_compatible_fallback",
+  "pii_redaction_audit_counts": {
+    "BEARER_JWT_TOKEN": 1,
+    "AWS_ACCESS_KEY_ID": 1,
+    "PHONE_NUMBER": 2,
+    "EMAIL_ADDRESS": 2,
+    "US_SSN": 1
+  },
+  "zero_raw_pii_leaked_in_postgres": true,
+  "vector_only_rag_recall": "3/9",
+  "vector_only_facts_found": [
+    "GDPR-Article-32",
+    "PCI-DSS-4.0",
+    "aurora-ledger-01"
+  ],
+  "enterprise_kg_fabric_recall": "9/9",
+  "enterprise_kg_fabric_facts_found": [
+    "CC-209-Global",
+    "CVE-2026-9981",
+    "GDPR-Article-32",
+    "PCI-DSS-4.0",
+    "WAF-Shield-Rule-904",
+    "api-edge-gw",
+    "aurora-ledger-01",
+    "eu-central-1",
+    "payment-router-01"
+  ],
+  "stale_facts_excluded_from_active_graph": true,
+  "sibling_canary_isolated": true,
+  "bitemporal_historical_june_2026_verified": true,
+  "incremental_watermark_100pct_skip_verified": true,
+  "cold_process_restart_persistence_verified": true,
+  "shacl_conformance_passed": true
+}

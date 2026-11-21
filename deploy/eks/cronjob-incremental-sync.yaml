@@ -1,0 +1,47 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: kg-fabric-incremental-sync
+  namespace: kg-ontology-fabric
+spec:
+  schedule: "*/15 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          serviceAccountName: kg-fabric-sa
+          restartPolicy: OnFailure
+          containers:
+            - name: incremental-kg-sync
+              image: 123456789012.dkr.ecr.us-east-1.amazonaws.com/enterprise-kg-ontology-fabric:0.1.0
+              command:
+                - python
+                - -c
+                - |
+                  import httpx, os
+                  api = os.environ.get("KG_FABRIC_INTERNAL_URL", "http://kg-fabric-api-svc.kg-ontology-fabric.svc.cluster.local")
+                  tenant = os.environ.get("TENANT_ID", "enterprise_default")
+                  # Trigger SHA-256 watermark delta build across all registered KBs
+                  r = httpx.post(
+                      f"{api}/v1/graph/build",
+                      json={"tenant_id": tenant, "incremental": True, "validate_shacl": True},
+                      timeout=300.0,
+                  )
+                  r.raise_for_status()
+                  print("Incremental KG Sync Report:", r.json())
+              env:
+                - name: KG_FABRIC_INTERNAL_URL
+                  value: "http://kg-fabric-api-svc.kg-ontology-fabric.svc.cluster.local"
+                - name: TENANT_ID
+                  value: "enterprise_default"
+              resources:
+                requests:
+                  cpu: "500m"
+                  memory: "1Gi"
+                limits:
+                  cpu: "2000m"
+                  memory: "4Gi"

@@ -1,0 +1,20 @@
+{
+  "total_registered_kbs": 121,
+  "heterogeneous_embedding_dims": [
+    384,
+    768,
+    1024,
+    1536
+  ],
+  "sampling_compression_ratio": 0.6237,
+  "synonym_alignment_verified": true,
+  "cross_kb_entity_resolution_verified": true,
+  "sibling_collision_guard_verified": true,
+  "bitemporal_active_state_verified": true,
+  "bitemporal_historical_point_in_time_verified": true,
+  "multihop_2hop_compliance_discovery_verified": true,
+  "incremental_watermark_skip_ratio": 0.999,
+  "bottom_up_emergent_ontology_promotion_verified": true,
+  "w3c_owl_shacl_turtle_bytes": 6936,
+  "shacl_conformance_passed": true
+}

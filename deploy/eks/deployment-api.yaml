@@ -1,0 +1,141 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kg-ontology-fabric
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kg-fabric-sa
+  namespace: kg-ontology-fabric
+  annotations:
+    # Bind EKS Pod Identity / IRSA for passwordless SigV4 access to Amazon Neptune,
+    # Amazon Bedrock, Amazon Aurora PostgreSQL (IAM Auth), and AWS Secrets Manager.
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/eks-kg-ontology-fabric-role
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kg-fabric-api
+  namespace: kg-ontology-fabric
+  labels:
+    app: kg-fabric-api
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: kg-fabric-api
+  template:
+    metadata:
+      labels:
+        app: kg-fabric-api
+    spec:
+      serviceAccountName: kg-fabric-sa
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: kg-fabric-api
+      containers:
+        - name: api
+          image: 123456789012.dkr.ecr.us-east-1.amazonaws.com/enterprise-kg-ontology-fabric:0.1.0
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: AWS_REGION
+              value: "us-east-1"
+            - name: GRAPH_BACKEND
+              value: "neptune"
+            - name: NEPTUNE_ENDPOINT
+              value: "https://kg-fabric-cluster.cluster-xxxx.us-east-1.neptune.amazonaws.com:8182"
+            - name: PGVECTOR_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: kg-fabric-db-secrets
+                  key: aurora_pgvector_dsn
+            - name: PII_REDACTION_MODE
+              value: "replace_tag"
+            - name: PII_HMAC_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: kg-fabric-db-secrets
+                  key: pii_hmac_key
+          resources:
+            requests:
+              cpu: "1000m"
+              memory: "2Gi" # Accommodates pre-loaded Presidio + spaCy en_core_web_lg in memory
+            limits:
+              cpu: "2000m"
+              memory: "4Gi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 20
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kg-fabric-api-svc
+  namespace: kg-ontology-fabric
+spec:
+  type: ClusterIP
+  selector:
+    app: kg-fabric-api
+  ports:
+    - port: 80
+      targetPort: 8080
+      protocol: TCP
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: kg-fabric-api-hpa
+  namespace: kg-ontology-fabric
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: kg-fabric-api
+  minReplicas: 3
+  maxReplicas: 15
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 65
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: kg-fabric-alb-ingress
+  namespace: kg-ontology-fabric
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internal
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/healthcheck-path: /health
+spec:
+  rules:
+    - host: kg-fabric.internal.enterprise.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: kg-fabric-api-svc
+                port:
+                  number: 80

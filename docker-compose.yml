@@ -1,0 +1,30 @@
+services:
+  kg-fabric-postgres:
+    image: pgvector/pgvector:pg16
+    container_name: kg-fabric-postgres
+    environment:
+      POSTGRES_USER: ${KG_FABRIC_PG_USER:-kg_admin}
+      POSTGRES_PASSWORD: ${KG_FABRIC_PG_PASS:-local_dev_only}
+      POSTGRES_DB: enterprise_kg_fabric
+    ports:
+      - "5434:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kg_admin -d enterprise_kg_fabric"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  kg-fabric-neo4j:
+    image: neo4j:5-community
+    container_name: kg-fabric-neo4j
+    environment:
+      NEO4J_AUTH: ${KG_FABRIC_NEO4J_AUTH:-neo4j/local_dev_only}
+      NEO4J_PLUGINS: '[]'
+    ports:
+      - "7475:7474"
+      - "7688:7687"
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:7474 || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
