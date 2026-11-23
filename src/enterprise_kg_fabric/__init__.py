@@ -16,9 +16,13 @@ from .llama_index_bridge import (
     LlamaTextNode,
     PIIRedactor,
 )
+from .mcp_server import KGFabricMcpServer, create_fastmcp_server
 from .models import (
     ChunkExtractionResult,
+    ChunkSearchRequest,
     EnterpriseCompiledTBox,
+    EntitySearchMatch,
+    EntitySearchRequest,
     ExtractedEntityMention,
     ExtractedRelationTriple,
     GraphRAGQueryRequest,
@@ -33,8 +37,12 @@ from .models import (
     OntologyRelationDef,
     OntologyStatus,
     RawDocumentInput,
+    ReadOnlyCypherSearchRequest,
+    ReadOnlyCypherSearchResponse,
     RetrievedChunkContext,
     RetrievedGraphFact,
+    SubgraphSearchRequest,
+    SubgraphSearchResponse,
     UpperOntologyCategory,
     VectorChunkRecord,
     VectorKBColumnMapping,

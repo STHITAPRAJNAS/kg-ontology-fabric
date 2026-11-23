@@ -343,3 +343,69 @@ class GraphRAGQueryResponse(BaseModel):
     chunk_contexts: list[RetrievedChunkContext] = Field(default_factory=list)
     provenance_kbs_contributing: list[str] = Field(default_factory=list)
     retrieval_latency_ms: float = 0.0
+
+
+class ChunkSearchRequest(BaseModel):
+    """Granular multi-KB vector + BM25 search primitive for autonomous agents."""
+
+    tenant_id: str = "enterprise_default"
+    query: str
+    top_k: int = Field(default=6, ge=1, le=50)
+    kb_filter: list[str] | None = None
+    domain_filter: list[str] | None = None
+
+
+class EntitySearchRequest(BaseModel):
+    """Granular entity lookup & resolution primitive across all KBs."""
+
+    tenant_id: str = "enterprise_default"
+    query: str
+    ontology_class_filter: str | None = None
+    top_k: int = Field(default=8, ge=1, le=50)
+    include_quarantined: bool = False
+
+
+class EntitySearchMatch(BaseModel):
+    entity_id: str
+    canonical_name: str
+    ontology_class: str
+    upper_category: UpperOntologyCategory
+    aliases: list[str] = Field(default_factory=list)
+    source_kb_ids: list[str] = Field(default_factory=list)
+    is_cross_kb_bridge: bool = False
+    match_score: float = 0.0
+
+
+class SubgraphSearchRequest(BaseModel):
+    """Granular K-hop bi-temporal subgraph traversal primitive around specific entities."""
+
+    tenant_id: str = "enterprise_default"
+    seed_entities: list[str] = Field(
+        ..., description="List of entity_ids or canonical entity names (e.g. ['payment-router-01'])"
+    )
+    max_hops: int = Field(default=2, ge=1, le=4)
+    predicate_filter: list[str] | None = None
+    as_of_iso: str | None = None
+    include_quarantined: bool = False
+
+
+class SubgraphSearchResponse(BaseModel):
+    tenant_id: str
+    resolved_seed_entity_ids: list[str] = Field(default_factory=list)
+    cross_kb_bridge_entities: list[str] = Field(default_factory=list)
+    facts: list[RetrievedGraphFact] = Field(default_factory=list)
+
+
+class ReadOnlyCypherSearchRequest(BaseModel):
+    """Guarded read-only OpenCypher query primitive for ontology-aware agents."""
+
+    tenant_id: str = "enterprise_default"
+    cypher_query: str
+    params: dict[str, Any] = Field(default_factory=dict)
+
+
+class ReadOnlyCypherSearchResponse(BaseModel):
+    tenant_id: str
+    cypher_query: str
+    rows: list[dict[str, Any]] = Field(default_factory=list)
+    row_count: int = 0

@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 from enterprise_kg_fabric import (
+    ChunkSearchRequest,
     EnterpriseKGOntologyService,
+    EntitySearchRequest,
     FederatedEmbeddingModelRouter,
     GraphRAGQueryRequest,
     PIIRedactionMode,
     PIIRedactor,
     PresidioPIIRedactor,
     RawDocumentInput,
+    ReadOnlyCypherSearchRequest,
     SemanticFeatureHashEmbeddingProvider,
     SiblingCollisionGuard,
+    SubgraphSearchRequest,
     SubLinearVectorCentroidSampler,
     VectorChunkRecord,
     VectorKBRegistration,
@@ -22,6 +26,7 @@ from enterprise_kg_fabric.api import (
     BuildGraphRequest,
     HydrateKBChunksRequest,
     InduceOntologyRequest,
+    McpToolCallRestRequest,
     PromoteOntologyRequest,
 )
 from examples.simulate_120_kbs_end_to_end import (
@@ -340,5 +345,115 @@ def test_fastapi_rest_endpoints_e2e() -> None:
         await routes["/v1/ontology/promote"](PromoteOntologyRequest(tenant_id="t_api"))
         tel_res = await routes["/v1/telemetry"](tenant_id="t_api")
         assert tel_res["registered_kbs_count"] == 2
+
+        # 10. Granular Search Primitives (/v1/search/chunks, /v1/search/entities, /v1/search/subgraph, /v1/search/cypher)
+        chunks_res = await routes["/v1/search/chunks"](
+            ChunkSearchRequest(tenant_id="t_api", query="aurora-orders-01 PCI-DSS-4.0", top_k=3)
+        )
+        assert len(chunks_res) == 2
+
+        ents_res = await routes["/v1/search/entities"](
+            EntitySearchRequest(tenant_id="t_api", query="aurora-orders-01")
+        )
+        assert len(ents_res) >= 1
+        assert ents_res[0].canonical_name == "aurora-orders-01"
+        assert ents_res[0].is_cross_kb_bridge is True
+
+        sub_res = await routes["/v1/search/subgraph"](
+            SubgraphSearchRequest(
+                tenant_id="t_api",
+                seed_entities=["checkout-api-01"],
+                max_hops=2,
+            )
+        )
+        assert "aurora-orders-01" in sub_res.cross_kb_bridge_entities
+        assert any(f.target_name == "PCI-DSS-4.0" for f in sub_res.facts)
+
+        cypher_res = await routes["/v1/search/cypher"](
+            ReadOnlyCypherSearchRequest(
+                tenant_id="t_api",
+                cypher_query="MATCH (s:Entity)-[r:KG_RELATION]->(t:Entity) RETURN s, r, t",
+            )
+        )
+        assert cypher_res.row_count >= 2
+
+        # Verify Read-Only Cypher Guard blocks mutating statements
+        blocked = False
+        try:
+            await service.execute_readonly_opencypher(
+                ReadOnlyCypherSearchRequest(
+                    tenant_id="t_api",
+                    cypher_query="MATCH (n:Entity) DETACH DELETE n",
+                )
+            )
+        except ValueError as exc:
+            blocked = "forbidden" in str(exc).lower()
+        assert blocked is True
+
+        # 11. Co-Hosted Model Context Protocol (MCP 2026-07-28) JSON-RPC Surface (/mcp & /v1/mcp/call)
+        init_rpc = await routes["/mcp"](
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2026-07-28"}},
+            None,
+        )
+        assert init_rpc["result"]["protocolVersion"] == "2026-07-28"
+
+        tools_rpc = await routes["/mcp"]({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, None)
+        tool_names = {t["name"] for t in tools_rpc["result"]["tools"]}
+        assert {
+            "query_hybrid_graph_rag",
+            "search_vector_chunks",
+            "search_kg_entities",
+            "traverse_entity_subgraph",
+            "execute_readonly_opencypher",
+        }.issubset(tool_names)
+
+        call_rpc = await routes["/mcp"](
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "search_kg_entities",
+                    "arguments": {"tenant_id": "t_api", "query": "aurora-orders-01"},
+                },
+            },
+            None,
+        )
+        assert call_rpc["result"]["isError"] is False
+        assert call_rpc["result"]["structuredContent"]["count"] >= 1
+
+        res_rpc = await routes["/mcp"](
+            {
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "resources/read",
+                "params": {"uri": "kg://ontology/t_api/shapes.ttl"},
+            },
+            None,
+        )
+        assert "owl:Ontology" in res_rpc["result"]["contents"][0]["text"]
+
+        prompt_rpc = await routes["/mcp"](
+            {
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "prompts/get",
+                "params": {
+                    "name": "ontology_cypher_analyst",
+                    "arguments": {"tenant_id": "t_api", "question": "List all governed databases"},
+                },
+            },
+            None,
+        )
+        assert "Approved Ontology Classes" in prompt_rpc["result"]["messages"][0]["content"]["text"]
+
+        rest_mcp = await routes["/v1/mcp/call"](
+            McpToolCallRestRequest(
+                tool_name="traverse_entity_subgraph",
+                arguments={"tenant_id": "t_api", "seed_entities": ["checkout-api-01"], "max_hops": 2},
+            )
+        )
+        assert rest_mcp["isError"] is False
+        assert "aurora-orders-01" in rest_mcp["result"]["cross_kb_bridge_entities"]
 
     run_coroutine_sync(_run_api_flow())

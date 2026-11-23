@@ -276,7 +276,7 @@ class InMemoryOpenCypherGraphEmulator(PropertyGraphStorePort):
         target_pred = params.get("predicate")
         if not target_pred:
             m_pred = re.search(r":([A-Z][A-Z0-9_]{2,30})", cypher_query)
-            if m_pred and m_pred.group(1) not in {"ENTITY", "ONTOLOGYCLASS"}:
+            if m_pred and m_pred.group(1) not in {"ENTITY", "ONTOLOGYCLASS", "KG_RELATION", "ONTOLOGYRELATION"}:
                 target_pred = m_pred.group(1)
 
         entity_filter = (params.get("entity_name") or "").lower()

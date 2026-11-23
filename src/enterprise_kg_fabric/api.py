@@ -2,16 +2,25 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
+from .mcp_server import KGFabricMcpServer
 from .models import (
+    ChunkSearchRequest,
+    EntitySearchMatch,
+    EntitySearchRequest,
     GraphRAGQueryRequest,
     GraphRAGQueryResponse,
     KGGraphBuildReport,
     OntologyInductionReport,
     RawDocumentInput,
+    ReadOnlyCypherSearchRequest,
+    ReadOnlyCypherSearchResponse,
+    RetrievedChunkContext,
+    SubgraphSearchRequest,
+    SubgraphSearchResponse,
     VectorChunkRecord,
     VectorKBRegistration,
 )
@@ -49,20 +58,41 @@ class PromoteOntologyRequest(BaseModel):
     min_confidence: float = Field(default=0.80, ge=0.0, le=1.0)
 
 
+class McpToolCallRestRequest(BaseModel):
+    tool_name: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+
+
 def create_kg_fabric_app(
     service: EnterpriseKGOntologyService | None = None,
 ) -> FastAPI:
     svc = service or EnterpriseKGOntologyService()
+    mcp_server = KGFabricMcpServer(svc)
+
     app = FastAPI(
-        title="Enterprise Multi-KB Ontology & Knowledge Graph Fabric",
+        title="Enterprise Multi-KB Ontology & Knowledge Graph Fabric (FastAPI + MCP)",
         version="0.1.0",
-        description="Automated Ontology Induction, Cross-KB Entity Resolution & LlamaIndex Hybrid GraphRAG over 100s of pgvector KBs and Neo4j/Neptune",
+        description=(
+            "Co-hosted FastAPI REST & Model Context Protocol (MCP 2026-07-28 / 2025-11-25) "
+            "Service for Automated Ontology Induction, Cross-KB Entity Resolution & "
+            "LlamaIndex Hybrid GraphRAG over 100s of pgvector KBs and Neo4j/Neptune"
+        ),
     )
     app.state.kg_service = svc
+    app.state.mcp_server = mcp_server
 
     @app.get("/health")
-    async def health() -> dict[str, str]:
-        return {"status": "healthy", "service": "enterprise-kg-ontology-fabric"}
+    async def health() -> dict[str, Any]:
+        return {
+            "status": "healthy",
+            "service": "enterprise-kg-ontology-fabric",
+            "mcp_cohosted": True,
+            "mcp_tools_count": len(mcp_server.list_tools_metadata()),
+        }
+
+    # -------------------------------------------------------------------------
+    # 1. Control & Ingestion Plane (`/v1/kbs/*`, `/v1/documents/*`, `/v1/ontology/*`, `/v1/graph/*`)
+    # -------------------------------------------------------------------------
 
     @app.post("/v1/kbs/register", response_model=VectorKBRegistration)
     async def register_kb(reg: VectorKBRegistration) -> VectorKBRegistration:
@@ -122,12 +152,67 @@ def create_kg_fabric_app(
             allow_dynamic_emergent=req.allow_dynamic_emergent,
         )
 
+    # -------------------------------------------------------------------------
+    # 2. Search & Retrieval Plane:
+    #    - Level 1: One-Shot Orchestrated 4-Path Hybrid GraphRAG (`/v1/rag/query`)
+    #    - Level 2: Granular Agentic Search Primitives (`/v1/search/*`)
+    # -------------------------------------------------------------------------
+
     @app.post("/v1/rag/query", response_model=GraphRAGQueryResponse)
     async def query_rag(req: GraphRAGQueryRequest) -> GraphRAGQueryResponse:
         return await svc.query_graph_rag(req)
 
+    @app.post("/v1/search/chunks", response_model=list[RetrievedChunkContext])
+    async def search_chunks(req: ChunkSearchRequest) -> list[RetrievedChunkContext]:
+        return await svc.search_vector_chunks(req)
+
+    @app.post("/v1/search/entities", response_model=list[EntitySearchMatch])
+    async def search_entities(req: EntitySearchRequest) -> list[EntitySearchMatch]:
+        return await svc.search_kg_entities(req)
+
+    @app.post("/v1/search/subgraph", response_model=SubgraphSearchResponse)
+    async def search_subgraph(req: SubgraphSearchRequest) -> SubgraphSearchResponse:
+        return await svc.traverse_entity_subgraph(req)
+
+    @app.post("/v1/search/cypher", response_model=ReadOnlyCypherSearchResponse)
+    async def search_cypher(req: ReadOnlyCypherSearchRequest) -> ReadOnlyCypherSearchResponse:
+        try:
+            return await svc.execute_readonly_opencypher(req)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @app.get("/v1/telemetry")
     async def get_telemetry(tenant_id: str = "enterprise_default") -> dict[str, Any]:
         return await svc.get_enterprise_telemetry(tenant_id=tenant_id)
+
+    # -------------------------------------------------------------------------
+    # 3. Co-Hosted Model Context Protocol (MCP) Surface (`/mcp`, `/mcp/http`, `/v1/mcp/*`)
+    # -------------------------------------------------------------------------
+
+    @app.post("/mcp")
+    @app.post("/mcp/http")
+    async def mcp_jsonrpc_endpoint(
+        payload: dict[str, Any],
+        mcp_protocol_version: str | None = Header(default="2026-07-28", alias="MCP-Protocol-Version"),
+    ) -> dict[str, Any]:
+        proto = mcp_protocol_version if isinstance(mcp_protocol_version, str) else "2026-07-28"
+        return await mcp_server.handle_jsonrpc(payload, protocol_version_header=proto)
+
+    @app.get("/v1/mcp/tools")
+    async def list_mcp_tools() -> dict[str, Any]:
+        return {
+            "tools": mcp_server.list_tools_metadata(),
+            "resources": mcp_server.list_resources_metadata(),
+            "resourceTemplates": mcp_server.list_resource_templates_metadata(),
+            "prompts": mcp_server.list_prompts_metadata(),
+        }
+
+    @app.post("/v1/mcp/call")
+    async def call_mcp_tool_rest(req: McpToolCallRestRequest) -> dict[str, Any]:
+        try:
+            result = await mcp_server.call_tool(req.tool_name, req.arguments)
+            return {"tool_name": req.tool_name, "result": result, "isError": False}
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return app

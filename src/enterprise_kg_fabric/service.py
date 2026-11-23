@@ -12,7 +12,10 @@ from .llama_index_bridge import (
 )
 from .models import (
     ChunkExtractionResult,
+    ChunkSearchRequest,
     EnterpriseCompiledTBox,
+    EntitySearchMatch,
+    EntitySearchRequest,
     GraphRAGQueryRequest,
     GraphRAGQueryResponse,
     KBSourceType,
@@ -21,6 +24,11 @@ from .models import (
     OntologyInductionReport,
     OntologyStatus,
     RawDocumentInput,
+    ReadOnlyCypherSearchRequest,
+    ReadOnlyCypherSearchResponse,
+    RetrievedChunkContext,
+    SubgraphSearchRequest,
+    SubgraphSearchResponse,
     VectorChunkRecord,
     VectorKBRegistration,
 )
@@ -31,6 +39,7 @@ from .vector_clustering import (
     EmbeddingProvider,
     FederatedEmbeddingModelRouter,
     SemanticFeatureHashEmbeddingProvider,
+    cosine_similarity,
 )
 
 
@@ -376,6 +385,144 @@ class EnterpriseKGOntologyService:
     async def query_graph_rag(self, request: GraphRAGQueryRequest) -> GraphRAGQueryResponse:
         tbox = self.get_tbox(request.tenant_id)
         return await self.rag_engine.query(request=request, tbox=tbox)
+
+    # -------------------------------------------------------------------------
+    # Granular Agentic Search Primitives (FastAPI `/v1/search/*` + MCP Tools)
+    # -------------------------------------------------------------------------
+
+    async def search_vector_chunks(
+        self, request: ChunkSearchRequest
+    ) -> list[RetrievedChunkContext]:
+        """Granular Multi-Model Federated pgvector + BM25 RRF chunk search across KBs."""
+        q_vec = self.embedding_provider.embed_text(request.query, dim=self.canonical_dim)
+        return await self.vector_store.hybrid_search_chunks(
+            tenant_id=request.tenant_id,
+            query_text=request.query,
+            query_embedding=q_vec,
+            top_k=request.top_k,
+            kb_filter=request.kb_filter,
+            domain_filter=request.domain_filter,
+        )
+
+    async def search_kg_entities(
+        self, request: EntitySearchRequest
+    ) -> list[EntitySearchMatch]:
+        """Granular Knowledge Graph canonical entity lookup by name, alias, class, or vector similarity."""
+        all_entities = await self.graph_store.get_all_entities(request.tenant_id)
+        q_lower = request.query.strip().lower()
+        q_vec = self.embedding_provider.embed_text(request.query, dim=self.canonical_dim)
+
+        matches: list[EntitySearchMatch] = []
+        for ent in all_entities.values():
+            if not request.include_quarantined and ent.governance_bucket != OntologyStatus.APPROVED:
+                continue
+            if (
+                request.ontology_class_filter
+                and ent.ontology_class.lower() != request.ontology_class_filter.lower()
+            ):
+                continue
+
+            # Compute hybrid lexical + vector score
+            names = [ent.canonical_name] + list(ent.aliases)
+            lexical_boost = 0.0
+            for n in names:
+                nl = n.lower()
+                if nl == q_lower:
+                    lexical_boost = max(lexical_boost, 1.0)
+                elif q_lower in nl or nl in q_lower:
+                    lexical_boost = max(lexical_boost, 0.75)
+
+            ent_vec = ent.embedding or self.embedding_provider.embed_text(
+                f"{ent.ontology_class} {ent.canonical_name}", dim=self.canonical_dim
+            )
+            vec_sim = max(0.0, cosine_similarity(q_vec, ent_vec))
+            score = round(0.65 * lexical_boost + 0.35 * vec_sim, 4) if lexical_boost > 0 else round(vec_sim, 4)
+
+            if score >= 0.15 or lexical_boost > 0:
+                matches.append(
+                    EntitySearchMatch(
+                        entity_id=ent.entity_id,
+                        canonical_name=ent.canonical_name,
+                        ontology_class=ent.ontology_class,
+                        upper_category=ent.upper_category,
+                        aliases=ent.aliases,
+                        source_kb_ids=ent.source_kb_ids,
+                        is_cross_kb_bridge=(len(ent.source_kb_ids) >= 2),
+                        match_score=score,
+                    )
+                )
+
+        matches.sort(key=lambda m: (-m.match_score, -len(m.source_kb_ids)))
+        return matches[: request.top_k]
+
+    async def traverse_entity_subgraph(
+        self, request: SubgraphSearchRequest
+    ) -> SubgraphSearchResponse:
+        """Granular K-hop bi-temporal subgraph expansion around specific entity IDs or names."""
+        all_entities = await self.graph_store.get_all_entities(request.tenant_id)
+        resolved_ids: list[str] = []
+
+        for seed in request.seed_entities:
+            s_clean = seed.strip()
+            if s_clean in all_entities:
+                resolved_ids.append(s_clean)
+                continue
+            s_lower = s_clean.lower()
+            for eid, ent in all_entities.items():
+                names = [ent.canonical_name.lower()] + [a.lower() for a in ent.aliases]
+                if s_lower in names or any(s_lower in n for n in names):
+                    if eid not in resolved_ids:
+                        resolved_ids.append(eid)
+
+        facts, bridges = await self.graph_store.expand_k_hop_subgraph(
+            tenant_id=request.tenant_id,
+            seed_entity_ids=resolved_ids,
+            max_hops=request.max_hops,
+            include_quarantined=request.include_quarantined,
+            as_of_iso=request.as_of_iso,
+        )
+        if request.predicate_filter:
+            allowed_preds = {p.upper() for p in request.predicate_filter}
+            facts = [f for f in facts if f.predicate.upper() in allowed_preds]
+
+        return SubgraphSearchResponse(
+            tenant_id=request.tenant_id,
+            resolved_seed_entity_ids=resolved_ids,
+            cross_kb_bridge_entities=bridges,
+            facts=facts,
+        )
+
+    @staticmethod
+    def validate_readonly_opencypher(cypher_query: str) -> None:
+        import re
+
+        forbidden = re.compile(
+            r"\b(CREATE|MERGE|DELETE|DETACH|SET|REMOVE|DROP|LOAD\s+CSV|CALL\s+dbms)\b",
+            re.I,
+        )
+        m = forbidden.search(cypher_query)
+        if m:
+            raise ValueError(
+                f"Mutating OpenCypher keyword '{m.group(1)}' is forbidden on read-only search endpoint."
+            )
+
+    async def execute_readonly_opencypher(
+        self, request: ReadOnlyCypherSearchRequest
+    ) -> ReadOnlyCypherSearchResponse:
+        """Executes a guarded read-only OpenCypher query on Neo4j / Amazon Neptune."""
+        self.validate_readonly_opencypher(request.cypher_query)
+        params = {**request.params, "tenant_id": request.tenant_id}
+        rows = await self.graph_store.execute_opencypher(
+            tenant_id=request.tenant_id,
+            cypher_query=request.cypher_query,
+            params=params,
+        )
+        return ReadOnlyCypherSearchResponse(
+            tenant_id=request.tenant_id,
+            cypher_query=request.cypher_query,
+            rows=rows,
+            row_count=len(rows),
+        )
 
     async def get_enterprise_telemetry(
         self, tenant_id: str = "enterprise_default"
