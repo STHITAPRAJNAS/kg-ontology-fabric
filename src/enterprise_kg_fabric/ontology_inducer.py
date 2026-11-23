@@ -6,6 +6,7 @@ from typing import Sequence
 
 from rdflib import OWL, RDF, RDFS, SH, XSD, BNode, Graph, Literal, Namespace, URIRef
 
+from .domain_packs import DomainRulePack, resolve_domain_pack
 from .models import (
     EnterpriseCompiledTBox,
     KGEntityNode,
@@ -396,8 +397,10 @@ class AutomatedOntologyInducer:
         min_kb_support_for_approval: int = 2,
         min_chunk_support_for_approval: int = 2,
         alignment_cosine_threshold: float = 0.80,
+        domain_pack: DomainRulePack | str | None = None,
     ):
         self.embedding_provider = embedding_provider
+        self.domain_pack = resolve_domain_pack(domain_pack)
         self.sampler = SubLinearVectorCentroidSampler(
             centroids_per_kb=centroids_per_kb,
             boundary_outliers_per_kb=boundary_outliers_per_kb,
@@ -446,9 +449,14 @@ class AutomatedOntologyInducer:
                 )
             )
 
-        # 2. Discover classes from chunk text patterns
+        # 2. Discover classes from chunk text patterns (domain-pack driven)
+        class_rules = (
+            _CLASS_DISCOVERY_RULES
+            if self.domain_pack.name == "cloud_sre"
+            else self.domain_pack.class_discovery_rules
+        )
         matched_class_names: set[str] = set()
-        for pattern, raw_cls_name, upper_cat, desc in _CLASS_DISCOVERY_RULES:
+        for pattern, raw_cls_name, upper_cat, desc in class_rules:
             if pattern.search(text):
                 matched_class_names.add(raw_cls_name)
                 classes.append(
@@ -505,6 +513,31 @@ class AutomatedOntologyInducer:
 
         # 4. Discover relation rules from textual relational patterns
         text_lower = text.lower()
+        if self.domain_pack.name != "cloud_sre":
+            for (
+                keywords,
+                pred_name,
+                dom_cls,
+                rng_cls,
+                desc,
+                is_func,
+                is_trans,
+            ) in self.domain_pack.text_relation_triggers:
+                if any(w in text_lower for w in keywords):
+                    relations.append(
+                        RawCandidateRelation(
+                            raw_predicate=pred_name,
+                            domain_class=dom_cls,
+                            range_class=rng_cls,
+                            description=desc,
+                            kb_id=chunk.kb_id,
+                            chunk_id=chunk.chunk_id,
+                            is_functional=is_func,
+                            is_transitive=is_trans,
+                        )
+                    )
+            return classes, relations
+
         if any(w in text_lower for w in ("depends on", "calls upstream", "requires service", "backed by", "connects to")):
             relations.append(
                 RawCandidateRelation(
@@ -696,10 +729,13 @@ class AutomatedOntologyInducer:
         class_alias_map: dict[str, str] = {}
         merged_synonyms_report: dict[str, list[str]] = {}
 
-        # Pre-compute embeddings for canonical equivalence centroids
+        # Pre-compute embeddings for canonical equivalence centroids (Cloud/SRE pack only)
+        class_equivalences = (
+            _CANONICAL_CLASS_EQUIVALENCES if self.domain_pack.name == "cloud_sre" else {}
+        )
         canonical_class_vecs: dict[str, list[float]] = {
             canon_name: self.embedding_provider.embed_text(f"{canon_name} {desc} {' '.join(syns)}")
-            for canon_name, (_, _, desc, syns) in _CANONICAL_CLASS_EQUIVALENCES.items()
+            for canon_name, (_, _, desc, syns) in class_equivalences.items()
         }
 
         for cand in raw_classes:
@@ -709,7 +745,7 @@ class AutomatedOntologyInducer:
             matched_desc = cand.description
 
             # 1. Check exact or synonym lexicon equivalence
-            for canon_name, (_, upper_cat, desc, syn_set) in _CANONICAL_CLASS_EQUIVALENCES.items():
+            for canon_name, (_, upper_cat, desc, syn_set) in class_equivalences.items():
                 if norm_cand in syn_set or norm_cand == self._norm_key(canon_name):
                     matched_canonical = canon_name
                     matched_upper = upper_cat
@@ -720,7 +756,7 @@ class AutomatedOntologyInducer:
             if matched_canonical is None:
                 cand_vec = self.embedding_provider.embed_text(f"{cand.raw_name} {cand.description}")
                 best_score = 0.0
-                for canon_name, (_, upper_cat, desc, _) in _CANONICAL_CLASS_EQUIVALENCES.items():
+                for canon_name, (_, upper_cat, desc, _) in class_equivalences.items():
                     if upper_cat != cand.upper_category:
                         continue
                     sim = cosine_similarity(cand_vec, canonical_class_vecs[canon_name])

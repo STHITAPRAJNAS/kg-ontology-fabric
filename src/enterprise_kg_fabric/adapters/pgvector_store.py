@@ -7,10 +7,12 @@ from abc import ABC, abstractmethod
 from typing import Any, Sequence
 
 from ..models import (
+    DLQFailedChunkRecord,
     EnterpriseCompiledTBox,
     KBWatermarkState,
     KGEntityNode,
     RetrievedChunkContext,
+    SyncJobRecord,
     VectorChunkRecord,
     VectorKBRegistration,
     utc_now_iso,
@@ -101,6 +103,29 @@ CREATE TABLE IF NOT EXISTS enterprise_tbox_registry (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS kg_sync_jobs (
+    job_id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    job_json JSONB NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_kg_sync_jobs_tenant
+    ON kg_sync_jobs (tenant_id, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS kg_dlq_chunks (
+    dlq_id SERIAL PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    kb_id TEXT NOT NULL,
+    chunk_id TEXT NOT NULL,
+    record_json JSONB NOT NULL,
+    failed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_kg_dlq_chunks_tenant
+    ON kg_dlq_chunks (tenant_id, failed_at DESC);
+
 ALTER TABLE unified_rag_chunks ENABLE ROW LEVEL SECURITY;
 ALTER TABLE canonical_entity_embeddings ENABLE ROW LEVEL SECURITY;
 """.strip()
@@ -113,6 +138,21 @@ class PgVectorStorePort(ABC):
         return None
 
     async def load_tbox(self, tenant_id: str) -> EnterpriseCompiledTBox | None:
+        return None
+
+    async def save_sync_job(self, job: SyncJobRecord) -> None:
+        return None
+
+    async def get_sync_job(self, job_id: str) -> SyncJobRecord | None:
+        return None
+
+    async def append_dlq_record(self, record: DLQFailedChunkRecord) -> None:
+        return None
+
+    async def list_dlq_records(self, tenant_id: str | None = None) -> list[DLQFailedChunkRecord]:
+        return []
+
+    async def close(self) -> None:
         return None
 
     @abstractmethod
@@ -195,12 +235,28 @@ class InMemoryPgVectorStoreEmulator(PgVectorStorePort):
         self._watermarks: dict[tuple[str, str], KBWatermarkState] = {}
         self._entity_index: dict[str, KGEntityNode] = {}
         self._tboxes: dict[str, EnterpriseCompiledTBox] = {}
+        self._sync_jobs: dict[str, SyncJobRecord] = {}
+        self._dlq_records: list[DLQFailedChunkRecord] = []
 
     async def save_tbox(self, tbox: EnterpriseCompiledTBox) -> None:
         self._tboxes[tbox.tenant_id] = tbox
 
     async def load_tbox(self, tenant_id: str) -> EnterpriseCompiledTBox | None:
         return self._tboxes.get(tenant_id)
+
+    async def save_sync_job(self, job: SyncJobRecord) -> None:
+        self._sync_jobs[job.job_id] = job
+
+    async def get_sync_job(self, job_id: str) -> SyncJobRecord | None:
+        return self._sync_jobs.get(job_id)
+
+    async def append_dlq_record(self, record: DLQFailedChunkRecord) -> None:
+        self._dlq_records.append(record)
+
+    async def list_dlq_records(self, tenant_id: str | None = None) -> list[DLQFailedChunkRecord]:
+        if tenant_id is None:
+            return list(self._dlq_records)
+        return [r for r in self._dlq_records if r.tenant_id == tenant_id]
 
     async def register_kb(self, registration: VectorKBRegistration) -> None:
         self._kb_registry[registration.kb_id] = registration
@@ -540,6 +596,70 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
                 return None
             raw = self._parse_json_safe(row["tbox_json"])
             return EnterpriseCompiledTBox.model_validate(raw)
+
+    async def initialize_schema(self) -> None:
+        await self._get_pool()
+
+    async def save_sync_job(self, job: SyncJobRecord) -> None:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO kg_sync_jobs (job_id, tenant_id, status, job_json)
+                VALUES ($1, $2, $3, $4::jsonb)
+                ON CONFLICT (job_id) DO UPDATE SET
+                    status = EXCLUDED.status,
+                    job_json = EXCLUDED.job_json,
+                    updated_at = NOW()
+                """,
+                job.job_id,
+                job.tenant_id,
+                job.status.value,
+                job.model_dump_json(),
+            )
+
+    async def get_sync_job(self, job_id: str) -> SyncJobRecord | None:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT job_json FROM kg_sync_jobs WHERE job_id = $1",
+                job_id,
+            )
+            if not row:
+                return None
+            raw = self._parse_json_safe(row["job_json"])
+            return SyncJobRecord.model_validate(raw)
+
+    async def append_dlq_record(self, record: DLQFailedChunkRecord) -> None:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO kg_dlq_chunks (tenant_id, kb_id, chunk_id, record_json)
+                VALUES ($1, $2, $3, $4::jsonb)
+                """,
+                record.tenant_id,
+                record.kb_id,
+                record.chunk_id,
+                record.model_dump_json(),
+            )
+
+    async def list_dlq_records(self, tenant_id: str | None = None) -> list[DLQFailedChunkRecord]:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            if tenant_id is not None:
+                rows = await conn.fetch(
+                    "SELECT record_json FROM kg_dlq_chunks WHERE tenant_id = $1 ORDER BY dlq_id ASC",
+                    tenant_id,
+                )
+            else:
+                rows = await conn.fetch(
+                    "SELECT record_json FROM kg_dlq_chunks ORDER BY dlq_id ASC"
+                )
+            return [
+                DLQFailedChunkRecord.model_validate(self._parse_json_safe(r["record_json"]))
+                for r in rows
+            ]
 
     async def reverse_hydrate_from_legacy_pgvector_table(
         self,

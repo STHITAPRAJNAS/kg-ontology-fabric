@@ -1,6 +1,8 @@
-# Enterprise Multi-KB Automated Ontology & Knowledge Graph Fabric (`kg-ontology-fabric` v0.2.0)
+# Enterprise Multi-KB Automated Ontology & Knowledge Graph Fabric (`enterprise-kg-ontology-fabric` v0.3.0)
 
-An enterprise-grade service that automatically induces, aligns, and governs **formal domain ontologies (W3C OWL 2 / SHACL TBox)** and **bi-temporal, ABAC-trimmed knowledge graphs (ABox)** from **100s of heterogeneous PostgreSQL `pgvector` embedding stores** (`384d` / `768d` / `1024d` / `1536d`) and **multimodal/raw document streams**, powered by **LlamaIndex**, **Neo4j 5 / Amazon Neptune (`openCypher`)**, **PostgreSQL (`pgvector`)**, **Microsoft Presidio**, **HippoRAG 2 PPR**, **Leiden Global Search**, **IBM Docling**, and co-hosted **FastAPI + MCP (`2026-07-28`)**.
+An enterprise-grade **Python SDK, CLI (`kg-fabric`), and self-hostable FastAPI + MCP microservice** that automatically induces, aligns, and governs **formal domain ontologies (W3C OWL 2 / SHACL TBox)** and **bi-temporal, ABAC-trimmed knowledge graphs (ABox)** from **100s of heterogeneous PostgreSQL `pgvector` embedding stores** (`384d` / `768d` / `1024d` / `1536d`) and **multimodal/raw document streams**, powered by **LlamaIndex**, **Neo4j 5 / Amazon Neptune (`openCypher`)**, **PostgreSQL (`pgvector`)**, **Microsoft Presidio**, **HippoRAG 2 PPR**, **Leiden Global Search**, **IBM Docling**, and co-hosted **FastAPI + MCP (`2026-07-28`)**.
+
+> **Dual-Mode Distribution**: Use it **as a PyPI library/CLI** embedded into your existing Python/ADK/LangGraph/FastAPI apps (`pip install enterprise-kg-ontology-fabric`) **OR clone & self-host** the full containerized service via `docker compose --profile app up -d --build` or Amazon EKS (`deploy/eks/`).
 
 ---
 
@@ -130,32 +132,52 @@ Rather than ripping and replacing existing RAG pipelines, deploy `kg-ontology-fa
 
 ---
 
-## 4. Quickstart
+## 4. Quickstart — Two Ways to Use It
 
-### A. Run Unit Tests & 120-KB Scale Simulation (No Docker Required)
+### Mode 1: Install as a Python Package / CLI (PyPI-Ready SDK)
+Embed the engine in your own FastAPI/ADK/LangGraph app, plug in a custom `DomainRulePack` (or `GENERIC_DOMAIN_PACK`), or launch via the built-in `kg-fabric` CLI:
 ```bash
-pip install -e ".[dev]"
-pytest tests/ -v
+# Install core SDK + CLI (or add optional extras: pii,aws,mcp,llm,graph-analytics,multimodal,rerank,eval,otel,auth)
+pip install -e ".[mcp,auth,graph-analytics]"
+
+# 1. Start co-hosted FastAPI REST + MCP HTTP server on loopback (or set KG_FABRIC_AUTH_MODE=jwt|api_key for 0.0.0.0)
+kg-fabric serve --host 127.0.0.1 --port 8080
+
+# 2. Or start standalone FastMCP over stdio for Claude Desktop / Cursor / Windsurf / ADK
+kg-fabric mcp --transport stdio
+
+# 3. Initialize PostgreSQL pgvector schema (registry, watermarks, persistent TBox, durable jobs & DLQ)
+kg-fabric init-db
 ```
 
-### B. Run Live Docker Messy Cross-KB Benchmark (`pgvector` + `Neo4j 5`)
+### Mode 2: Clone & Self-Host as a Full Service (Docker Compose / Amazon EKS)
 ```bash
+git clone https://github.com/STHITAPRAJNAS/kg-ontology-fabric.git
+cd kg-ontology-fabric
+cp .env.example .env
+
+# Start PostgreSQL 16 (pgvector) + Neo4j 5 + FastAPI/MCP API container in one command:
+docker compose --profile app up -d --build
+
+# Or start only Postgres + Neo4j for local benchmarks & tests:
 docker compose up -d --wait
 python examples/live_docker_messy_enterprise_test.py
-```
-Inspect the live induced ontology and knowledge graph in Neo4j Browser at `http://localhost:7475` (`bolt://localhost:7688`).
 
-### C. Run FastAPI + MCP Microservice Locally or Deploy to Amazon EKS
-```bash
-# Local FastAPI + MCP server (install optional SOTA extras as needed)
-pip install -e ".[pii,aws,mcp,llm,graph-analytics,multimodal,rerank,eval,otel]"
-python -m spacy download en_core_web_lg
-uvicorn enterprise_kg_fabric.api:create_kg_fabric_app --factory --host 0.0.0.0 --port 8080
+# Run full offline pytest suite (14 tests, no Docker required):
+pip install -e ".[dev,mcp,auth]"
+pytest tests/ -v
 
 # Amazon EKS Deployment (see docs/usage_and_eks_deployment_guide.md)
 kubectl apply -f deploy/eks/deployment-api.yaml
 kubectl apply -f deploy/eks/cronjob-incremental-sync.yaml
 ```
+Inspect the live induced ontology and knowledge graph in Neo4j Browser at `http://localhost:7475` (`bolt://localhost:7688`).
+
+### Security & Multi-Tenant Auth (`v0.3.0`)
+- **`KG_FABRIC_AUTH_MODE=jwt`** (strict `exp` + `tenant_id` + `acl_groups` enforcement via PyJWT or built-in HS256) or **`api_key`** (`X-API-Key` / Bearer).
+- **Non-loopback Guard**: `kg-fabric serve` refuses binding `0.0.0.0` when `KG_FABRIC_AUTH_MODE=none` unless `--allow-unauthenticated` / `KG_FABRIC_ALLOW_UNAUTHENTICATED=true` is explicitly passed.
+- **Anti-Spoofing ABAC**: Caller `caller_acl_groups` on both REST (`/v1/rag/query`, `/v1/search/*`) and MCP (`/mcp`, `/v1/mcp/call`) are intersected with verified token claims, and Path 4 OpenCypher rows are post-filtered for zero leakage.
+- See [CHANGELOG.md](./CHANGELOG.md) for full release history and `.github/workflows/release.yml` for tag-triggered PyPI Trusted Publishing (`v*.*.*`).
 
 ---
 

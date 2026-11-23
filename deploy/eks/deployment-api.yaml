@@ -40,7 +40,7 @@ spec:
               app: kg-fabric-api
       containers:
         - name: api
-          image: 123456789012.dkr.ecr.us-east-1.amazonaws.com/enterprise-kg-ontology-fabric:0.1.0
+          image: 123456789012.dkr.ecr.us-east-1.amazonaws.com/enterprise-kg-ontology-fabric:0.3.0
           ports:
             - containerPort: 8080
               name: http
@@ -49,6 +49,10 @@ spec:
               value: "us-east-1"
             - name: GRAPH_BACKEND
               value: "neptune"
+            - name: KG_FABRIC_AUTH_MODE
+              value: "jwt"
+            - name: KG_FABRIC_DOMAIN_PACK
+              value: "cloud_sre"
             - name: NEPTUNE_ENDPOINT
               value: "https://kg-fabric-cluster.cluster-xxxx.us-east-1.neptune.amazonaws.com:8182"
             - name: PGVECTOR_DSN

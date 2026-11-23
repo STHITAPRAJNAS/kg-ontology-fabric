@@ -9,7 +9,16 @@ from .adapters import (
     get_production_pgvector_ddl,
 )
 from .adaptive_router import AdaptiveQueryRouter, PluggableCrossEncoderReranker
-from .api import create_kg_fabric_app
+from .api import API_VERSION as __version__
+from .api import create_kg_fabric_app, create_kg_fabric_app_from_env
+from .auth import AuthConfig, AuthEnforcer, AuthMode, AuthPrincipal, create_hs256_jwt
+from .domain_packs import (
+    BUILTIN_DOMAIN_PACKS,
+    CLOUD_SRE_DOMAIN_PACK,
+    GENERIC_DOMAIN_PACK,
+    DomainRulePack,
+    resolve_domain_pack,
+)
 from .entity_resolution import CrossKBEntityResolver, SiblingCollisionGuard
 from .eval_harness import GraphRAGEvaluationHarness
 from .graph_analytics import GraphAnalyticsEngine
@@ -83,6 +92,18 @@ from .vector_clustering import (
 )
 
 __all__ = [
+    "__version__",
+    "AuthMode",
+    "AuthConfig",
+    "AuthPrincipal",
+    "AuthEnforcer",
+    "create_hs256_jwt",
+    "DomainRulePack",
+    "CLOUD_SRE_DOMAIN_PACK",
+    "GENERIC_DOMAIN_PACK",
+    "BUILTIN_DOMAIN_PACKS",
+    "resolve_domain_pack",
+    "create_kg_fabric_app_from_env",
     "UpperOntologyCategory",
     "OntologyStatus",
     "KBSourceType",

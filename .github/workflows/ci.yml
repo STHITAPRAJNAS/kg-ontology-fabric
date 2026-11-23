@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-and-package:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install package with dev extras
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,mcp,auth]"
+      - name: Run full pytest suite
+        run: pytest tests/ -v
+      - name: Build sdist & wheel and verify isolated install
+        run: |
+          python -m build
+          twine check dist/*
+          python -m venv /tmp/wheel-smoke
+          /tmp/wheel-smoke/bin/pip install dist/*.whl
+          /tmp/wheel-smoke/bin/kg-fabric version
+          /tmp/wheel-smoke/bin/python -c "import enterprise_kg_fabric as kg; assert kg.__version__ == '0.3.0'; print('Wheel smoke OK:', kg.__version__)"

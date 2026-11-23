@@ -1,13 +1,24 @@
 from __future__ import annotations
 
+import os
 import uuid
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Sequence
 
-from .adapters.graph_stores import InMemoryOpenCypherGraphEmulator, PropertyGraphStorePort
-from .adapters.pgvector_store import InMemoryPgVectorStoreEmulator, PgVectorStorePort
+from .adapters.graph_stores import (
+    InMemoryOpenCypherGraphEmulator,
+    Neo4jOpenCypherGraphAdapter,
+    NeptuneOpenCypherGraphAdapter,
+    PropertyGraphStorePort,
+)
+from .adapters.pgvector_store import (
+    InMemoryPgVectorStoreEmulator,
+    PgVectorStorePort,
+    PostgresPgVectorStoreAdapter,
+)
 from .adaptive_router import PluggableCrossEncoderReranker
+from .domain_packs import DomainRulePack, resolve_domain_pack
 from .entity_resolution import CrossKBEntityResolver
 from .eval_harness import GraphRAGEvaluationHarness
 from .graph_analytics import GraphAnalyticsEngine, _is_acl_allowed
@@ -98,8 +109,10 @@ class EnterpriseKGOntologyService:
         min_kb_support_for_approval: int = 2,
         min_chunk_support_for_approval: int = 2,
         use_live_llm: bool = False,
+        domain_pack: DomainRulePack | str | None = None,
     ):
         self.canonical_dim = canonical_embedding_dim
+        self.domain_pack = resolve_domain_pack(domain_pack)
         self.embedding_provider = embedding_provider or SemanticFeatureHashEmbeddingProvider(
             default_dim=canonical_embedding_dim
         )
@@ -122,6 +135,7 @@ class EnterpriseKGOntologyService:
             boundary_outliers_per_kb=boundary_outliers_per_kb,
             min_kb_support_for_approval=min_kb_support_for_approval,
             min_chunk_support_for_approval=min_chunk_support_for_approval,
+            domain_pack=self.domain_pack,
         )
         self.kg_extractor = llm_extractor or StructuredLLMExtractorAdapter(
             use_live_llm=use_live_llm,
@@ -149,6 +163,111 @@ class EnterpriseKGOntologyService:
         self._pii_redaction_audit_counts: dict[str, int] = {}
         self._sync_jobs: dict[str, SyncJobRecord] = {}
         self._dlq_records: list[DLQFailedChunkRecord] = []
+
+    @classmethod
+    def from_env(cls) -> EnterpriseKGOntologyService:
+        """
+        Environment-driven factory for both PyPI CLI (`kg-fabric serve`) and Docker/EKS pods.
+        Auto-wires PostgreSQL `pgvector`, Neo4j 5 or Amazon Neptune, Microsoft Presidio PII,
+        optional live LLM extraction, and pluggable DomainRulePack from environment variables.
+        """
+        canonical_dim = int(os.getenv("KG_FABRIC_CANONICAL_DIM", "256"))
+        embedding_provider = SemanticFeatureHashEmbeddingProvider(default_dim=canonical_dim)
+        model_router = FederatedEmbeddingModelRouter(embedding_provider)
+
+        pii_mode_raw = os.getenv("PII_REDACTION_MODE", "replace_tag").strip().lower()
+        try:
+            pii_mode = PIIRedactionMode(pii_mode_raw)
+        except ValueError:
+            pii_mode = PIIRedactionMode.REPLACE_TAG
+        pii_redactor = PresidioPIIRedactor(
+            mode=pii_mode,
+            hmac_secret_key=os.getenv("PII_HMAC_SECRET_KEY") or None,
+        )
+
+        pg_dsn = (
+            os.getenv("PGVECTOR_DSN")
+            or os.getenv("KG_FABRIC_PGVECTOR_DSN")
+            or os.getenv("DATABASE_URL")
+            or ""
+        ).strip()
+        if not pg_dsn and os.getenv("PGHOST"):
+            pg_user = os.getenv("PGUSER", "postgres")
+            pg_pass = os.getenv("PGPASSWORD", "")
+            pg_host = os.getenv("PGHOST", "127.0.0.1")
+            pg_port = os.getenv("PGPORT", "5432")
+            pg_db = os.getenv("PGDATABASE", "enterprise_kg_fabric")
+            creds = f"{pg_user}:{pg_pass}@" if pg_pass else f"{pg_user}@"
+            pg_dsn = f"postgresql://{creds}{pg_host}:{pg_port}/{pg_db}"
+        if pg_dsn:
+            vector_store: PgVectorStorePort = PostgresPgVectorStoreAdapter(
+                dsn=pg_dsn,
+                embedding_provider=embedding_provider,
+                canonical_dim=canonical_dim,
+            )
+        else:
+            vector_store = InMemoryPgVectorStoreEmulator(
+                embedding_provider=embedding_provider,
+                canonical_dim=canonical_dim,
+                model_router=model_router,
+            )
+
+        graph_backend = os.getenv("GRAPH_BACKEND", "").strip().lower()
+        neo4j_uri = os.getenv("NEO4J_URI", "").strip()
+        neptune_endpoint = os.getenv("NEPTUNE_ENDPOINT", "").strip()
+        if not graph_backend:
+            if neptune_endpoint:
+                graph_backend = "neptune"
+            elif neo4j_uri:
+                graph_backend = "neo4j"
+            else:
+                graph_backend = "memory"
+
+        if graph_backend == "neptune" and neptune_endpoint:
+            graph_store: PropertyGraphStorePort = NeptuneOpenCypherGraphAdapter(
+                endpoint_url=neptune_endpoint,
+                aws_region=os.getenv("AWS_REGION", "us-east-1"),
+            )
+        elif graph_backend == "neo4j" and neo4j_uri:
+            graph_store = Neo4jOpenCypherGraphAdapter(
+                uri=neo4j_uri,
+                user=os.getenv("NEO4J_USER", "neo4j"),
+                password=os.getenv("NEO4J_PASSWORD", ""),
+            )
+        else:
+            graph_store = InMemoryOpenCypherGraphEmulator()
+
+        use_live_llm = os.getenv("KG_FABRIC_USE_LIVE_LLM", "false").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        llm_provider = os.getenv("KG_FABRIC_LLM_PROVIDER", "gemini").strip().lower()
+        llm_model = os.getenv("KG_FABRIC_LLM_MODEL", "gemini-2.5-flash").strip()
+        llm_extractor = StructuredLLMExtractorAdapter(
+            provider=llm_provider,
+            model_name=llm_model,
+            use_live_llm=use_live_llm,
+            fallback_extractor=LlamaIndexSchemaAndDynamicExtractor(),
+        )
+
+        domain_pack_name = os.getenv("KG_FABRIC_DOMAIN_PACK", "cloud_sre").strip().lower()
+        return cls(
+            vector_store=vector_store,
+            graph_store=graph_store,
+            embedding_provider=embedding_provider,
+            model_router=model_router,
+            pii_redactor=pii_redactor,
+            llm_extractor=llm_extractor,
+            canonical_embedding_dim=canonical_dim,
+            use_live_llm=use_live_llm,
+            domain_pack=domain_pack_name,
+        )
+
+    async def close(self) -> None:
+        """Gracefully closes database pools and graph drivers (called by FastAPI lifespan)."""
+        await self.vector_store.close()
+        await self.graph_store.close()
 
     async def register_vector_kb(self, registration: VectorKBRegistration) -> VectorKBRegistration:
         await self.vector_store.register_kb(registration)
@@ -332,15 +451,15 @@ class EnterpriseKGOntologyService:
                     extractions.append(res)
                     succeeded_chunks.append(chk)
                 except Exception as exc:
-                    self._dlq_records.append(
-                        DLQFailedChunkRecord(
-                            dlq_id=f"dlq_{uuid.uuid4().hex[:10]}",
-                            tenant_id=tenant_id,
-                            kb_id=chk.kb_id,
-                            chunk_id=chk.chunk_id,
-                            error_message=str(exc),
-                        )
+                    dlq_rec = DLQFailedChunkRecord(
+                        dlq_id=f"dlq_{uuid.uuid4().hex[:10]}",
+                        tenant_id=tenant_id,
+                        kb_id=chk.kb_id,
+                        chunk_id=chk.chunk_id,
+                        error_message=str(exc),
                     )
+                    self._dlq_records.append(dlq_rec)
+                    await self.vector_store.append_dlq_record(dlq_rec)
 
             existing_entities = await self.graph_store.get_all_entities(tenant_id)
             (
@@ -426,6 +545,7 @@ class EnterpriseKGOntologyService:
             incremental=incremental,
         )
         self._sync_jobs[job_id] = job
+        await self.vector_store.save_sync_job(job)
         dlq_before = len(self._dlq_records)
         try:
             report = await self.build_or_update_knowledge_graph(
@@ -441,15 +561,32 @@ class EnterpriseKGOntologyService:
             job.status = SyncJobStatus.FAILED
             job.error = str(exc)
             job.completed_at = utc_now_iso()
+        await self.vector_store.save_sync_job(job)
         return job
 
     def get_sync_job(self, job_id: str) -> SyncJobRecord | None:
         return self._sync_jobs.get(job_id)
 
+    async def get_sync_job_async(self, job_id: str) -> SyncJobRecord | None:
+        if job_id in self._sync_jobs:
+            return self._sync_jobs[job_id]
+        persisted = await self.vector_store.get_sync_job(job_id)
+        if persisted is not None:
+            self._sync_jobs[job_id] = persisted
+        return persisted
+
     def list_dlq_records(self, tenant_id: str | None = None) -> list[DLQFailedChunkRecord]:
         if tenant_id is None:
             return list(self._dlq_records)
         return [r for r in self._dlq_records if r.tenant_id == tenant_id]
+
+    async def list_dlq_records_async(
+        self, tenant_id: str | None = None
+    ) -> list[DLQFailedChunkRecord]:
+        persisted = await self.vector_store.list_dlq_records(tenant_id=tenant_id)
+        if persisted:
+            return persisted
+        return self.list_dlq_records(tenant_id=tenant_id)
 
     async def promote_quarantined_ontology_concepts(
         self,

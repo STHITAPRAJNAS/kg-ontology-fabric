@@ -71,6 +71,9 @@ class PropertyGraphStorePort(ABC):
     ) -> list[dict[str, Any]]:
         raise NotImplementedError
 
+    async def close(self) -> None:
+        return None
+
 
 class InMemoryOpenCypherGraphEmulator(PropertyGraphStorePort):
     """

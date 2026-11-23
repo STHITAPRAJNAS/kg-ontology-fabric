@@ -264,15 +264,44 @@ class EnterpriseHybridGraphRAGEngine:
                 gf.ppr_score = ppr_by_edge.get(gf.edge_id, 0.0)
             graph_facts.sort(key=lambda f: (f.hop_distance, -f.ppr_score, -f.confidence))
 
-        # Path 4: Text-to-OpenCypher Structured Query Execution
+        # Path 4: Text-to-OpenCypher Structured Query Execution (with ABAC post-filtering)
         cypher_query, cypher_params = self.synthesize_opencypher_from_query(
             request.query, tbox, seed_entities
         )
-        opencypher_rows = await self.graph_store.execute_opencypher(
+        raw_opencypher_rows = await self.graph_store.execute_opencypher(
             tenant_id=request.tenant_id,
             cypher_query=cypher_query,
             params=cypher_params,
         )
+        if request.caller_acl_groups is not None:
+            allowed_entity_names = {
+                ent.canonical_name
+                for ent in all_entities.values()
+                if _is_acl_allowed(ent.acl_groups, request.caller_acl_groups)
+            }
+            allowed_fact_pairs = {
+                (gf.source_name, gf.predicate, gf.target_name) for gf in graph_facts
+            }
+            opencypher_rows = []
+            for row in raw_opencypher_rows:
+                src_val = row.get("source")
+                tgt_val = row.get("target")
+                pred_val = row.get("predicate")
+                if src_val is not None and src_val not in allowed_entity_names:
+                    continue
+                if tgt_val is not None and tgt_val not in allowed_entity_names:
+                    continue
+                if (
+                    src_val is not None
+                    and tgt_val is not None
+                    and pred_val is not None
+                    and allowed_fact_pairs
+                    and (src_val, pred_val, tgt_val) not in allowed_fact_pairs
+                ):
+                    continue
+                opencypher_rows.append(row)
+        else:
+            opencypher_rows = raw_opencypher_rows
 
         contributing_kbs: set[str] = {c.kb_id for c in chunk_contexts}
         for gf in graph_facts:
