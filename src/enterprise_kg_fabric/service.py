@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import os
+import re
 import uuid
 from contextlib import nullcontext
 from pathlib import Path
@@ -18,6 +21,7 @@ from .adapters.pgvector_store import (
     PostgresPgVectorStoreAdapter,
 )
 from .adaptive_router import PluggableCrossEncoderReranker
+from .auth import AuthEnforcer, get_current_principal
 from .domain_packs import DomainRulePack, resolve_domain_pack
 from .entity_resolution import CrossKBEntityResolver
 from .eval_harness import GraphRAGEvaluationHarness
@@ -25,6 +29,8 @@ from .graph_analytics import GraphAnalyticsEngine, _is_acl_allowed
 from .llama_index_bridge import LlamaIndexHierarchicalNodeParser, LlamaIndexSchemaAndDynamicExtractor
 from .llm_extractor import StructuredLLMExtractorAdapter
 from .models import (
+    AnswerabilityCheckRequest,
+    AnswerabilityCheckResponse,
     ChunkExtractionResult,
     ChunkSearchRequest,
     DLQFailedChunkRecord,
@@ -163,6 +169,35 @@ class EnterpriseKGOntologyService:
         self._pii_redaction_audit_counts: dict[str, int] = {}
         self._sync_jobs: dict[str, SyncJobRecord] = {}
         self._dlq_records: list[DLQFailedChunkRecord] = []
+        self._sync_worker_task: asyncio.Task[Any] | None = None
+        self._sync_worker_lock = asyncio.Lock()
+        self._sync_worker_interval_sec: float = 300.0
+        self._sync_worker_last_cycle: dict[str, Any] | None = None
+        self._metrics: dict[str, int] = {
+            "queries_total": 0,
+            "builds_total": 0,
+            "dlq_total": 0,
+            "ppr_searches_total": 0,
+            "global_searches_total": 0,
+            "answerability_checks_total": 0,
+        }
+        self._principal_enforcer = AuthEnforcer()
+
+    def _enforce_service_principal(
+        self,
+        tenant_id: str,
+        requested_acls: list[str] | None = None,
+        required_role: str | None = None,
+    ) -> tuple[str, list[str] | None]:
+        """Enforces contextvars `AuthPrincipal` inside the service layer (blocks SDK/stdio bypasses)."""
+        principal = get_current_principal()
+        if principal is None:
+            return tenant_id, requested_acls
+        if required_role:
+            self._principal_enforcer.require_role(principal, required_role)
+        safe_tenant = self._principal_enforcer.enforce_tenant(principal, tenant_id)
+        safe_acls = self._principal_enforcer.enforce_acl_groups(principal, requested_acls)
+        return safe_tenant, safe_acls
 
     @classmethod
     def from_env(cls) -> EnterpriseKGOntologyService:
@@ -231,8 +266,8 @@ class EnterpriseKGOntologyService:
         elif graph_backend == "neo4j" and neo4j_uri:
             graph_store = Neo4jOpenCypherGraphAdapter(
                 uri=neo4j_uri,
-                user=os.getenv("NEO4J_USER", "neo4j"),
-                password=os.getenv("NEO4J_PASSWORD", ""),
+                username=os.getenv("NEO4J_USER", "neo4j"),
+                password=os.getenv("NEO4J_PASSWORD") or os.getenv("KG_FABRIC_NEO4J_PASS", ""),
             )
         else:
             graph_store = InMemoryOpenCypherGraphEmulator()
@@ -265,9 +300,109 @@ class EnterpriseKGOntologyService:
         )
 
     async def close(self) -> None:
-        """Gracefully closes database pools and graph drivers (called by FastAPI lifespan)."""
+        """Gracefully stops background workers and closes database pools and graph drivers."""
+        await self.stop_sync_worker()
         await self.vector_store.close()
         await self.graph_store.close()
+
+    # -------------------------------------------------------------------------
+    # Multi-Replica-Safe Built-In Incremental Sync Worker (pg_try_advisory_lock)
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def _sync_lock_key(tenant_id: str) -> int:
+        digest = hashlib.sha256(f"kg_fabric_sync:{tenant_id}".encode("utf-8")).digest()
+        return int.from_bytes(digest[:7], byteorder="big", signed=False)
+
+    async def run_scheduled_sync_cycle(
+        self, tenant_ids: Sequence[str] | None = None
+    ) -> dict[str, Any]:
+        """
+        Executes one multi-replica-safe incremental CDC sync pass across registered tenants.
+        Uses both an in-process `asyncio.Lock` and a PostgreSQL non-blocking advisory lock
+        (`pg_try_advisory_lock`) so autoscaled EKS replicas never race on the same batch.
+        """
+        async with self._sync_worker_lock:
+            if tenant_ids is not None:
+                target_tenants = list(tenant_ids)
+            else:
+                kbs = await self.vector_store.list_registered_kbs(tenant_id=None)
+                target_tenants = sorted({kb.tenant_id for kb in kbs})
+
+            synced: dict[str, Any] = {}
+            skipped_locked: list[str] = []
+            for tid in target_tenants:
+                lock_key = self._sync_lock_key(tid)
+                acquired = await self.vector_store.try_acquire_advisory_lock(lock_key)
+                if not acquired:
+                    skipped_locked.append(tid)
+                    continue
+                try:
+                    tbox = await self.vector_store.load_tbox(tid)
+                    if tbox is None and tid not in self._tboxes:
+                        await self.induce_and_align_ontology(tenant_id=tid)
+                    job = await self.execute_tracked_build_job(
+                        tenant_id=tid,
+                        incremental=True,
+                        validate_shacl=True,
+                    )
+                    synced[tid] = {
+                        "job_id": job.job_id,
+                        "status": job.status.value,
+                        "delta_chunks": job.report.delta_chunks_extracted if job.report else 0,
+                        "dlq_count": job.dlq_count,
+                    }
+                finally:
+                    await self.vector_store.release_advisory_lock(lock_key)
+
+            summary = {
+                "ran_at": utc_now_iso(),
+                "tenants_synced": synced,
+                "tenants_skipped_locked": skipped_locked,
+            }
+            self._sync_worker_last_cycle = summary
+            return summary
+
+    def start_sync_worker(
+        self,
+        interval_sec: float = 300.0,
+        tenant_ids: Sequence[str] | None = None,
+    ) -> None:
+        if self._sync_worker_task is not None and not self._sync_worker_task.done():
+            return
+        self._sync_worker_interval_sec = max(5.0, float(interval_sec))
+
+        async def _loop() -> None:
+            while True:
+                try:
+                    await self.run_scheduled_sync_cycle(tenant_ids=tenant_ids)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self._sync_worker_last_cycle = {
+                        "ran_at": utc_now_iso(),
+                        "error": str(exc),
+                    }
+                await asyncio.sleep(self._sync_worker_interval_sec)
+
+        self._sync_worker_task = asyncio.create_task(_loop())
+
+    async def stop_sync_worker(self) -> None:
+        if self._sync_worker_task is not None:
+            self._sync_worker_task.cancel()
+            try:
+                await self._sync_worker_task
+            except asyncio.CancelledError:
+                pass
+            self._sync_worker_task = None
+
+    def sync_worker_status(self) -> dict[str, Any]:
+        running = self._sync_worker_task is not None and not self._sync_worker_task.done()
+        return {
+            "running": running,
+            "interval_sec": self._sync_worker_interval_sec,
+            "last_cycle": self._sync_worker_last_cycle,
+        }
 
     async def register_vector_kb(self, registration: VectorKBRegistration) -> VectorKBRegistration:
         await self.vector_store.register_kb(registration)
@@ -664,8 +799,124 @@ class EnterpriseKGOntologyService:
 
     async def query_graph_rag(self, request: GraphRAGQueryRequest) -> GraphRAGQueryResponse:
         with _otel_span("kg_fabric.query_graph_rag"):
-            tbox = await self.load_or_get_tbox(request.tenant_id)
-            return await self.rag_engine.query(request=request, tbox=tbox)
+            safe_tenant, safe_acls = self._enforce_service_principal(
+                request.tenant_id, request.caller_acl_groups
+            )
+            scoped_req = request.model_copy(
+                update={"tenant_id": safe_tenant, "caller_acl_groups": safe_acls}
+            )
+            self._metrics["queries_total"] += 1
+            tbox = await self.load_or_get_tbox(safe_tenant)
+            return await self.rag_engine.query(request=scoped_req, tbox=tbox)
+
+    async def check_answerable(
+        self, request: AnswerabilityCheckRequest
+    ) -> AnswerabilityCheckResponse:
+        """
+        Pre-flight Ontology & Multi-KB Graph Coverage Check (`ANSWERABLE` | `PARTIAL` | `UNANSWERABLE`).
+        Prevents hallucinated answers when requested concepts or entities are missing or
+        outside the caller's ABAC `acl_groups` scope.
+        """
+        safe_tenant, safe_acls = self._enforce_service_principal(
+            request.tenant_id, request.caller_acl_groups
+        )
+        self._metrics["answerability_checks_total"] += 1
+        tbox = await self.load_or_get_tbox(safe_tenant)
+        all_entities = await self.graph_store.get_all_entities(safe_tenant)
+
+        q_lower = request.query.lower()
+        stop_words = {
+            "what", "which", "where", "when", "who", "how", "does", "are", "the",
+            "and", "for", "with", "from", "that", "this", "into", "about", "across",
+            "depend", "depends", "connected", "impact", "blast", "radius", "show",
+            "list", "find", "tell", "give", "have", "been", "being", "their",
+        }
+        tokens = [
+            tok for tok in re.findall(r"[a-z0-9][a-z0-9_\-\.]{2,}", q_lower)
+            if tok not in stop_words
+        ]
+
+        matched_classes: list[str] = []
+        for cls_name, cls_def in tbox.classes.items():
+            terms = [cls_name.lower()] + [s.lower() for s in cls_def.synonyms]
+            if any(t in q_lower for t in terms if len(t) >= 3):
+                matched_classes.append(cls_name)
+
+        matched_entities: list[str] = []
+        covered_tokens: set[str] = set()
+        for ent in all_entities.values():
+            if ent.governance_bucket != OntologyStatus.APPROVED:
+                continue
+            if not _is_acl_allowed(ent.acl_groups, safe_acls):
+                continue
+            names = [ent.canonical_name.lower()] + [a.lower() for a in ent.aliases]
+            if any(n in q_lower for n in names if len(n) >= 3):
+                matched_entities.append(ent.canonical_name)
+                for tok in tokens:
+                    if any(tok in n or n in tok for n in names):
+                        covered_tokens.add(tok)
+
+        q_vec = self.embedding_provider.embed_text(request.query, dim=self.canonical_dim)
+        chunk_hits = await self.vector_store.hybrid_search_chunks(
+            tenant_id=safe_tenant,
+            query_text=request.query,
+            query_embedding=q_vec,
+            top_k=5,
+            caller_acl_groups=safe_acls,
+        )
+        for chk in chunk_hits:
+            chk_l = chk.text.lower()
+            for tok in tokens:
+                if tok in chk_l:
+                    covered_tokens.add(tok)
+
+        for cls_name in matched_classes:
+            cls_l = cls_name.lower()
+            for tok in tokens:
+                if tok in cls_l or cls_l in tok:
+                    covered_tokens.add(tok)
+
+        unmatched = [t for t in dict.fromkeys(tokens) if t not in covered_tokens]
+        if tokens:
+            coverage = round(len(covered_tokens) / len(set(tokens)), 3)
+        else:
+            coverage = 1.0 if (matched_entities or chunk_hits) else 0.0
+
+        if (matched_entities or covered_tokens) and coverage >= 0.60:
+            status = "ANSWERABLE"
+            answerable = True
+            hint = None
+        elif matched_entities or matched_classes or covered_tokens:
+            status = "PARTIAL"
+            answerable = False
+            hint = (
+                f"Partial graph/KB coverage ({coverage:.0%}). Missing or restricted concepts: "
+                f"{', '.join(unmatched[:5]) or 'none'}."
+            )
+        else:
+            status = "UNANSWERABLE"
+            answerable = False
+            hint = (
+                "No authorized KB chunks, entities, or ontology classes cover this query. "
+                "Verify KB ingestion, ontology induction, or caller ACL groups."
+            )
+
+        return AnswerabilityCheckResponse(
+            query=request.query,
+            tenant_id=safe_tenant,
+            answerable=answerable,
+            status=status,
+            coverage_score=coverage,
+            matched_tbox_classes=sorted(set(matched_classes)),
+            matched_entities=sorted(set(matched_entities)),
+            unmatched_terms=unmatched[:10],
+            evidence_counts={
+                "matched_entities": len(set(matched_entities)),
+                "matched_tbox_classes": len(set(matched_classes)),
+                "accessible_chunks": len(chunk_hits),
+            },
+            clarification_hint=hint,
+        )
 
     # -------------------------------------------------------------------------
     # Granular Agentic Search Primitives + HippoRAG PPR + Leiden Global Search
@@ -674,22 +925,28 @@ class EnterpriseKGOntologyService:
     async def search_vector_chunks(
         self, request: ChunkSearchRequest
     ) -> list[RetrievedChunkContext]:
+        safe_tenant, safe_acls = self._enforce_service_principal(
+            request.tenant_id, request.caller_acl_groups
+        )
         q_vec = self.embedding_provider.embed_text(request.query, dim=self.canonical_dim)
         chunks = await self.vector_store.hybrid_search_chunks(
-            tenant_id=request.tenant_id,
+            tenant_id=safe_tenant,
             query_text=request.query,
             query_embedding=q_vec,
             top_k=request.top_k,
             kb_filter=request.kb_filter,
             domain_filter=request.domain_filter,
-            caller_acl_groups=request.caller_acl_groups,
+            caller_acl_groups=safe_acls,
         )
         return self.reranker.rerank_chunks(request.query, chunks, top_k=request.top_k)
 
     async def search_kg_entities(
         self, request: EntitySearchRequest
     ) -> list[EntitySearchMatch]:
-        all_entities = await self.graph_store.get_all_entities(request.tenant_id)
+        safe_tenant, safe_acls = self._enforce_service_principal(
+            request.tenant_id, request.caller_acl_groups
+        )
+        all_entities = await self.graph_store.get_all_entities(safe_tenant)
         q_lower = request.query.strip().lower()
         q_vec = self.embedding_provider.embed_text(request.query, dim=self.canonical_dim)
 
@@ -697,7 +954,7 @@ class EnterpriseKGOntologyService:
         for ent in all_entities.values():
             if not request.include_quarantined and ent.governance_bucket != OntologyStatus.APPROVED:
                 continue
-            if not _is_acl_allowed(ent.acl_groups, request.caller_acl_groups):
+            if not _is_acl_allowed(ent.acl_groups, safe_acls):
                 continue
             if (
                 request.ontology_class_filter
@@ -741,23 +998,26 @@ class EnterpriseKGOntologyService:
     async def traverse_entity_subgraph(
         self, request: SubgraphSearchRequest
     ) -> SubgraphSearchResponse:
-        all_entities = await self.graph_store.get_all_entities(request.tenant_id)
+        safe_tenant, safe_acls = self._enforce_service_principal(
+            request.tenant_id, request.caller_acl_groups
+        )
+        all_entities = await self.graph_store.get_all_entities(safe_tenant)
         resolved_ids = self._resolve_seed_names_to_ids(all_entities, request.seed_entities)
 
         facts, bridges = await self.graph_store.expand_k_hop_subgraph(
-            tenant_id=request.tenant_id,
+            tenant_id=safe_tenant,
             seed_entity_ids=resolved_ids,
             max_hops=request.max_hops,
             include_quarantined=request.include_quarantined,
             as_of_iso=request.as_of_iso,
-            caller_acl_groups=request.caller_acl_groups,
+            caller_acl_groups=safe_acls,
         )
         if request.predicate_filter:
             allowed_preds = {p.upper() for p in request.predicate_filter}
             facts = [f for f in facts if f.predicate.upper() in allowed_preds]
 
         return SubgraphSearchResponse(
-            tenant_id=request.tenant_id,
+            tenant_id=safe_tenant,
             resolved_seed_entity_ids=resolved_ids,
             cross_kb_bridge_entities=bridges,
             facts=facts,
@@ -765,35 +1025,43 @@ class EnterpriseKGOntologyService:
 
     async def search_ppr_subgraph(self, request: PPRSearchRequest) -> PPRSearchResponse:
         """HippoRAG 2 Personalized PageRank hub-damped subgraph retrieval."""
-        all_entities = await self.graph_store.get_all_entities(request.tenant_id)
+        safe_tenant, safe_acls = self._enforce_service_principal(
+            request.tenant_id, request.caller_acl_groups
+        )
+        self._metrics["ppr_searches_total"] += 1
+        all_entities = await self.graph_store.get_all_entities(safe_tenant)
         all_edges = await self.graph_store.get_all_edges(
-            request.tenant_id, active_only=(request.as_of_iso is None)
+            safe_tenant, active_only=(request.as_of_iso is None)
         )
         resolved_ids = self._resolve_seed_names_to_ids(all_entities, request.seed_entities)
         return self.graph_analytics.search_ppr_subgraph(
-            tenant_id=request.tenant_id,
+            tenant_id=safe_tenant,
             entities=all_entities,
             edges=all_edges,
             seed_entity_ids=resolved_ids,
             top_k_facts=request.top_k_facts,
             alpha=request.alpha,
             as_of_iso=request.as_of_iso,
-            caller_acl_groups=request.caller_acl_groups,
+            caller_acl_groups=safe_acls,
         )
 
     async def query_global_communities(
         self, request: GlobalCommunitySearchRequest
     ) -> GlobalCommunitySearchResponse:
         """Microsoft GraphRAG Leiden/Louvain Hierarchical Community Global Sensemaking."""
-        all_entities = await self.graph_store.get_all_entities(request.tenant_id)
-        all_edges = await self.graph_store.get_all_edges(request.tenant_id, active_only=True)
+        safe_tenant, safe_acls = self._enforce_service_principal(
+            request.tenant_id, request.caller_acl_groups
+        )
+        self._metrics["global_searches_total"] += 1
+        all_entities = await self.graph_store.get_all_entities(safe_tenant)
+        all_edges = await self.graph_store.get_all_edges(safe_tenant, active_only=True)
         return self.graph_analytics.query_global_communities(
-            tenant_id=request.tenant_id,
+            tenant_id=safe_tenant,
             query=request.query,
             entities=all_entities,
             edges=all_edges,
             top_k_communities=request.top_k_communities,
-            caller_acl_groups=request.caller_acl_groups,
+            caller_acl_groups=safe_acls,
         )
 
     async def run_eval_suite(
@@ -836,18 +1104,52 @@ class EnterpriseKGOntologyService:
                 f"Mutating OpenCypher keyword '{m.group(1)}' is forbidden on read-only search endpoint."
             )
 
+    def get_metrics_snapshot(self) -> dict[str, Any]:
+        return {
+            **self._metrics,
+            "sync_jobs_cached": len(self._sync_jobs),
+            "dlq_records_cached": len(self._dlq_records),
+            "sync_worker": self.sync_worker_status(),
+            "pii_redaction_audit_counts": dict(self._pii_redaction_audit_counts),
+        }
+
+    def get_prometheus_metrics_text(self) -> str:
+        snap = self.get_metrics_snapshot()
+        lines = [
+            "# HELP kg_fabric_queries_total Total GraphRAG queries processed",
+            "# TYPE kg_fabric_queries_total counter",
+            f"kg_fabric_queries_total {snap['queries_total']}",
+            "# HELP kg_fabric_ppr_searches_total Total HippoRAG PPR subgraph searches",
+            "# TYPE kg_fabric_ppr_searches_total counter",
+            f"kg_fabric_ppr_searches_total {snap['ppr_searches_total']}",
+            "# HELP kg_fabric_global_searches_total Total Leiden global community searches",
+            "# TYPE kg_fabric_global_searches_total counter",
+            f"kg_fabric_global_searches_total {snap['global_searches_total']}",
+            "# HELP kg_fabric_answerability_checks_total Total pre-flight answerability checks",
+            "# TYPE kg_fabric_answerability_checks_total counter",
+            f"kg_fabric_answerability_checks_total {snap['answerability_checks_total']}",
+            "# HELP kg_fabric_dlq_records_cached Current DLQ failed chunk count",
+            "# TYPE kg_fabric_dlq_records_cached gauge",
+            f"kg_fabric_dlq_records_cached {snap['dlq_records_cached']}",
+            "# HELP kg_fabric_sync_worker_running Whether background incremental sync worker is active",
+            "# TYPE kg_fabric_sync_worker_running gauge",
+            f"kg_fabric_sync_worker_running {1 if snap['sync_worker']['running'] else 0}",
+        ]
+        return "\n".join(lines) + "\n"
+
     async def execute_readonly_opencypher(
         self, request: ReadOnlyCypherSearchRequest
     ) -> ReadOnlyCypherSearchResponse:
+        safe_tenant, _ = self._enforce_service_principal(request.tenant_id)
         self.validate_readonly_opencypher(request.cypher_query)
-        params = {**request.params, "tenant_id": request.tenant_id}
+        params = {**request.params, "tenant_id": safe_tenant}
         rows = await self.graph_store.execute_opencypher(
-            tenant_id=request.tenant_id,
+            tenant_id=safe_tenant,
             cypher_query=request.cypher_query,
             params=params,
         )
         return ReadOnlyCypherSearchResponse(
-            tenant_id=request.tenant_id,
+            tenant_id=safe_tenant,
             cypher_query=request.cypher_query,
             rows=rows,
             row_count=len(rows),

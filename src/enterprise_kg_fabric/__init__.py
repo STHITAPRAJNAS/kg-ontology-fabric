@@ -7,11 +7,23 @@ from .adapters import (
     PostgresPgVectorStoreAdapter,
     PropertyGraphStorePort,
     get_production_pgvector_ddl,
+    get_rls_app_role_ddl,
 )
 from .adaptive_router import AdaptiveQueryRouter, PluggableCrossEncoderReranker
 from .api import API_VERSION as __version__
 from .api import create_kg_fabric_app, create_kg_fabric_app_from_env
-from .auth import AuthConfig, AuthEnforcer, AuthMode, AuthPrincipal, create_hs256_jwt
+from .auth import (
+    MIN_JWT_SECRET_BYTES,
+    AuthConfig,
+    AuthEnforcer,
+    AuthMode,
+    AuthPrincipal,
+    BoundedApiRateLimiter,
+    create_hs256_jwt,
+    get_current_principal,
+    reset_current_principal,
+    set_current_principal,
+)
 from .domain_packs import (
     BUILTIN_DOMAIN_PACKS,
     CLOUD_SRE_DOMAIN_PACK,
@@ -31,6 +43,8 @@ from .llama_index_bridge import (
 from .llm_extractor import AsyncCircuitBreaker, StructuredLLMExtractorAdapter
 from .mcp_server import KGFabricMcpServer, create_fastmcp_server
 from .models import (
+    AnswerabilityCheckRequest,
+    AnswerabilityCheckResponse,
     ChunkExtractionResult,
     ChunkSearchRequest,
     CommunitySummaryRecord,

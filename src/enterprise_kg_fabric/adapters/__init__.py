@@ -9,6 +9,7 @@ from .pgvector_store import (
     PgVectorStorePort,
     PostgresPgVectorStoreAdapter,
     get_production_pgvector_ddl,
+    get_rls_app_role_ddl,
 )
 
 __all__ = [
@@ -16,6 +17,7 @@ __all__ = [
     "InMemoryPgVectorStoreEmulator",
     "PostgresPgVectorStoreAdapter",
     "get_production_pgvector_ddl",
+    "get_rls_app_role_ddl",
     "PropertyGraphStorePort",
     "InMemoryOpenCypherGraphEmulator",
     "Neo4jOpenCypherGraphAdapter",

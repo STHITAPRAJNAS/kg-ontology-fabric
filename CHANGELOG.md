@@ -3,15 +3,20 @@
 All notable changes to `enterprise-kg-ontology-fabric` are documented in this file.
 
 ## [0.3.0] - 2026-11-23
-### Added — PyPI Release Readiness & Dual-Mode Self-Hosting
-- **CLI Entrypoint (`kg-fabric`)**: Added `[project.scripts]` CLI (`kg-fabric serve`, `kg-fabric mcp`, `kg-fabric init-db`, `kg-fabric version`) with a strict non-loopback (`0.0.0.0`) unauthenticated bind guard (`--allow-unauthenticated` / `KG_FABRIC_ALLOW_UNAUTHENTICATED=true` required when `KG_FABRIC_AUTH_MODE=none`).
-- **Authentication, Tenant Isolation & ABAC Enforcement (`auth.py`, `api.py`)**:
-  - Supports `KG_FABRIC_AUTH_MODE=api_key` (static or JSON principal map) and `KG_FABRIC_AUTH_MODE=jwt` (strict `exp` + `tenant_id` validation via PyJWT or built-in stdlib HS256).
-  - Enforces tenant isolation (`403` on cross-tenant smuggling), role checks (`writer` / `admin`), and caller ABAC `acl_groups` intersection across all FastAPI endpoints and MCP tool invocations (`/mcp`, `/mcp/http`, `/v1/mcp/call`).
-- **Pluggable Domain Packs (`domain_packs.py`)**: Extracted fallback ontology rules into `DomainRulePack` with built-in `CLOUD_SRE_DOMAIN_PACK` and domain-neutral `GENERIC_DOMAIN_PACK` (`KG_FABRIC_DOMAIN_PACK=generic|cloud_sre`), plus full SDK extensibility.
-- **Env-Auto-Wired Factory & FastAPI `lifespan`**: Added `EnterpriseKGOntologyService.from_env()`, `create_kg_fabric_app_from_env()`, standard `PGHOST`/`PGPORT`/`PGDATABASE`/`PGUSER`/`PGPASSWORD` + `PGVECTOR_DSN` support, and graceful `async def close()` pool/driver shutdown.
-- **Durable PostgreSQL Sync Jobs & DLQ**: Added `kg_sync_jobs` and `kg_dlq_chunks` tables to PostgreSQL DDL and wired `save_sync_job`, `get_sync_job_async`, `append_dlq_record`, and `list_dlq_records_async` for multi-pod EKS durability.
-- **Self-Hosted Full-Stack Compose & CI/CD**: Added optional `kg-fabric-api` service profile (`docker compose --profile app up -d --build`), `.env.example`, and GitHub Actions CI (`ci.yml`) + PyPI Trusted Publishing release workflow (`release.yml`).
+### Added — PyPI Release Readiness, `adk-memory-platform` Hardening Parity & Live-Docker RLS Verification
+- **CLI Entrypoint (`kg-fabric`)**: Added `[project.scripts]` CLI (`kg-fabric serve`, `kg-fabric mcp`, `kg-fabric init-db`, `kg-fabric migrate-db --app-role kg_app_user`, `kg-fabric version`) with a strict non-loopback (`0.0.0.0`) unauthenticated bind guard and env-only secrets (no CLI secret flags).
+- **Hardened Authentication, BYOA, Rate Limiting & Service-Layer `contextvars` Enforcement (`auth.py`, `api.py`, `service.py`, `mcp_server.py`)**:
+  - Supports `KG_FABRIC_AUTH_MODE=api_key`, `jwt` (strict `exp` + `tenant_id` + **minimum 32-byte secret**), and `custom` Bring-Your-Own-Auth (BYOA) hooks (`custom_request_authenticator(headers)` for API Gateway/Envoy/Kong/IAP and `custom_token_verifier(token)`).
+  - Enforces bounded API rate limiting (`BoundedApiRateLimiter`, `429`), query-vs-body `tenant_id` smuggling rejection (`403`), and propagates `AuthPrincipal` via `contextvars` (`get_current_principal` / `set_current_principal`) into `EnterpriseKGOntologyService` and `KGFabricMcpServer` (closing direct SDK, MCP `stdio`, and MCP resource-read bypasses).
+- **Fail-Closed PostgreSQL 16 Row-Level Security (`NOBYPASSRLS`) & Live Adapter Fixes (`adapters/pgvector_store.py`, `adapters/graph_stores.py`)**:
+  - Added fail-closed `CREATE POLICY` RLS rules across all 6 multi-tenant PostgreSQL tables + transaction-local `SET LOCAL app.current_tenant_id` + `get_rls_app_role_ddl()` (`NOBYPASSRLS` role provisioning).
+  - Persisted and restored `acl_groups` across PostgreSQL `unified_rag_chunks` (JSONB column + GIN index + SQL filter) and Neo4j 5 nodes/edges, persisted N-ary `qualifiers_json` on live Neo4j 5 edges, added Neo4j composite indexes (`:Entity(tenant_id, entity_id)`), and batched non-functional edge upserts via `UNWIND`.
+- **Pre-Flight Answerability Check, Multi-Replica Sync Worker, Metrics & Governance Console**:
+  - Added `POST /v1/rag/check-answerable` & 13th MCP tool `check_answerable` (`ANSWERABLE` | `PARTIAL` | `UNANSWERABLE`).
+  - Added opt-in multi-replica-safe background incremental CDC sync worker (`start_sync_worker` / `run_scheduled_sync_cycle`) coordinated via `asyncio.Lock` + PostgreSQL `pg_try_advisory_lock`.
+  - Added `GET /metrics` (Prometheus exposition), `GET /v1/metrics` (JSON), and lightweight Governance Console SPA at `GET /ui`.
+- **Pluggable Domain Packs (`domain_packs.py`)**: Extracted fallback ontology rules into `DomainRulePack` with built-in `CLOUD_SRE_DOMAIN_PACK` and domain-neutral `GENERIC_DOMAIN_PACK` (`KG_FABRIC_DOMAIN_PACK=generic|cloud_sre`).
+- **Live-Docker Adversarial & SOTA Verification (`examples/live_docker_v03_full_verification.py`)**: Verified live on Docker PostgreSQL 16 (`NOBYPASSRLS` `kg_app_user`) + Neo4j 5 + live Uvicorn HTTP server.
 
 ## [0.2.0] - 2026-11-23
 ### Added — 2024–2026 SOTA GraphRAG & Enterprise Production Capabilities

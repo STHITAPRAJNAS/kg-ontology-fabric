@@ -4,7 +4,8 @@ import json
 import math
 import re
 from abc import ABC, abstractmethod
-from typing import Any, Sequence
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator, Sequence
 
 from ..models import (
     DLQFailedChunkRecord,
@@ -67,10 +68,14 @@ CREATE TABLE IF NOT EXISTS unified_rag_chunks (
     content_sha256 TEXT NOT NULL,
     canonical_embedding vector({canonical_dim}) NOT NULL,
     section_path TEXT NOT NULL DEFAULT '',
+    acl_groups JSONB NOT NULL DEFAULT '["public"]'::jsonb,
     metadata JSONB NOT NULL DEFAULT '{{}}'::jsonb,
     tsv tsvector GENERATED ALWAYS AS (to_tsvector('english', text)) STORED,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE unified_rag_chunks
+    ADD COLUMN IF NOT EXISTS acl_groups JSONB NOT NULL DEFAULT '["public"]'::jsonb;
 
 CREATE INDEX IF NOT EXISTS idx_unified_chunks_hnsw
     ON unified_rag_chunks USING hnsw (canonical_embedding vector_cosine_ops)
@@ -81,6 +86,9 @@ CREATE INDEX IF NOT EXISTS idx_unified_chunks_tsv
 
 CREATE INDEX IF NOT EXISTS idx_unified_chunks_tenant_kb
     ON unified_rag_chunks (tenant_id, kb_id, domain_tag);
+
+CREATE INDEX IF NOT EXISTS idx_unified_chunks_acl_gin
+    ON unified_rag_chunks USING gin (acl_groups);
 
 CREATE TABLE IF NOT EXISTS canonical_entity_embeddings (
     entity_id TEXT PRIMARY KEY,
@@ -126,8 +134,107 @@ CREATE TABLE IF NOT EXISTS kg_dlq_chunks (
 CREATE INDEX IF NOT EXISTS idx_kg_dlq_chunks_tenant
     ON kg_dlq_chunks (tenant_id, failed_at DESC);
 
+-- Fail-Closed Row-Level Security (RLS) across all multi-tenant tables
+-- Enforced automatically for non-superuser app roles (`NOBYPASSRLS`) via `SET LOCAL app.current_tenant_id`
+ALTER TABLE kb_federation_registry ENABLE ROW LEVEL SECURITY;
 ALTER TABLE unified_rag_chunks ENABLE ROW LEVEL SECURITY;
 ALTER TABLE canonical_entity_embeddings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE enterprise_tbox_registry ENABLE ROW LEVEL SECURITY;
+ALTER TABLE kg_sync_jobs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE kg_dlq_chunks ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS rls_kb_federation_tenant ON kb_federation_registry;
+CREATE POLICY rls_kb_federation_tenant ON kb_federation_registry
+    USING (
+        current_setting('app.current_tenant_id', true) = '*'
+        OR tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')
+    )
+    WITH CHECK (
+        current_setting('app.current_tenant_id', true) = '*'
+        OR tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')
+    );
+
+DROP POLICY IF EXISTS rls_unified_chunks_tenant ON unified_rag_chunks;
+CREATE POLICY rls_unified_chunks_tenant ON unified_rag_chunks
+    USING (
+        current_setting('app.current_tenant_id', true) = '*'
+        OR tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')
+    )
+    WITH CHECK (
+        current_setting('app.current_tenant_id', true) = '*'
+        OR tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')
+    );
+
+DROP POLICY IF EXISTS rls_canonical_entities_tenant ON canonical_entity_embeddings;
+CREATE POLICY rls_canonical_entities_tenant ON canonical_entity_embeddings
+    USING (
+        current_setting('app.current_tenant_id', true) = '*'
+        OR tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')
+    )
+    WITH CHECK (
+        current_setting('app.current_tenant_id', true) = '*'
+        OR tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')
+    );
+
+DROP POLICY IF EXISTS rls_tbox_registry_tenant ON enterprise_tbox_registry;
+CREATE POLICY rls_tbox_registry_tenant ON enterprise_tbox_registry
+    USING (
+        current_setting('app.current_tenant_id', true) = '*'
+        OR tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')
+    )
+    WITH CHECK (
+        current_setting('app.current_tenant_id', true) = '*'
+        OR tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')
+    );
+
+DROP POLICY IF EXISTS rls_sync_jobs_tenant ON kg_sync_jobs;
+CREATE POLICY rls_sync_jobs_tenant ON kg_sync_jobs
+    USING (
+        current_setting('app.current_tenant_id', true) = '*'
+        OR tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')
+    )
+    WITH CHECK (
+        current_setting('app.current_tenant_id', true) = '*'
+        OR tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')
+    );
+
+DROP POLICY IF EXISTS rls_dlq_chunks_tenant ON kg_dlq_chunks;
+CREATE POLICY rls_dlq_chunks_tenant ON kg_dlq_chunks
+    USING (
+        current_setting('app.current_tenant_id', true) = '*'
+        OR tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')
+    )
+    WITH CHECK (
+        current_setting('app.current_tenant_id', true) = '*'
+        OR tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')
+    );
+""".strip()
+
+
+def get_rls_app_role_ddl(role_name: str = "kg_app_user", password: str = "") -> str:
+    """
+    Idempotently provisions a least-privilege PostgreSQL runtime role (`NOBYPASSRLS`)
+    so PostgreSQL Row-Level Security policies are strictly enforced in production.
+    """
+    if not re.match(r"^[a-z_][a-z0-9_]{0,62}$", role_name):
+        raise ValueError(f"Invalid PostgreSQL role name: {role_name}")
+    escaped_pw = password.replace("'", "''")
+    pw_clause = f"PASSWORD '{escaped_pw}'" if escaped_pw else ""
+    return f"""
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = '{role_name}') THEN
+        CREATE ROLE {role_name} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS {pw_clause};
+    ELSE
+        ALTER ROLE {role_name} WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS {pw_clause};
+    END IF;
+END
+$$;
+GRANT USAGE ON SCHEMA public TO {role_name};
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO {role_name};
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO {role_name};
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO {role_name};
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO {role_name};
 """.strip()
 
 
@@ -151,6 +258,12 @@ class PgVectorStorePort(ABC):
 
     async def list_dlq_records(self, tenant_id: str | None = None) -> list[DLQFailedChunkRecord]:
         return []
+
+    async def try_acquire_advisory_lock(self, lock_key: int) -> bool:
+        return True
+
+    async def release_advisory_lock(self, lock_key: int) -> None:
+        return None
 
     async def close(self) -> None:
         return None
@@ -237,6 +350,16 @@ class InMemoryPgVectorStoreEmulator(PgVectorStorePort):
         self._tboxes: dict[str, EnterpriseCompiledTBox] = {}
         self._sync_jobs: dict[str, SyncJobRecord] = {}
         self._dlq_records: list[DLQFailedChunkRecord] = []
+        self._advisory_locks: set[int] = set()
+
+    async def try_acquire_advisory_lock(self, lock_key: int) -> bool:
+        if lock_key in self._advisory_locks:
+            return False
+        self._advisory_locks.add(lock_key)
+        return True
+
+    async def release_advisory_lock(self, lock_key: int) -> None:
+        self._advisory_locks.discard(lock_key)
 
     async def save_tbox(self, tbox: EnterpriseCompiledTBox) -> None:
         self._tboxes[tbox.tenant_id] = tbox
@@ -485,24 +608,79 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
         dsn: str,
         embedding_provider: EmbeddingProvider,
         canonical_dim: int = 256,
+        auto_init_schema: bool = True,
     ):
         self.dsn = dsn
         self.embedding_provider = embedding_provider
         self.canonical_dim = canonical_dim
+        self.auto_init_schema = auto_init_schema
         self._pool: Any = None
+        self._advisory_lock_conns: dict[int, Any] = {}
 
     async def _get_pool(self) -> Any:
         if self._pool is None:
             import asyncpg
 
             self._pool = await asyncpg.create_pool(dsn=self.dsn, min_size=1, max_size=10)
-            async with self._pool.acquire() as conn:
-                await conn.execute(get_production_pgvector_ddl(self.canonical_dim))
+            if self.auto_init_schema:
+                async with self._pool.acquire() as conn:
+                    try:
+                        await conn.execute(get_production_pgvector_ddl(self.canonical_dim))
+                    except Exception as exc:
+                        # Non-superuser runtime roles (`NOBYPASSRLS`) rely on pre-migrated schema
+                        if "InsufficientPrivilege" not in type(exc).__name__ and "permission denied" not in str(exc).lower():
+                            raise
         return self._pool
 
-    async def register_kb(self, registration: VectorKBRegistration) -> None:
+    @asynccontextmanager
+    async def _scoped_conn(self, tenant_id: str | None = "*") -> AsyncIterator[Any]:
+        """
+        Acquires a pooled connection inside a transaction and sets transaction-local
+        `app.current_tenant_id` so PostgreSQL Row-Level Security policies enforce tenant
+        boundaries directly in the database kernel for `NOBYPASSRLS` roles.
+        """
+        pool = await self._get_pool()
+        scope_val = tenant_id if tenant_id else "*"
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "SELECT set_config('app.current_tenant_id', $1, true)",
+                    scope_val,
+                )
+                yield conn
+
+    async def migrate_schema_and_rls(
+        self,
+        app_role_name: str | None = None,
+        app_role_password: str = "",
+    ) -> None:
+        """Idempotently applies schema tables, `acl_groups` column, RLS policies, and optional `NOBYPASSRLS` role."""
         pool = await self._get_pool()
         async with pool.acquire() as conn:
+            await conn.execute(get_production_pgvector_ddl(self.canonical_dim))
+            if app_role_name:
+                await conn.execute(get_rls_app_role_ddl(app_role_name, app_role_password))
+
+    async def try_acquire_advisory_lock(self, lock_key: int) -> bool:
+        pool = await self._get_pool()
+        conn = await pool.acquire()
+        acquired = bool(await conn.fetchval("SELECT pg_try_advisory_lock($1)", int(lock_key)))
+        if acquired:
+            self._advisory_lock_conns[int(lock_key)] = conn
+            return True
+        await pool.release(conn)
+        return False
+
+    async def release_advisory_lock(self, lock_key: int) -> None:
+        conn = self._advisory_lock_conns.pop(int(lock_key), None)
+        if conn is not None and self._pool is not None:
+            try:
+                await conn.execute("SELECT pg_advisory_unlock($1)", int(lock_key))
+            finally:
+                await self._pool.release(conn)
+
+    async def register_kb(self, registration: VectorKBRegistration) -> None:
+        async with self._scoped_conn(registration.tenant_id) as conn:
             await conn.execute(
                 """
                 INSERT INTO kb_federation_registry (
@@ -530,8 +708,7 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
             )
 
     async def list_registered_kbs(self, tenant_id: str | None = None) -> list[VectorKBRegistration]:
-        pool = await self._get_pool()
-        async with pool.acquire() as conn:
+        async with self._scoped_conn(tenant_id or "*") as conn:
             if tenant_id:
                 rows = await conn.fetch(
                     "SELECT * FROM kb_federation_registry WHERE tenant_id = $1 ORDER BY kb_id",
@@ -564,13 +741,14 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
         return val
 
     async def close(self) -> None:
+        for lock_key in list(self._advisory_lock_conns.keys()):
+            await self.release_advisory_lock(lock_key)
         if self._pool is not None:
             await self._pool.close()
             self._pool = None
 
     async def save_tbox(self, tbox: EnterpriseCompiledTBox) -> None:
-        pool = await self._get_pool()
-        async with pool.acquire() as conn:
+        async with self._scoped_conn(tbox.tenant_id) as conn:
             await conn.execute(
                 """
                 INSERT INTO enterprise_tbox_registry (tenant_id, tbox_version, tbox_json)
@@ -586,8 +764,7 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
             )
 
     async def load_tbox(self, tenant_id: str) -> EnterpriseCompiledTBox | None:
-        pool = await self._get_pool()
-        async with pool.acquire() as conn:
+        async with self._scoped_conn(tenant_id) as conn:
             row = await conn.fetchrow(
                 "SELECT tbox_json FROM enterprise_tbox_registry WHERE tenant_id = $1",
                 tenant_id,
@@ -598,11 +775,10 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
             return EnterpriseCompiledTBox.model_validate(raw)
 
     async def initialize_schema(self) -> None:
-        await self._get_pool()
+        await self.migrate_schema_and_rls()
 
     async def save_sync_job(self, job: SyncJobRecord) -> None:
-        pool = await self._get_pool()
-        async with pool.acquire() as conn:
+        async with self._scoped_conn(job.tenant_id) as conn:
             await conn.execute(
                 """
                 INSERT INTO kg_sync_jobs (job_id, tenant_id, status, job_json)
@@ -619,8 +795,7 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
             )
 
     async def get_sync_job(self, job_id: str) -> SyncJobRecord | None:
-        pool = await self._get_pool()
-        async with pool.acquire() as conn:
+        async with self._scoped_conn("*") as conn:
             row = await conn.fetchrow(
                 "SELECT job_json FROM kg_sync_jobs WHERE job_id = $1",
                 job_id,
@@ -631,8 +806,7 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
             return SyncJobRecord.model_validate(raw)
 
     async def append_dlq_record(self, record: DLQFailedChunkRecord) -> None:
-        pool = await self._get_pool()
-        async with pool.acquire() as conn:
+        async with self._scoped_conn(record.tenant_id) as conn:
             await conn.execute(
                 """
                 INSERT INTO kg_dlq_chunks (tenant_id, kb_id, chunk_id, record_json)
@@ -645,8 +819,7 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
             )
 
     async def list_dlq_records(self, tenant_id: str | None = None) -> list[DLQFailedChunkRecord]:
-        pool = await self._get_pool()
-        async with pool.acquire() as conn:
+        async with self._scoped_conn(tenant_id or "*") as conn:
             if tenant_id is not None:
                 rows = await conn.fetch(
                     "SELECT record_json FROM kg_dlq_chunks WHERE tenant_id = $1 ORDER BY dlq_id ASC",
@@ -707,15 +880,20 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
         return hydrated
 
     async def upsert_kb_chunks(self, kb_id: str, chunks: Sequence[VectorChunkRecord]) -> int:
-        pool = await self._get_pool()
-        rows_to_insert = []
+        if not chunks:
+            return 0
+        # Group by tenant_id so each batch executes under its strict RLS tenant context
+        by_tenant: dict[str, list[tuple[Any, ...]]] = {}
         for chk in chunks:
             if not chk.canonical_embedding:
                 chk.canonical_embedding = self.embedding_provider.embed_text(
                     chk.text, dim=self.canonical_dim
                 )
             vec_str = "[" + ",".join(f"{v:.6f}" for v in chk.canonical_embedding) + "]"
-            rows_to_insert.append(
+            meta_copy = dict(chk.metadata)
+            acls = list(chk.acl_groups or ["public"])
+            meta_copy["acl_groups"] = acls
+            by_tenant.setdefault(chk.tenant_id, []).append(
                 (
                     chk.chunk_id,
                     kb_id,
@@ -726,25 +904,28 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
                     chk.content_sha256,
                     vec_str,
                     chk.section_path,
-                    json.dumps(chk.metadata),
+                    json.dumps(acls),
+                    json.dumps(meta_copy),
                 )
             )
-        async with pool.acquire() as conn:
-            await conn.executemany(
-                """
-                INSERT INTO unified_rag_chunks (
-                    chunk_id, kb_id, tenant_id, domain_tag, doc_id, text,
-                    content_sha256, canonical_embedding, section_path, metadata
-                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::vector,$9,$10::jsonb)
-                ON CONFLICT (chunk_id) DO UPDATE SET
-                    text = EXCLUDED.text,
-                    content_sha256 = EXCLUDED.content_sha256,
-                    canonical_embedding = EXCLUDED.canonical_embedding,
-                    metadata = EXCLUDED.metadata,
-                    updated_at = NOW()
-                """,
-                rows_to_insert,
-            )
+        for t_id, rows_to_insert in by_tenant.items():
+            async with self._scoped_conn(t_id) as conn:
+                await conn.executemany(
+                    """
+                    INSERT INTO unified_rag_chunks (
+                        chunk_id, kb_id, tenant_id, domain_tag, doc_id, text,
+                        content_sha256, canonical_embedding, section_path, acl_groups, metadata
+                    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::vector,$9,$10::jsonb,$11::jsonb)
+                    ON CONFLICT (chunk_id) DO UPDATE SET
+                        text = EXCLUDED.text,
+                        content_sha256 = EXCLUDED.content_sha256,
+                        canonical_embedding = EXCLUDED.canonical_embedding,
+                        acl_groups = EXCLUDED.acl_groups,
+                        metadata = EXCLUDED.metadata,
+                        updated_at = NOW()
+                    """,
+                    rows_to_insert,
+                )
         return len(chunks)
 
     async def fetch_kb_chunks(
@@ -753,14 +934,13 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
         only_unindexed_or_changed: bool = False,
         target_tbox_version: str | None = None,
     ) -> list[VectorChunkRecord]:
-        pool = await self._get_pool()
-        async with pool.acquire() as conn:
+        async with self._scoped_conn("*") as conn:
             if only_unindexed_or_changed:
                 rows = await conn.fetch(
                     """
                     SELECT c.chunk_id, c.kb_id, c.tenant_id, c.domain_tag, c.doc_id,
                            c.text, c.content_sha256, c.canonical_embedding::text AS emb_txt,
-                           c.section_path, c.metadata, c.updated_at
+                           c.section_path, c.acl_groups, c.metadata, c.updated_at
                     FROM unified_rag_chunks c
                     LEFT JOIN kb_ingestion_watermarks w
                       ON c.kb_id = w.kb_id AND c.chunk_id = w.chunk_id
@@ -776,27 +956,34 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
                     """
                     SELECT chunk_id, kb_id, tenant_id, domain_tag, doc_id,
                            text, content_sha256, canonical_embedding::text AS emb_txt,
-                           section_path, metadata, updated_at
+                           section_path, acl_groups, metadata, updated_at
                     FROM unified_rag_chunks WHERE kb_id = $1
                     """,
                     kb_id,
                 )
-            return [
-                VectorChunkRecord(
-                    chunk_id=r["chunk_id"],
-                    kb_id=r["kb_id"],
-                    tenant_id=r["tenant_id"],
-                    domain_tag=r["domain_tag"],
-                    doc_id=r["doc_id"],
-                    text=r["text"],
-                    content_sha256=r["content_sha256"],
-                    canonical_embedding=self._parse_json_safe(r["emb_txt"]),
-                    section_path=r["section_path"],
-                    metadata=self._parse_json_safe(r["metadata"]),
-                    updated_at=r["updated_at"].isoformat() if r["updated_at"] else utc_now_iso(),
+            out: list[VectorChunkRecord] = []
+            for r in rows:
+                meta = self._parse_json_safe(r["metadata"]) if r["metadata"] else {}
+                raw_acls = self._parse_json_safe(r["acl_groups"]) if r["acl_groups"] else None
+                if not isinstance(raw_acls, list) or not raw_acls:
+                    raw_acls = meta.get("acl_groups", ["public"]) if isinstance(meta, dict) else ["public"]
+                out.append(
+                    VectorChunkRecord(
+                        chunk_id=r["chunk_id"],
+                        kb_id=r["kb_id"],
+                        tenant_id=r["tenant_id"],
+                        domain_tag=r["domain_tag"],
+                        doc_id=r["doc_id"],
+                        text=r["text"],
+                        content_sha256=r["content_sha256"],
+                        canonical_embedding=self._parse_json_safe(r["emb_txt"]),
+                        section_path=r["section_path"],
+                        acl_groups=[str(g) for g in raw_acls],
+                        metadata=meta if isinstance(meta, dict) else {},
+                        updated_at=r["updated_at"].isoformat() if r["updated_at"] else utc_now_iso(),
+                    )
                 )
-                for r in rows
-            ]
+            return out
 
     async def mark_chunks_watermarked(self, watermarks: Sequence[KBWatermarkState]) -> None:
         pool = await self._get_pool()
@@ -815,8 +1002,9 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
             )
 
     async def upsert_canonical_entity_embeddings(self, entities: Sequence[KGEntityNode]) -> None:
-        pool = await self._get_pool()
-        rows = []
+        if not entities:
+            return
+        by_tenant: dict[str, list[tuple[Any, ...]]] = {}
         for ent in entities:
             if not ent.embedding:
                 ent.embedding = self.embedding_provider.embed_text(
@@ -824,7 +1012,7 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
                     dim=self.canonical_dim,
                 )
             vec_str = "[" + ",".join(f"{v:.6f}" for v in ent.embedding) + "]"
-            rows.append(
+            by_tenant.setdefault(ent.tenant_id, []).append(
                 (
                     ent.entity_id,
                     ent.tenant_id,
@@ -835,20 +1023,21 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
                     vec_str,
                 )
             )
-        async with pool.acquire() as conn:
-            await conn.executemany(
-                """
-                INSERT INTO canonical_entity_embeddings (
-                    entity_id, tenant_id, canonical_name, ontology_class,
-                    upper_category, source_kb_ids, embedding
-                ) VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7::vector)
-                ON CONFLICT (entity_id) DO UPDATE SET
-                    source_kb_ids = EXCLUDED.source_kb_ids,
-                    embedding = EXCLUDED.embedding,
-                    updated_at = NOW()
-                """,
-                rows,
-            )
+        for t_id, rows in by_tenant.items():
+            async with self._scoped_conn(t_id) as conn:
+                await conn.executemany(
+                    """
+                    INSERT INTO canonical_entity_embeddings (
+                        entity_id, tenant_id, canonical_name, ontology_class,
+                        upper_category, source_kb_ids, embedding
+                    ) VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7::vector)
+                    ON CONFLICT (entity_id) DO UPDATE SET
+                        source_kb_ids = EXCLUDED.source_kb_ids,
+                        embedding = EXCLUDED.embedding,
+                        updated_at = NOW()
+                    """,
+                    rows,
+                )
 
     async def hybrid_search_chunks(
         self,
@@ -860,28 +1049,29 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
         domain_filter: list[str] | None = None,
         caller_acl_groups: list[str] | None = None,
     ) -> list[RetrievedChunkContext]:
-        pool = await self._get_pool()
         vec_str = "[" + ",".join(f"{v:.6f}" for v in query_embedding) + "]"
-        async with pool.acquire() as conn:
+        async with self._scoped_conn(tenant_id) as conn:
             rows = await conn.fetch(
                 """
                 WITH dense AS (
-                    SELECT chunk_id, kb_id, domain_tag, doc_id, text, metadata,
+                    SELECT chunk_id, kb_id, domain_tag, doc_id, text, acl_groups, metadata,
                            ROW_NUMBER() OVER (ORDER BY canonical_embedding <=> $2::vector) AS dense_rank
                     FROM unified_rag_chunks
                     WHERE tenant_id = $1
                       AND ($5::text[] IS NULL OR kb_id = ANY($5::text[]))
                       AND ($6::text[] IS NULL OR domain_tag = ANY($6::text[]))
+                      AND ($8::text[] IS NULL OR acl_groups ? 'public' OR acl_groups ?| $8::text[])
                     ORDER BY canonical_embedding <=> $2::vector
                     LIMIT $4
                 ),
                 lexical AS (
-                    SELECT chunk_id, kb_id, domain_tag, doc_id, text, metadata,
+                    SELECT chunk_id, kb_id, domain_tag, doc_id, text, acl_groups, metadata,
                            ROW_NUMBER() OVER (ORDER BY ts_rank_cd(tsv, plainto_tsquery('english', $3)) DESC) AS lex_rank
                     FROM unified_rag_chunks
                     WHERE tenant_id = $1
                       AND ($5::text[] IS NULL OR kb_id = ANY($5::text[]))
                       AND ($6::text[] IS NULL OR domain_tag = ANY($6::text[]))
+                      AND ($8::text[] IS NULL OR acl_groups ? 'public' OR acl_groups ?| $8::text[])
                       AND tsv @@ plainto_tsquery('english', $3)
                     ORDER BY ts_rank_cd(tsv, plainto_tsquery('english', $3)) DESC
                     LIMIT $4
@@ -892,6 +1082,7 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
                            COALESCE(d.domain_tag, l.domain_tag) AS domain_tag,
                            COALESCE(d.doc_id, l.doc_id) AS doc_id,
                            COALESCE(d.text, l.text) AS text,
+                           COALESCE(d.acl_groups, l.acl_groups) AS acl_groups,
                            COALESCE(d.metadata, l.metadata) AS metadata,
                            COALESCE(1.0 / (60.0 + d.dense_rank), 0.0)
                              + COALESCE(1.2 / (60.0 + l.lex_rank), 0.0) AS rrf_score,
@@ -910,15 +1101,21 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
                 max(top_k * 4, 25),
                 kb_filter,
                 domain_filter,
-                top_k * 3 if caller_acl_groups is not None else top_k,
+                top_k,
+                list(caller_acl_groups) if caller_acl_groups is not None else None,
             )
             caller_acls = {g.lower() for g in caller_acl_groups} if caller_acl_groups is not None else None
             results: list[RetrievedChunkContext] = []
             for r in rows:
+                raw_acls = self._parse_json_safe(r["acl_groups"]) if r["acl_groups"] else None
                 meta = self._parse_json_safe(r["metadata"]) if r["metadata"] else {}
-                chk_acls = meta.get("acl_groups", ["public"]) if isinstance(meta, dict) else ["public"]
+                chk_acls = (
+                    raw_acls
+                    if isinstance(raw_acls, list) and raw_acls
+                    else (meta.get("acl_groups", ["public"]) if isinstance(meta, dict) else ["public"])
+                )
                 if caller_acls is not None:
-                    chk_set = {g.lower() for g in chk_acls}
+                    chk_set = {str(g).lower() for g in chk_acls}
                     if "public" not in chk_set and not caller_acls.intersection(chk_set):
                         continue
                 chans = []
@@ -935,7 +1132,7 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
                         text=r["text"],
                         rrf_score=round(float(r["rrf_score"]), 5),
                         retrieval_channels=chans,
-                        acl_groups=list(chk_acls),
+                        acl_groups=[str(g) for g in chk_acls],
                     )
                 )
                 if len(results) >= top_k:
@@ -950,9 +1147,8 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
     ) -> list[tuple[KGEntityNode, float]]:
         from ..models import UpperOntologyCategory
 
-        pool = await self._get_pool()
         vec_str = "[" + ",".join(f"{v:.6f}" for v in query_embedding) + "]"
-        async with pool.acquire() as conn:
+        async with self._scoped_conn(tenant_id) as conn:
             rows = await conn.fetch(
                 """
                 SELECT entity_id, tenant_id, canonical_name, ontology_class,

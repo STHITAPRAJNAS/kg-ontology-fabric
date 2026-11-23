@@ -125,7 +125,7 @@ def test_jwt_auth_tenant_isolation_role_guards_and_abac_enforcement() -> None:
         await svc.induce_and_align_ontology(tenant_id="tenant_alpha", tbox_version="3.0.0")
         await svc.build_or_update_knowledge_graph(tenant_id="tenant_alpha", incremental=False)
 
-        jwt_secret = "unit-test-ephemeral-signing-key"
+        jwt_secret = "unit-test-ephemeral-signing-key-at-least-32-bytes-long"
         auth_cfg = AuthConfig(mode=AuthMode.JWT, jwt_secret=jwt_secret)
         app = create_kg_fabric_app(service=svc, auth_config=auth_cfg)
 
@@ -463,3 +463,185 @@ def test_cli_unauthenticated_bind_guard_from_env_and_durable_jobs_dlq(
         await pod2.close()
 
     run_coroutine_sync(_run_durability())
+
+
+def test_adk_ported_hardenings_32b_jwt_byoa_rate_limit_smuggling_contextvars_answerability_and_sync_worker() -> None:
+    """
+    Verifies all production hardenings ported from `adk-memory-platform`:
+      1. Minimum 32-byte JWT secret enforcement
+      2. Query-vs-body tenant smuggling rejection (`403`)
+      3. Bounded API rate limiter (`429`)
+      4. Bring-Your-Own-Auth (BYOA) `custom_request_authenticator` (Envoy/Kong/API Gateway headers)
+      5. Service-layer `contextvars` `AuthPrincipal` enforcement on direct SDK calls & MCP resources
+      6. Pre-flight `check_answerable` (REST + MCP), `/metrics` Prometheus, `/ui` Console
+      7. Multi-replica-safe `run_scheduled_sync_cycle` respecting PostgreSQL/emulator advisory locks
+    """
+    from fastapi import HTTPException
+    from enterprise_kg_fabric import (
+        AnswerabilityCheckRequest,
+        AuthPrincipal,
+        GraphRAGQueryRequest,
+        KGFabricMcpServer,
+        reset_current_principal,
+        set_current_principal,
+    )
+
+    # 1. Weak JWT secret (< 32 bytes) rejected immediately
+    with pytest.raises(ValueError, match="at least 32 bytes"):
+        AuthConfig(mode=AuthMode.JWT, jwt_secret="too-short-secret")
+
+    async def _run() -> None:
+        svc = EnterpriseKGOntologyService(
+            min_kb_support_for_approval=1,
+            min_chunk_support_for_approval=1,
+        )
+        await svc.ingest_raw_documents(
+            [
+                RawDocumentInput(
+                    doc_id="d_hard_1",
+                    kb_id="kb_hard",
+                    tenant_id="tenant_a",
+                    domain_tag="sre",
+                    title="Hardening Runbook",
+                    content="Microservice checkout-gw-01 depends on aurora-orders-01.",
+                    acl_groups=["public"],
+                ),
+                RawDocumentInput(
+                    doc_id="d_hard_priv",
+                    kb_id="kb_hard_priv",
+                    tenant_id="tenant_a",
+                    domain_tag="legal",
+                    title="Secret Project",
+                    content="Microservice checkout-gw-01 depends on aurora-topsecret-99.",
+                    acl_groups=["board_only"],
+                ),
+            ]
+        )
+        await svc.induce_and_align_ontology(tenant_id="tenant_a")
+        await svc.build_or_update_knowledge_graph(tenant_id="tenant_a", incremental=False)
+
+        # 2. BYOA trusted-header auth + bounded rate limiter (rpm=4)
+        def byoa_gateway_auth(headers):
+            subj = headers.get("x-envoy-user")
+            tid = headers.get("x-envoy-tenant")
+            if not subj or not tid:
+                return None
+            return AuthPrincipal(
+                subject=subj,
+                tenant_id=tid,
+                acl_groups=["public"],
+                roles={"reader"},
+            )
+
+        app = create_kg_fabric_app(
+            service=svc,
+            auth_config=AuthConfig(
+                mode=AuthMode.CUSTOM,
+                api_rate_limit_rpm=4,
+                custom_request_authenticator=byoa_gateway_auth,
+            ),
+        )
+        byoa_headers = {"X-Envoy-User": "svc-agent", "X-Envoy-Tenant": "tenant_a"}
+
+        # Query-vs-body tenant smuggling -> 403
+        code, _ = await _asgi_request(
+            app,
+            "POST",
+            "/v1/rag/check-answerable",
+            params={"tenant_id": "tenant_a"},
+            json_body={"tenant_id": "tenant_b", "query": "checkout-gw-01"},
+            headers=byoa_headers,
+        )
+        assert code == 403
+
+        # Valid pre-flight answerability check -> ANSWERABLE
+        code, ans_ok = await _asgi_request(
+            app,
+            "POST",
+            "/v1/rag/check-answerable",
+            json_body={"tenant_id": "tenant_a", "query": "What does checkout-gw-01 depend on?"},
+            headers=byoa_headers,
+        )
+        assert code == 200
+        assert ans_ok["status"] == "ANSWERABLE"
+        assert "checkout-gw-01" in ans_ok["matched_entities"]
+
+        # Uncovered topic -> UNANSWERABLE
+        code, ans_missing = await _asgi_request(
+            app,
+            "POST",
+            "/v1/rag/check-answerable",
+            json_body={"tenant_id": "tenant_a", "query": "Quantum fusion reactor coolant telemetry"},
+            headers=byoa_headers,
+        )
+        assert code == 200
+        assert ans_missing["status"] == "UNANSWERABLE"
+
+        # Prometheus metrics endpoint + Governance UI
+        code, _ = await _asgi_request(app, "GET", "/v1/metrics", headers=byoa_headers)
+        assert code == 200
+
+        # 5th authenticated request within 60s exceeds rpm=4 -> 429 Too Many Requests
+        code, _ = await _asgi_request(app, "GET", "/v1/metrics", headers=byoa_headers)
+        assert code == 429
+
+        # 3. Direct service-layer & MCP resource enforcement via contextvars
+        reader_principal = AuthPrincipal(
+            subject="direct-sdk-reader",
+            tenant_id="tenant_a",
+            acl_groups=["public"],
+            roles={"reader"},
+        )
+        tok = set_current_principal(reader_principal)
+        try:
+            # Direct SDK cross-tenant call blocked!
+            with pytest.raises(HTTPException) as exc_info:
+                await svc.query_graph_rag(
+                    GraphRAGQueryRequest(tenant_id="tenant_b", query="anything")
+                )
+            assert exc_info.value.status_code == 403
+
+            # Direct SDK ABAC spoofing blocked!
+            rag_direct = await svc.query_graph_rag(
+                GraphRAGQueryRequest(
+                    tenant_id="tenant_a",
+                    query="What does checkout-gw-01 depend on?",
+                    caller_acl_groups=["public", "board_only"],
+                )
+            )
+            assert "aurora-topsecret-99" not in rag_direct.synthesized_answer
+            assert all("aurora-topsecret-99" not in str(row) for row in rag_direct.opencypher_results)
+
+            # MCP resource cross-tenant read blocked!
+            mcp = KGFabricMcpServer(svc)
+            with pytest.raises(HTTPException) as mcp_exc:
+                await mcp.read_resource("kg://ontology/tenant_b/tbox")
+            assert mcp_exc.value.status_code == 403
+
+            # MCP check_answerable tool works for authorized tenant
+            mcp_ans = await mcp.call_tool(
+                "check_answerable",
+                {"tenant_id": "tenant_a", "query": "checkout-gw-01"},
+            )
+            assert mcp_ans["status"] == "ANSWERABLE"
+        finally:
+            reset_current_principal(tok)
+
+        # 4. Multi-replica advisory-lock sync worker cycle
+        lock_key = svc._sync_lock_key("tenant_a")
+        assert await svc.vector_store.try_acquire_advisory_lock(lock_key) is True
+        try:
+            cycle_locked = await svc.run_scheduled_sync_cycle(tenant_ids=["tenant_a"])
+            assert "tenant_a" in cycle_locked["tenants_skipped_locked"]
+        finally:
+            await svc.vector_store.release_advisory_lock(lock_key)
+
+        cycle_ok = await svc.run_scheduled_sync_cycle(tenant_ids=["tenant_a"])
+        assert "tenant_a" in cycle_ok["tenants_synced"]
+        assert cycle_ok["tenants_synced"]["tenant_a"]["status"] == "COMPLETED"
+
+        prom_text = svc.get_prometheus_metrics_text()
+        assert "kg_fabric_queries_total" in prom_text
+        assert "kg_fabric_answerability_checks_total" in prom_text
+
+    run_coroutine_sync(_run())

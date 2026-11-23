@@ -540,3 +540,22 @@ class EvalSuiteReport(BaseModel):
     citation_groundedness_rate: float
     ragas_available: bool = False
     case_details: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class AnswerabilityCheckRequest(BaseModel):
+    query: str
+    tenant_id: str = "enterprise_default"
+    caller_acl_groups: list[str] | None = None
+
+
+class AnswerabilityCheckResponse(BaseModel):
+    query: str
+    tenant_id: str
+    answerable: bool
+    status: str  # "ANSWERABLE" | "PARTIAL" | "UNANSWERABLE"
+    coverage_score: float
+    matched_tbox_classes: list[str] = Field(default_factory=list)
+    matched_entities: list[str] = Field(default_factory=list)
+    unmatched_terms: list[str] = Field(default_factory=list)
+    evidence_counts: dict[str, int] = Field(default_factory=dict)
+    clarification_hint: str | None = None

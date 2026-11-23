@@ -406,6 +406,20 @@ class Neo4jOpenCypherGraphAdapter(PropertyGraphStorePort):
                     version=tbox.version,
                 )
 
+    async def _ensure_indexes(self, session: Any) -> None:
+        if getattr(self, "_indexes_ready", False):
+            return
+        try:
+            await session.run(
+                "CREATE INDEX entity_tenant_id_idx IF NOT EXISTS FOR (n:Entity) ON (n.tenant_id, n.entity_id)"
+            )
+            await session.run(
+                "CREATE INDEX kg_rel_edge_id_idx IF NOT EXISTS FOR ()-[r:KG_RELATION]-() ON (r.edge_id)"
+            )
+        except Exception:
+            pass
+        self._indexes_ready = True
+
     async def upsert_entities_and_bitemporal_edges(
         self,
         tenant_id: str,
@@ -418,6 +432,7 @@ class Neo4jOpenCypherGraphAdapter(PropertyGraphStorePort):
         superseded_closed = 0
 
         async with driver.session() as session:
+            await self._ensure_indexes(session)
             if ent_rows:
                 await session.run(
                     """
@@ -439,54 +454,59 @@ class Neo4jOpenCypherGraphAdapter(PropertyGraphStorePort):
                     entities=ent_rows,
                 )
 
+            non_functional_batch: list[dict[str, Any]] = []
             for edge in sorted_edges:
-                edge_dict = edge.model_dump()
-                if edge.is_functional:
-                    # Close any older ACTIVE edge for the same (source, predicate) pointing elsewhere
-                    res_close = await session.run(
-                        """
-                        MATCH (s:Entity {entity_id: $src_id, tenant_id: $tenant_id})
-                              -[old:KG_RELATION]->(other:Entity {tenant_id: $tenant_id})
-                        WHERE old.predicate = $predicate
-                          AND old.t_invalid = 'ACTIVE'
-                          AND other.entity_id <> $tgt_id
-                          AND old.t_valid <= $t_valid
-                        SET old.t_invalid = $t_valid
-                        RETURN count(old) AS closed_cnt
-                        """,
-                        src_id=edge.source_entity_id,
-                        tgt_id=edge.target_entity_id,
-                        tenant_id=tenant_id,
-                        predicate=edge.predicate,
-                        t_valid=edge.t_valid,
-                    )
-                    rec = await res_close.single()
-                    if rec:
-                        superseded_closed += int(rec["closed_cnt"])
+                edge_dict = edge.model_dump(exclude={"qualifiers"})
+                edge_dict["qualifiers_json"] = json.dumps(edge.qualifiers)
+                if not edge.is_functional:
+                    non_functional_batch.append(edge_dict)
+                    continue
 
-                    # Check if a NEWER active functional edge already exists (out-of-order historical backfill)
-                    res_newer = await session.run(
-                        """
-                        MATCH (s:Entity {entity_id: $src_id, tenant_id: $tenant_id})
-                              -[newer:KG_RELATION]->(other:Entity {tenant_id: $tenant_id})
-                        WHERE newer.predicate = $predicate
-                          AND newer.t_invalid = 'ACTIVE'
-                          AND other.entity_id <> $tgt_id
-                          AND newer.t_valid > $t_valid
-                        RETURN newer.t_valid AS newer_t_valid
-                        ORDER BY newer.t_valid ASC
-                        LIMIT 1
-                        """,
-                        src_id=edge.source_entity_id,
-                        tgt_id=edge.target_entity_id,
-                        tenant_id=tenant_id,
-                        predicate=edge.predicate,
-                        t_valid=edge.t_valid,
-                    )
-                    newer_rec = await res_newer.single()
-                    if newer_rec and newer_rec["newer_t_valid"]:
-                        edge_dict["t_invalid"] = newer_rec["newer_t_valid"]
-                        superseded_closed += 1
+                # Functional edges require ordered bi-temporal superseding checks
+                res_close = await session.run(
+                    """
+                    MATCH (s:Entity {entity_id: $src_id, tenant_id: $tenant_id})
+                          -[old:KG_RELATION]->(other:Entity {tenant_id: $tenant_id})
+                    WHERE old.predicate = $predicate
+                      AND old.t_invalid = 'ACTIVE'
+                      AND other.entity_id <> $tgt_id
+                      AND old.t_valid <= $t_valid
+                    SET old.t_invalid = $t_valid
+                    RETURN count(old) AS closed_cnt
+                    """,
+                    src_id=edge.source_entity_id,
+                    tgt_id=edge.target_entity_id,
+                    tenant_id=tenant_id,
+                    predicate=edge.predicate,
+                    t_valid=edge.t_valid,
+                )
+                rec = await res_close.single()
+                if rec:
+                    superseded_closed += int(rec["closed_cnt"])
+
+                # Check if a NEWER active functional edge already exists (out-of-order historical backfill)
+                res_newer = await session.run(
+                    """
+                    MATCH (s:Entity {entity_id: $src_id, tenant_id: $tenant_id})
+                          -[newer:KG_RELATION]->(other:Entity {tenant_id: $tenant_id})
+                    WHERE newer.predicate = $predicate
+                      AND newer.t_invalid = 'ACTIVE'
+                      AND other.entity_id <> $tgt_id
+                      AND newer.t_valid > $t_valid
+                    RETURN newer.t_valid AS newer_t_valid
+                    ORDER BY newer.t_valid ASC
+                    LIMIT 1
+                    """,
+                    src_id=edge.source_entity_id,
+                    tgt_id=edge.target_entity_id,
+                    tenant_id=tenant_id,
+                    predicate=edge.predicate,
+                    t_valid=edge.t_valid,
+                )
+                newer_rec = await res_newer.single()
+                if newer_rec and newer_rec["newer_t_valid"]:
+                    edge_dict["t_invalid"] = newer_rec["newer_t_valid"]
+                    superseded_closed += 1
 
                 await session.run(
                     """
@@ -501,10 +521,33 @@ class Neo4jOpenCypherGraphAdapter(PropertyGraphStorePort):
                         rel.source_chunk_ids = $r.source_chunk_ids,
                         rel.evidence_snippets = $r.evidence_snippets,
                         rel.acl_groups = $r.acl_groups,
+                        rel.qualifiers_json = $r.qualifiers_json,
                         rel.confidence = $r.confidence,
                         rel.governance_bucket = $r.governance_bucket
                     """,
                     r=edge_dict,
+                )
+
+            if non_functional_batch:
+                await session.run(
+                    """
+                    UNWIND $edges AS r
+                    MATCH (s:Entity {entity_id: r.source_entity_id, tenant_id: r.tenant_id})
+                    MATCH (t:Entity {entity_id: r.target_entity_id, tenant_id: r.tenant_id})
+                    MERGE (s)-[rel:KG_RELATION {edge_id: r.edge_id}]->(t)
+                    SET rel.predicate = r.predicate,
+                        rel.is_functional = r.is_functional,
+                        rel.t_valid = r.t_valid,
+                        rel.t_invalid = r.t_invalid,
+                        rel.source_kb_ids = r.source_kb_ids,
+                        rel.source_chunk_ids = r.source_chunk_ids,
+                        rel.evidence_snippets = r.evidence_snippets,
+                        rel.acl_groups = r.acl_groups,
+                        rel.qualifiers_json = r.qualifiers_json,
+                        rel.confidence = r.confidence,
+                        rel.governance_bucket = r.governance_bucket
+                    """,
+                    edges=non_functional_batch,
                 )
         return superseded_closed
 
@@ -525,6 +568,7 @@ class Neo4jOpenCypherGraphAdapter(PropertyGraphStorePort):
                        coalesce(n.summary, '') AS summary,
                        coalesce(n.source_kb_ids, []) AS source_kb_ids,
                        coalesce(n.source_chunk_ids, []) AS source_chunk_ids,
+                       coalesce(n.acl_groups, ['public']) AS acl_groups,
                        coalesce(n.mention_count, 1) AS mention_count,
                        coalesce(n.confidence, 0.9) AS confidence,
                        coalesce(n.governance_bucket, 'APPROVED') AS governance_bucket
@@ -544,6 +588,7 @@ class Neo4jOpenCypherGraphAdapter(PropertyGraphStorePort):
                 summary=r["summary"],
                 source_kb_ids=list(r["source_kb_ids"]),
                 source_chunk_ids=list(r["source_chunk_ids"]),
+                acl_groups=list(r["acl_groups"]),
                 mention_count=int(r["mention_count"]),
                 confidence=float(r["confidence"]),
                 governance_bucket=OntologyStatus(r["governance_bucket"]),
@@ -569,29 +614,39 @@ class Neo4jOpenCypherGraphAdapter(PropertyGraphStorePort):
                        coalesce(rel.source_kb_ids, []) AS source_kb_ids,
                        coalesce(rel.source_chunk_ids, []) AS source_chunk_ids,
                        coalesce(rel.evidence_snippets, []) AS evidence_snippets,
+                       coalesce(rel.acl_groups, ['public']) AS acl_groups,
+                       coalesce(rel.qualifiers_json, '{{}}') AS qualifiers_json,
                        coalesce(rel.governance_bucket, 'APPROVED') AS governance_bucket
                 """,
                 tenant_id=tenant_id,
             )
             rows = await result.data()
-        return [
-            KGRelationEdge(
-                edge_id=r["edge_id"],
-                tenant_id=tenant_id,
-                source_entity_id=r["source_entity_id"],
-                target_entity_id=r["target_entity_id"],
-                predicate=r["predicate"],
-                is_functional=bool(r["is_functional"]),
-                confidence=float(r["confidence"]),
-                t_valid=r["t_valid"],
-                t_invalid=r["t_invalid"],
-                source_kb_ids=list(r["source_kb_ids"]),
-                source_chunk_ids=list(r["source_chunk_ids"]),
-                evidence_snippets=list(r["evidence_snippets"]),
-                governance_bucket=OntologyStatus(r["governance_bucket"]),
+        out_edges: list[KGRelationEdge] = []
+        for r in rows:
+            try:
+                quals = json.loads(r["qualifiers_json"]) if isinstance(r["qualifiers_json"], str) else {}
+            except Exception:
+                quals = {}
+            out_edges.append(
+                KGRelationEdge(
+                    edge_id=r["edge_id"],
+                    tenant_id=tenant_id,
+                    source_entity_id=r["source_entity_id"],
+                    target_entity_id=r["target_entity_id"],
+                    predicate=r["predicate"],
+                    is_functional=bool(r["is_functional"]),
+                    confidence=float(r["confidence"]),
+                    t_valid=r["t_valid"],
+                    t_invalid=r["t_invalid"],
+                    source_kb_ids=list(r["source_kb_ids"]),
+                    source_chunk_ids=list(r["source_chunk_ids"]),
+                    evidence_snippets=list(r["evidence_snippets"]),
+                    acl_groups=list(r["acl_groups"]),
+                    qualifiers=quals if isinstance(quals, dict) else {},
+                    governance_bucket=OntologyStatus(r["governance_bucket"]),
+                )
             )
-            for r in rows
-        ]
+        return out_edges
 
     async def expand_k_hop_subgraph(
         self,
@@ -628,6 +683,11 @@ class Neo4jOpenCypherGraphAdapter(PropertyGraphStorePort):
                         OR ANY(g IN coalesce(rel.acl_groups, ['public']) WHERE toLower(g) IN $caller_acls)
                       )
                       AND (
+                        $caller_acls IS NULL
+                        OR 'public' IN coalesce(b.acl_groups, ['public'])
+                        OR ANY(g IN coalesce(b.acl_groups, ['public']) WHERE toLower(g) IN $caller_acls)
+                      )
+                      AND (
                         ($as_of IS NULL AND rel.t_invalid = 'ACTIVE')
                         OR ($as_of IS NOT NULL AND rel.t_valid <= $as_of AND (rel.t_invalid = 'ACTIVE' OR rel.t_invalid > $as_of))
                       )
@@ -643,6 +703,7 @@ class Neo4jOpenCypherGraphAdapter(PropertyGraphStorePort):
                            coalesce(t.source_kb_ids, []) AS t_kbs,
                            coalesce(rel.source_kb_ids, []) AS edge_kbs,
                            coalesce(rel.acl_groups, ['public']) AS edge_acls,
+                           coalesce(rel.qualifiers_json, '{}') AS qualifiers_json,
                            rel.t_valid AS t_valid,
                            rel.t_invalid AS t_invalid,
                            coalesce(rel.confidence, 0.9) AS confidence,
@@ -671,6 +732,10 @@ class Neo4jOpenCypherGraphAdapter(PropertyGraphStorePort):
                         bridge_entities.add(r["source_name"])
                     if len(t_kbs) >= 2:
                         bridge_entities.add(r["target_name"])
+                    try:
+                        quals = json.loads(r["qualifiers_json"]) if isinstance(r.get("qualifiers_json"), str) else {}
+                    except Exception:
+                        quals = {}
                     facts.append(
                         RetrievedGraphFact(
                             edge_id=r["edge_id"],
@@ -685,6 +750,8 @@ class Neo4jOpenCypherGraphAdapter(PropertyGraphStorePort):
                             t_valid=r["t_valid"],
                             t_invalid=r["t_invalid"],
                             confidence=float(r["confidence"]),
+                            acl_groups=list(r.get("edge_acls", ["public"])),
+                            qualifiers=quals if isinstance(quals, dict) else {},
                         )
                     )
                 frontier = next_frontier

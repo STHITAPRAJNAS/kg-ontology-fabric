@@ -4,7 +4,9 @@ import json
 import re
 from typing import Any
 
+from .auth import AuthEnforcer, get_current_principal
 from .models import (
+    AnswerabilityCheckRequest,
     ChunkSearchRequest,
     EntitySearchRequest,
     GlobalCommunitySearchRequest,
@@ -23,13 +25,21 @@ class KGFabricMcpServer:
     Model Context Protocol (MCP `2026-07-28` Stateless Core & `2025-11-25` Streamable HTTP)
     Engine for `enterprise-kg-ontology-fabric`.
     Co-hosted directly inside FastAPI (`/mcp`, `/mcp/http`, `/v1/mcp/call`) and exported via
-    `FastMCP` (`stdio` / `sse`) with 10 Tools, 4 Resources, and 2 Prompts.
+    `FastMCP` (`stdio` / `sse`) with 13 Tools, 4 Resources, and 2 Prompts.
     """
 
     SUPPORTED_VERSIONS = ["2026-07-28", "2025-11-25", "2025-03-26", "2024-11-05"]
+    _WRITER_TOOLS = {
+        "register_vector_kb",
+        "ingest_raw_document",
+        "induce_and_align_ontology",
+        "build_or_update_knowledge_graph",
+    }
+    _ADMIN_TOOLS = {"promote_quarantined_ontology"}
 
     def __init__(self, service: EnterpriseKGOntologyService):
         self.service = service
+        self._enforcer = AuthEnforcer()
 
     @staticmethod
     def list_tools_metadata() -> list[dict[str, Any]]:
@@ -236,6 +246,24 @@ class KGFabricMcpServer:
                     },
                 },
             },
+            {
+                "name": "check_answerable",
+                "title": "Pre-Flight Ontology & Multi-KB Coverage Check",
+                "description": (
+                    "Evaluates whether the tenant's compiled TBox and authorized KB graph cover a user query "
+                    "before generating an answer (returns ANSWERABLE, PARTIAL, or UNANSWERABLE)."
+                ),
+                "annotations": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True},
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "tenant_id": {"type": "string", "default": "enterprise_default"},
+                        "caller_acl_groups": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["query"],
+                },
+            },
         ]
 
     @staticmethod
@@ -312,9 +340,36 @@ class KGFabricMcpServer:
         ]
 
     async def call_tool(self, tool_name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
-        args = arguments or {}
-        if tool_name == "query_hybrid_graph_rag":
+        args = dict(arguments or {})
+        principal = get_current_principal()
+        if principal is not None:
+            if tool_name in self._ADMIN_TOOLS:
+                self._enforcer.require_role(principal, "admin")
+            elif tool_name in self._WRITER_TOOLS:
+                self._enforcer.require_role(principal, "writer")
+            req_tenant = str(args.get("tenant_id") or principal.tenant_id or "enterprise_default")
+            args["tenant_id"] = self._enforcer.enforce_tenant(principal, req_tenant)
+            if "caller_acl_groups" in args or tool_name in {
+                "query_hybrid_graph_rag",
+                "query_graph_rag",
+                "check_answerable",
+                "search_vector_chunks",
+                "search_kg_entities",
+                "traverse_entity_subgraph",
+                "search_ppr_subgraph",
+                "query_global_communities",
+            }:
+                raw_acls = args.get("caller_acl_groups")
+                args["caller_acl_groups"] = self._enforcer.enforce_acl_groups(
+                    principal, list(raw_acls) if isinstance(raw_acls, list) else None
+                )
+
+        if tool_name in {"query_hybrid_graph_rag", "query_graph_rag"}:
             res = await self.service.query_graph_rag(GraphRAGQueryRequest(**args))
+            return res.model_dump()
+
+        if tool_name == "check_answerable":
+            res = await self.service.check_answerable(AnswerabilityCheckRequest(**args))
             return res.model_dump()
 
         if tool_name == "search_vector_chunks":
@@ -393,7 +448,7 @@ class KGFabricMcpServer:
 
         m_reg = re.match(r"^kg://kbs/([^/]+)/registry$", uri)
         if m_reg:
-            tenant_id = m_reg.group(1)
+            tenant_id = self._enforcer.enforce_tenant(get_current_principal(), m_reg.group(1))
             kbs = await self.service.vector_store.list_registered_kbs(tenant_id=tenant_id)
             return {
                 "uri": uri,
@@ -403,16 +458,18 @@ class KGFabricMcpServer:
 
         m_tbox = re.match(r"^kg://ontology/([^/]+)/tbox$", uri)
         if m_tbox:
-            tenant_id = m_tbox.group(1)
+            tenant_id = self._enforcer.enforce_tenant(get_current_principal(), m_tbox.group(1))
+            tbox = await self.service.load_or_get_tbox(tenant_id)
             return {
                 "uri": uri,
                 "mimeType": "application/json",
-                "text": json.dumps(self.service.get_tbox(tenant_id).model_dump()),
+                "text": json.dumps(tbox.model_dump()),
             }
 
         m_ttl = re.match(r"^kg://ontology/([^/]+)/shapes\.ttl$", uri)
         if m_ttl:
-            tenant_id = m_ttl.group(1)
+            tenant_id = self._enforcer.enforce_tenant(get_current_principal(), m_ttl.group(1))
+            await self.service.load_or_get_tbox(tenant_id)
             return {
                 "uri": uri,
                 "mimeType": "text/turtle",
@@ -423,7 +480,9 @@ class KGFabricMcpServer:
 
     async def get_prompt(self, name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
         args = arguments or {}
-        tenant_id = args.get("tenant_id", "enterprise_default")
+        tenant_id = self._enforcer.enforce_tenant(
+            get_current_principal(), args.get("tenant_id", "enterprise_default")
+        )
 
         if name == "cross_kb_graphrag_investigator":
             query = args.get("query", "")

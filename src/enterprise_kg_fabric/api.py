@@ -1,15 +1,28 @@
 from __future__ import annotations
 
+import json
+import os
 from contextlib import asynccontextmanager
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _pkg_version
 from typing import Any
+from urllib.parse import parse_qs
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
-from .auth import AuthConfig, AuthEnforcer, AuthPrincipal
+from .auth import (
+    AuthConfig,
+    AuthEnforcer,
+    AuthPrincipal,
+    reset_current_principal,
+    set_current_principal,
+)
 from .mcp_server import KGFabricMcpServer
 from .models import (
+    AnswerabilityCheckRequest,
+    AnswerabilityCheckResponse,
     ChunkSearchRequest,
     DLQFailedChunkRecord,
     EntitySearchMatch,
@@ -36,7 +49,10 @@ from .models import (
 )
 from .service import EnterpriseKGOntologyService
 
-API_VERSION = "0.3.0"
+try:
+    API_VERSION = _pkg_version("enterprise-kg-ontology-fabric")
+except PackageNotFoundError:
+    API_VERSION = "0.3.0"
 
 
 class BatchKBRegistrationRequest(BaseModel):
@@ -84,37 +100,67 @@ def _unwrap_principal(value: Any) -> AuthPrincipal | None:
     return value if isinstance(value, AuthPrincipal) else None
 
 
-def _apply_principal_to_mcp_arguments(
-    enforcer: AuthEnforcer,
-    principal: AuthPrincipal | None,
-    tool_name: str,
-    arguments: dict[str, Any],
-) -> dict[str, Any]:
-    """Enforces tenant isolation, role checks, and ABAC ACL groups on MCP tool calls."""
-    if principal is None:
-        return arguments
-
-    write_tools = {"register_vector_kb", "ingest_raw_document", "induce_ontology", "build_knowledge_graph"}
-    if tool_name in write_tools:
-        enforcer.require_role(principal, "writer")
-
-    sanitized = dict(arguments)
-    req_tenant = str(sanitized.get("tenant_id") or principal.tenant_id or "enterprise_default")
-    sanitized["tenant_id"] = enforcer.enforce_tenant(principal, req_tenant)
-
-    acl_tools = {"query_graph_rag", "search_vector_chunks", "traverse_entity_subgraph", "search_ppr_subgraph", "query_global_communities"}
-    if tool_name in acl_tools or "caller_acl_groups" in sanitized:
-        req_acls = sanitized.get("caller_acl_groups")
-        sanitized["caller_acl_groups"] = enforcer.enforce_acl_groups(
-            principal,
-            list(req_acls) if isinstance(req_acls, list) else None,
-        )
-    return sanitized
+_GOVERNANCE_UI_HTML = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Enterprise KG Ontology Fabric — Governance Console</title>
+  <style>
+    body { font-family: system-ui, -apple-system, sans-serif; margin: 24px; background: #0f172a; color: #e2e8f0; }
+    h1 { color: #38bdf8; margin-bottom: 4px; }
+    .sub { color: #94a3b8; margin-bottom: 20px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
+    .card { background: #1e293b; border: 1px solid #334155; border-radius: 10px; padding: 16px; }
+    input, button { padding: 8px 10px; border-radius: 6px; border: 1px solid #475569; background: #0f172a; color: #f8fafc; }
+    button { background: #0284c7; border-color: #0284c7; cursor: pointer; font-weight: 600; }
+    pre { background: #020617; padding: 12px; border-radius: 6px; overflow: auto; max-height: 320px; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <h1>Enterprise KG Ontology Fabric</h1>
+  <div class="sub">Ontology TBox, Telemetry, DLQ &amp; Hybrid GraphRAG Governance Console</div>
+  <div style="margin-bottom:16px; display:flex; gap:8px; flex-wrap:wrap;">
+    <input id="tenant" value="enterprise_default" placeholder="tenant_id" />
+    <input id="token" type="password" placeholder="Optional Bearer JWT or X-API-Key" style="width:280px;" />
+    <button onclick="refreshAll()">Refresh Dashboard</button>
+  </div>
+  <div class="grid">
+    <div class="card"><h3>Health &amp; Worker</h3><pre id="health">Loading...</pre></div>
+    <div class="card"><h3>Tenant Telemetry</h3><pre id="telemetry">Click Refresh</pre></div>
+    <div class="card"><h3>Compiled TBox Ontology</h3><pre id="tbox">Click Refresh</pre></div>
+    <div class="card"><h3>Dead-Letter Queue (DLQ)</h3><pre id="dlq">Click Refresh</pre></div>
+  </div>
+  <script>
+    function authHeaders() {
+      const t = document.getElementById('token').value.trim();
+      if (!t) return {};
+      return t.includes('.') ? {'Authorization': 'Bearer ' + t} : {'X-API-Key': t};
+    }
+    async function loadJson(url, elId) {
+      try {
+        const res = await fetch(url, {headers: authHeaders()});
+        document.getElementById(elId).textContent = JSON.stringify(await res.json(), null, 2);
+      } catch (e) { document.getElementById(elId).textContent = String(e); }
+    }
+    function refreshAll() {
+      const tid = encodeURIComponent(document.getElementById('tenant').value || 'enterprise_default');
+      loadJson('/health', 'health');
+      loadJson('/v1/telemetry?tenant_id=' + tid, 'telemetry');
+      loadJson('/v1/ontology/tbox?tenant_id=' + tid, 'tbox');
+      loadJson('/v1/jobs/dlq?tenant_id=' + tid, 'dlq');
+    }
+    loadJson('/health', 'health');
+  </script>
+</body>
+</html>
+"""
 
 
 def create_kg_fabric_app(
     service: EnterpriseKGOntologyService | None = None,
     auth_config: AuthConfig | None = None,
+    enable_sync_worker: bool | None = None,
+    sync_interval_sec: float | None = None,
 ) -> FastAPI:
     """
     Creates the co-hosted FastAPI REST + MCP (`2026-07-28`) application.
@@ -122,16 +168,34 @@ def create_kg_fabric_app(
     - When `service` is omitted, auto-wires PostgreSQL/Neo4j/Neptune/Presidio/DomainPack
       via `EnterpriseKGOntologyService.from_env()` (falling back cleanly to in-memory emulators).
     - When `auth_config` is omitted, reads `KG_FABRIC_AUTH_MODE` (`none` | `api_key` | `jwt`).
+    - Pure-ASGI auth middleware enforces AuthN, bounded rate limiting (`429`), query-vs-body
+      tenant smuggling rejection (`403`), and propagates `AuthPrincipal` via `contextvars`
+      into `EnterpriseKGOntologyService` and `KGFabricMcpServer`.
     """
     svc = service or EnterpriseKGOntologyService.from_env()
     effective_auth = auth_config or AuthConfig.from_env()
     enforcer = AuthEnforcer(effective_auth)
     mcp_server = KGFabricMcpServer(svc)
 
+    worker_enabled = (
+        enable_sync_worker
+        if enable_sync_worker is not None
+        else os.getenv("KG_FABRIC_ENABLE_SYNC_WORKER", "false").strip().lower() in {"1", "true", "yes"}
+    )
+    worker_interval = (
+        sync_interval_sec
+        if sync_interval_sec is not None
+        else float(os.getenv("KG_FABRIC_SYNC_INTERVAL_SEC", "300"))
+    )
+
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        yield
-        await svc.close()
+        if worker_enabled:
+            svc.start_sync_worker(interval_sec=worker_interval)
+        try:
+            yield
+        finally:
+            await svc.close()
 
     app = FastAPI(
         title="Enterprise Multi-KB Ontology & Knowledge Graph Fabric (FastAPI + MCP)",
@@ -148,10 +212,16 @@ def create_kg_fabric_app(
     app.state.mcp_server = mcp_server
     app.state.auth_enforcer = enforcer
 
-    _public_paths = {"/health", "/docs", "/openapi.json", "/redoc"}
+    _public_paths = {"/health", "/healthz", "/docs", "/openapi.json", "/redoc", "/ui"}
 
     class _AuthASGIMiddleware:
-        """Pure-ASGI authentication middleware (zero BaseHTTPMiddleware overhead or SSE buffering)."""
+        """
+        Pure-ASGI security middleware:
+          - Authenticates request (JWT / API key / BYOA custom hooks)
+          - Enforces bounded per-principal / per-IP rate limiting (`429`)
+          - Rejects query-vs-body `tenant_id` smuggling (`403`)
+          - Propagates `AuthPrincipal` via `contextvars` to service & MCP layers
+        """
 
         def __init__(self, inner_app: Any) -> None:
             self.inner_app = inner_app
@@ -160,15 +230,64 @@ def create_kg_fabric_app(
             if scope.get("type") != "http" or scope.get("path") in _public_paths:
                 await self.inner_app(scope, receive, send)
                 return
+
             request = Request(scope, receive=receive)
             try:
                 principal = enforcer.authenticate_request(request)
-                scope.setdefault("state", {})["principal"] = principal
+                enforcer.check_rate_limit(request, principal)
             except HTTPException as exc:
                 response = JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
                 await response(scope, receive, send)
                 return
-            await self.inner_app(scope, receive, send)
+
+            # Query-vs-body tenant smuggling defense for JSON POST/PUT/PATCH requests
+            replay_receive = receive
+            query_params = parse_qs(scope.get("query_string", b"").decode("latin-1"))
+            query_tenants = query_params.get("tenant_id", [])
+            if query_tenants and scope.get("method", "").upper() in {"POST", "PUT", "PATCH"}:
+                chunks: list[bytes] = []
+                while True:
+                    msg = await receive()
+                    chunks.append(msg.get("body", b""))
+                    if not msg.get("more_body", False):
+                        break
+                full_body = b"".join(chunks)
+                try:
+                    parsed_body = json.loads(full_body.decode("utf-8")) if full_body else None
+                except Exception:
+                    parsed_body = None
+                if isinstance(parsed_body, dict):
+                    body_tenant = parsed_body.get("tenant_id")
+                    if body_tenant and str(body_tenant) != str(query_tenants[0]):
+                        resp = JSONResponse(
+                            status_code=403,
+                            content={
+                                "detail": (
+                                    f"Conflicting tenant_id between query ('{query_tenants[0]}') "
+                                    f"and request body ('{body_tenant}')"
+                                )
+                            },
+                        )
+                        await resp(scope, receive, send)
+                        return
+
+                sent_cached = False
+
+                async def _replay() -> dict[str, Any]:
+                    nonlocal sent_cached
+                    if not sent_cached:
+                        sent_cached = True
+                        return {"type": "http.request", "body": full_body, "more_body": False}
+                    return {"type": "http.disconnect"}
+
+                replay_receive = _replay
+
+            scope.setdefault("state", {})["principal"] = principal
+            ctx_token = set_current_principal(principal)
+            try:
+                await self.inner_app(scope, replay_receive, send)
+            finally:
+                reset_current_principal(ctx_token)
 
     app.add_middleware(_AuthASGIMiddleware)
 
@@ -178,7 +297,9 @@ def create_kg_fabric_app(
         return enforcer.authenticate_request(request)
 
     @app.get("/health")
+    @app.get("/healthz")
     async def health() -> dict[str, Any]:
+        worker = svc.sync_worker_status()
         return {
             "status": "healthy",
             "service": "enterprise-kg-ontology-fabric",
@@ -187,7 +308,21 @@ def create_kg_fabric_app(
             "domain_pack": svc.domain_pack.name,
             "mcp_cohosted": True,
             "mcp_tools_count": len(mcp_server.list_tools_metadata()),
+            "sync_worker_running": worker["running"],
+            "sync_worker_last_cycle": worker["last_cycle"],
         }
+
+    @app.get("/ui", response_class=HTMLResponse)
+    async def governance_console_ui() -> str:
+        return _GOVERNANCE_UI_HTML
+
+    @app.get("/metrics", response_class=PlainTextResponse)
+    async def prometheus_metrics() -> str:
+        return svc.get_prometheus_metrics_text()
+
+    @app.get("/v1/metrics")
+    async def json_metrics() -> dict[str, Any]:
+        return svc.get_metrics_snapshot()
 
     # -------------------------------------------------------------------------
     # 1. Control & Ingestion Plane (`/v1/kbs/*`, `/v1/documents/*`, `/v1/ontology/*`, `/v1/graph/*`)
@@ -311,7 +446,7 @@ def create_kg_fabric_app(
 
     # -------------------------------------------------------------------------
     # 2. Search & Retrieval Plane:
-    #    - Level 1: One-Shot Orchestrated Adaptive Hybrid GraphRAG (`/v1/rag/query`)
+    #    - Level 1: One-Shot Orchestrated Adaptive Hybrid GraphRAG (`/v1/rag/*`)
     #    - Level 2: Granular Agentic Search Primitives (`/v1/search/*`)
     # -------------------------------------------------------------------------
 
@@ -324,6 +459,16 @@ def create_kg_fabric_app(
         req.tenant_id = enforcer.enforce_tenant(p, req.tenant_id)
         req.caller_acl_groups = enforcer.enforce_acl_groups(p, req.caller_acl_groups)
         return await svc.query_graph_rag(req)
+
+    @app.post("/v1/rag/check-answerable", response_model=AnswerabilityCheckResponse)
+    async def check_answerable_endpoint(
+        req: AnswerabilityCheckRequest,
+        principal: AuthPrincipal | None = Depends(get_principal),
+    ) -> AnswerabilityCheckResponse:
+        p = _unwrap_principal(principal)
+        req.tenant_id = enforcer.enforce_tenant(p, req.tenant_id)
+        req.caller_acl_groups = enforcer.enforce_acl_groups(p, req.caller_acl_groups)
+        return await svc.check_answerable(req)
 
     @app.post("/v1/search/chunks", response_model=list[RetrievedChunkContext])
     async def search_chunks(
@@ -342,6 +487,7 @@ def create_kg_fabric_app(
     ) -> list[EntitySearchMatch]:
         p = _unwrap_principal(principal)
         req.tenant_id = enforcer.enforce_tenant(p, req.tenant_id)
+        req.caller_acl_groups = enforcer.enforce_acl_groups(p, req.caller_acl_groups)
         return await svc.search_kg_entities(req)
 
     @app.post("/v1/search/subgraph", response_model=SubgraphSearchResponse)
@@ -451,16 +597,8 @@ def create_kg_fabric_app(
     async def mcp_jsonrpc_endpoint(
         payload: dict[str, Any],
         mcp_protocol_version: str | None = Header(default="2026-07-28", alias="MCP-Protocol-Version"),
-        principal: AuthPrincipal | None = Depends(get_principal),
     ) -> dict[str, Any]:
-        p = _unwrap_principal(principal)
         proto = mcp_protocol_version if isinstance(mcp_protocol_version, str) else "2026-07-28"
-        if p is not None and payload.get("method") == "tools/call":
-            params = dict(payload.get("params") or {})
-            tool_name = str(params.get("name", ""))
-            raw_args = dict(params.get("arguments") or {})
-            params["arguments"] = _apply_principal_to_mcp_arguments(enforcer, p, tool_name, raw_args)
-            payload = {**payload, "params": params}
         return await mcp_server.handle_jsonrpc(payload, protocol_version_header=proto)
 
     @app.get("/v1/mcp/tools")
@@ -473,14 +611,9 @@ def create_kg_fabric_app(
         }
 
     @app.post("/v1/mcp/call")
-    async def call_mcp_tool_rest(
-        req: McpToolCallRestRequest,
-        principal: AuthPrincipal | None = Depends(get_principal),
-    ) -> dict[str, Any]:
-        p = _unwrap_principal(principal)
-        safe_args = _apply_principal_to_mcp_arguments(enforcer, p, req.tool_name, req.arguments)
+    async def call_mcp_tool_rest(req: McpToolCallRestRequest) -> dict[str, Any]:
         try:
-            result = await mcp_server.call_tool(req.tool_name, safe_args)
+            result = await mcp_server.call_tool(req.tool_name, req.arguments)
             return {"tool_name": req.tool_name, "result": result, "isError": False}
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc

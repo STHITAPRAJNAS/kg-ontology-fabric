@@ -1,22 +1,27 @@
 from __future__ import annotations
 
 import base64
+import contextvars
 import hashlib
 import hmac
 import json
 import os
 import time
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, Callable, Mapping
 
 from fastapi import HTTPException, Request
+
+MIN_JWT_SECRET_BYTES = 32
 
 
 class AuthMode(str, Enum):
     NONE = "none"
     API_KEY = "api_key"
     JWT = "jwt"
+    CUSTOM = "custom"
 
 
 @dataclass(frozen=True)
@@ -31,15 +36,75 @@ class AuthPrincipal:
         return self.is_admin or role in self.roles
 
 
+# Service-layer AuthPrincipal propagation via contextvars (closes direct SDK / MCP stdio bypasses)
+_CURRENT_PRINCIPAL: contextvars.ContextVar[AuthPrincipal | None] = contextvars.ContextVar(
+    "kg_fabric_current_principal",
+    default=None,
+)
+
+
+def get_current_principal() -> AuthPrincipal | None:
+    return _CURRENT_PRINCIPAL.get()
+
+
+def set_current_principal(principal: AuthPrincipal | None) -> contextvars.Token[AuthPrincipal | None]:
+    return _CURRENT_PRINCIPAL.set(principal)
+
+
+def reset_current_principal(token: contextvars.Token[AuthPrincipal | None]) -> None:
+    _CURRENT_PRINCIPAL.reset(token)
+
+
+class BoundedApiRateLimiter:
+    """
+    In-process bounded sliding-window rate limiter (`max_keys=10_000` FIFO/LRU eviction)
+    protecting REST & MCP endpoints against runaway agents without unbounded memory growth.
+    """
+
+    def __init__(self, requests_per_minute: int = 0, max_keys: int = 10_000):
+        self.requests_per_minute = max(0, int(requests_per_minute))
+        self.max_keys = max(16, int(max_keys))
+        self._buckets: OrderedDict[str, deque[float]] = OrderedDict()
+
+    def check_and_record(self, key: str, now: float | None = None) -> tuple[bool, int]:
+        """Returns `(allowed, remaining_quota)`."""
+        if self.requests_per_minute <= 0:
+            return True, -1
+        ts = time.monotonic() if now is None else now
+        cutoff = ts - 60.0
+
+        bucket = self._buckets.get(key)
+        if bucket is None:
+            if len(self._buckets) >= self.max_keys:
+                self._buckets.popitem(last=False)
+            bucket = deque()
+            self._buckets[key] = bucket
+        else:
+            self._buckets.move_to_end(key)
+
+        while bucket and bucket[0] <= cutoff:
+            bucket.popleft()
+
+        if len(bucket) >= self.requests_per_minute:
+            return False, 0
+
+        bucket.append(ts)
+        return True, max(0, self.requests_per_minute - len(bucket))
+
+
 @dataclass
 class AuthConfig:
     """
-    Zero-dependency production authentication & ABAC enforcement config for FastAPI + MCP.
+    Production authentication, BYOA, rate-limiting & ABAC enforcement config for FastAPI + MCP.
 
     Supports:
       - `AuthMode.NONE`: Local dev / unit tests (blocked on `0.0.0.0` unless explicitly overridden).
       - `AuthMode.API_KEY`: Static or JSON-mapped API keys (`X-API-Key` or `Authorization: Bearer <key>`).
-      - `AuthMode.JWT`: Strict HS256 (stdlib) or PyJWT-verified JWT tokens requiring valid `exp` + `tenant_id`.
+      - `AuthMode.JWT`: Strict HS256 (stdlib) or PyJWT-verified JWT tokens requiring valid `exp`,
+        `tenant_id`, and a >= 32-byte secret.
+      - `AuthMode.CUSTOM` / BYOA hooks:
+          - `custom_request_authenticator(headers) -> AuthPrincipal | None` (API Gateway / Istio / Envoy mTLS / Kong / IAP)
+          - `custom_token_verifier(token) -> AuthPrincipal | None` (OIDC/JWKS/custom IdP)
     """
 
     mode: AuthMode = AuthMode.NONE
@@ -50,6 +115,21 @@ class AuthConfig:
     jwt_audience: str | None = None
     require_exp: bool = True
     require_tenant_claim: bool = True
+    api_rate_limit_rpm: int = 0
+    custom_request_authenticator: Callable[[Mapping[str, str]], AuthPrincipal | None] | None = None
+    custom_token_verifier: Callable[[str], AuthPrincipal | None] | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            self.mode == AuthMode.JWT
+            and self.custom_token_verifier is None
+            and self.jwt_secret
+            and len(self.jwt_secret.encode("utf-8")) < MIN_JWT_SECRET_BYTES
+        ):
+            raise ValueError(
+                f"KG_FABRIC_JWT_SECRET must be at least {MIN_JWT_SECRET_BYTES} bytes "
+                f"(got {len(self.jwt_secret.encode('utf-8'))} bytes)."
+            )
 
     @classmethod
     def from_env(cls) -> AuthConfig:
@@ -82,6 +162,7 @@ class AuthConfig:
         jwt_secret = os.getenv("KG_FABRIC_JWT_SECRET", "").strip()
         jwt_algs_raw = os.getenv("KG_FABRIC_JWT_ALGORITHMS", "HS256").strip()
         jwt_algs = [a.strip() for a in jwt_algs_raw.split(",") if a.strip()] or ["HS256"]
+        rate_limit_rpm = int(os.getenv("KG_FABRIC_RATE_LIMIT_RPM", "0"))
 
         return cls(
             mode=mode,
@@ -90,6 +171,7 @@ class AuthConfig:
             jwt_algorithms=jwt_algs,
             jwt_issuer=os.getenv("KG_FABRIC_JWT_ISSUER") or None,
             jwt_audience=os.getenv("KG_FABRIC_JWT_AUDIENCE") or None,
+            api_rate_limit_rpm=rate_limit_rpm,
         )
 
 
@@ -114,7 +196,15 @@ def create_hs256_jwt(payload: dict[str, Any], secret: str) -> str:
 
 def verify_jwt_token(token: str, config: AuthConfig) -> dict[str, Any]:
     if not config.jwt_secret:
-        raise HTTPException(status_code=500, detail="JWT auth enabled but KG_FABRIC_JWT_SECRET is not configured")
+        raise HTTPException(
+            status_code=500,
+            detail="JWT auth enabled but KG_FABRIC_JWT_SECRET is not configured",
+        )
+    if len(config.jwt_secret.encode("utf-8")) < MIN_JWT_SECRET_BYTES:
+        raise HTTPException(
+            status_code=500,
+            detail=f"KG_FABRIC_JWT_SECRET must be at least {MIN_JWT_SECRET_BYTES} bytes",
+        )
 
     # Prefer PyJWT if installed (supports RS256/ES256/JWKS/leeway)
     try:
@@ -179,12 +269,24 @@ def verify_jwt_token(token: str, config: AuthConfig) -> dict[str, Any]:
 
 
 class AuthEnforcer:
-    """Authenticates FastAPI & MCP callers and enforces tenant + ABAC `acl_groups` boundaries."""
+    """Authenticates FastAPI & MCP callers, rate-limits requests, and enforces tenant + ABAC boundaries."""
 
     def __init__(self, config: AuthConfig | None = None):
         self.config = config or AuthConfig()
+        self.rate_limiter = BoundedApiRateLimiter(
+            requests_per_minute=self.config.api_rate_limit_rpm
+        )
 
     def authenticate_request(self, request: Request) -> AuthPrincipal | None:
+        # 1. Bring-Your-Own-Auth (BYOA) request-header hook (API Gateway / Envoy mTLS / Kong / IAP)
+        if self.config.custom_request_authenticator is not None:
+            headers_dict = {k.lower(): v for k, v in request.headers.items()}
+            custom_principal = self.config.custom_request_authenticator(headers_dict)
+            if custom_principal is not None:
+                return custom_principal
+            if self.config.mode == AuthMode.CUSTOM:
+                raise HTTPException(status_code=401, detail="Custom request authentication failed")
+
         if self.config.mode == AuthMode.NONE:
             return None
 
@@ -193,6 +295,13 @@ class AuthEnforcer:
         bearer_token = ""
         if auth_header.lower().startswith("bearer "):
             bearer_token = auth_header[7:].strip()
+
+        # 2. Bring-Your-Own-Auth token verifier hook (OIDC/JWKS)
+        if self.config.custom_token_verifier is not None and bearer_token:
+            verified = self.config.custom_token_verifier(bearer_token)
+            if verified is None:
+                raise HTTPException(status_code=401, detail="Custom token verification failed")
+            return verified
 
         if self.config.mode == AuthMode.API_KEY:
             candidate = api_key_header or bearer_token
@@ -239,8 +348,24 @@ class AuthEnforcer:
 
         return None
 
+    def check_rate_limit(self, request: Request, principal: AuthPrincipal | None) -> None:
+        if self.config.api_rate_limit_rpm <= 0:
+            return
+        client_host = request.client.host if request.client else "unknown"
+        key = (
+            f"sub:{principal.tenant_id}:{principal.subject}"
+            if principal is not None
+            else f"ip:{client_host}"
+        )
+        allowed, _remaining = self.rate_limiter.check_and_record(key)
+        if not allowed:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Rate limit exceeded ({self.config.api_rate_limit_rpm} req/min)",
+            )
+
     def enforce_tenant(self, principal: AuthPrincipal | None, requested_tenant: str) -> str:
-        if principal is None or principal.is_admin or not principal.tenant_id:
+        if principal is None or principal.is_admin or not principal.tenant_id or principal.tenant_id == "*":
             return requested_tenant
         if requested_tenant and requested_tenant != principal.tenant_id:
             raise HTTPException(
@@ -257,12 +382,6 @@ class AuthEnforcer:
         principal: AuthPrincipal | None,
         requested_acls: list[str] | None,
     ) -> list[str] | None:
-        """
-        Prevents ABAC privilege escalation:
-          - When unauthenticated (`AuthMode.NONE`) or admin with no bound ACL restriction, preserves requested ACLs.
-          - When authenticated with bound `principal.acl_groups`, never allows caller to claim groups
-            outside `principal.acl_groups`. If caller omits `caller_acl_groups`, injects `principal.acl_groups`.
-        """
         if principal is None:
             return requested_acls
         if principal.is_admin and not principal.acl_groups:

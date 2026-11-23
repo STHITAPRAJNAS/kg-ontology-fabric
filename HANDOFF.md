@@ -1,21 +1,20 @@
 # Session Handoff — `enterprise-kg-ontology-fabric`
 
-1. **Last Updated**: 2026-11-23 15:48 EST (`Windows`)
+1. **Last Updated**: 2026-11-23 16:17 EST (`Windows`)
 2. **Current Goal & Status**:
-   - Shipped **`v0.3.0`** of `enterprise-kg-ontology-fabric` (`https://github.com/STHITAPRAJNAS/kg-ontology-fabric`) in **Dual-Mode Architecture**: fully **PyPI-ready** (SDK + `kg-fabric` CLI + pure-ASGI JWT/API-key auth + pluggable `DomainRulePack` + durable Postgres Jobs/DLQ + GitHub Actions CI & PyPI Trusted Publishing) while remaining **clone-and-host ready** (`docker compose --profile app up -d --build`, `.env.example`, `Dockerfile`, and Amazon EKS manifests).
-   - All **`14 / 14` pytest tests pass** across `tests/test_enterprise_kg_fabric_e2e.py`, `tests/test_v02_enterprise_sota_capabilities.py`, and `tests/test_v03_pypi_and_security_hardening.py` (including full pure-ASGI JWT/API-key auth, expired-token rejection, cross-tenant smuggling `403`, reader write-guard `403`, ABAC anti-spoofing across REST/MCP/OpenCypher Path 4, generic & custom Healthcare `DomainRulePack`, CLI `0.0.0.0` bind guard, `from_env()`, and durable Postgres Jobs/DLQ cold-start hydration).
-3. **Recent Changes (`v0.3.0`)**:
-   - `enterprise-kg-ontology-fabric/src/enterprise_kg_fabric/auth.py`: Added `AuthMode` (`none` | `api_key` | `jwt`), `AuthConfig.from_env()`, `AuthPrincipal`, `AuthEnforcer`, `create_hs256_jwt`, and strict `exp` + `tenant_id` + `acl_groups` verification (PyJWT when installed, pure-stdlib HS256 fallback).
-   - `enterprise-kg-ontology-fabric/src/enterprise_kg_fabric/domain_packs.py`: Extracted pluggable `DomainRulePack` with built-in `CLOUD_SRE_DOMAIN_PACK` and domain-neutral `GENERIC_DOMAIN_PACK`; wired into `AutomatedOntologyInducer` and `EnterpriseKGOntologyService`.
-   - `enterprise-kg-ontology-fabric/src/enterprise_kg_fabric/cli.py`: Added `kg-fabric` CLI (`serve`, `mcp`, `init-db`, `version`) with strict non-loopback (`0.0.0.0`) unauthenticated bind guard.
-   - `enterprise-kg-ontology-fabric/src/enterprise_kg_fabric/api.py`: Added pure-ASGI `_AuthASGIMiddleware`, FastAPI `lifespan` graceful `svc.close()`, `create_kg_fabric_app_from_env()`, and tenant/role/ABAC enforcement across all REST & MCP endpoints.
-   - `enterprise-kg-ontology-fabric/src/enterprise_kg_fabric/rag_engine.py`: Added Path 4 OpenCypher ABAC post-filtering so restricted entities/edges cannot leak via `opencypher_results`.
-   - `enterprise-kg-ontology-fabric/src/enterprise_kg_fabric/adapters/pgvector_store.py` & `service.py`: Added durable PostgreSQL `kg_sync_jobs` & `kg_dlq_chunks` tables + `EnterpriseKGOntologyService.from_env()` (supporting `PGVECTOR_DSN` and standard `PGHOST`/`PGPORT`/`PGDATABASE`/`PGUSER`/`PGPASSWORD`) + `close()`.
-   - `enterprise-kg-ontology-fabric/pyproject.toml`, `Dockerfile`, `docker-compose.yml`, `.env.example`, `CHANGELOG.md`, `deploy/eks/deployment-api.yaml`, `.github/workflows/ci.yml`, `.github/workflows/release.yml`: Bumped to `0.3.0`, added `[project.scripts]`, full-stack `--profile app` compose service, and CI/PyPI OIDC release workflows.
-   - `enterprise-kg-ontology-fabric/tests/test_v03_pypi_and_security_hardening.py`: Added 4 comprehensive `v0.3.0` security, domain-pack, CLI, and durability tests.
+   - Completed full **`v0.3.0`** PyPI-ready + cloneable-service hardening with full security/durability parity ported from `adk-memory-platform` (`v0.2.2` + `Unreleased`), and **verified live on Docker PostgreSQL 16 (`NOBYPASSRLS` RLS role) + Neo4j 5 + live Uvicorn HTTP server** (no PyPI tag/push yet per user request).
+   - **`15 / 15` pytest tests pass** (`test_enterprise_kg_fabric_e2e.py`, `test_v02_enterprise_sota_capabilities.py`, `test_v03_pypi_and_security_hardening.py`).
+   - **Live Docker Verification (`examples/live_docker_v03_full_verification.py`) — ALL PASSED**:
+     - Fail-closed PostgreSQL 16 Kernel RLS under least-privilege `NOBYPASSRLS` role `kg_app_user` (`fail_closed=0 rows`, `beta_leak=0`)
+     - Live PostgreSQL `pg_try_advisory_lock` multi-replica sync coordination
+     - Live Uvicorn HTTP server (`32+` byte JWT auth, `401`/`403` anti-smuggling, ABAC zero-leakage across live `pgvector`, live Neo4j 5, Path 4 OpenCypher & live `/mcp`, `13` MCP tools, `/metrics`, `/ui`)
+     - Live Neo4j 5 N-ary `qualifiers_json` + `acl_groups` persistence, composite indexes, batched `UNWIND`, HippoRAG PPR hub damping, Leiden global sensemaking (`3` communities), pre-flight `check-answerable`, and cold-start multi-pod disk hydration (`enterprise_tbox_registry`, `kg_sync_jobs`, `kg_dlq_chunks`).
+3. **Recent Changes**:
+   - `enterprise-kg-ontology-fabric/src/enterprise_kg_fabric/auth.py`: Added 32-byte minimum JWT secret guard, `contextvars` (`get_current_principal`/`set_current_principal`/`reset_current_principal`), BYOA hooks (`custom_request_authenticator`/`custom_token_verifier`), and `BoundedApiRateLimiter` (`429`).
+   - `enterprise-kg-ontology-fabric/src/enterprise_kg_fabric/adapters/pgvector_store.py`: Added fail-closed RLS `CREATE POLICY` rules across all 6 tables, `get_rls_app_role_ddl()`, `_scoped_conn(tenant_id)` (`SET LOCAL app.current_tenant_id`), `acl_groups` JSONB column + persistence/restoration/SQL filtering, `migrate_schema_and_rls()`, and `try_acquire_advisory_lock`/`release_advisory_lock`.
+   - `enterprise-kg-ontology-fabric/src/enterprise_kg_fabric/adapters/graph_stores.py`: Fixed Neo4j 5 `acl_groups` & `qualifiers_json` persistence/retrieval across `upsert_entities_and_bitemporal_edges`, `get_all_entities`, `get_all_edges`, and `expand_k_hop_subgraph`; added composite indexes and batched `UNWIND` for non-functional edges.
+   - `enterprise-kg-ontology-fabric/src/enterprise_kg_fabric/service.py`, `api.py`, `mcp_server.py`, `cli.py`: Added service-layer & MCP resource `contextvars` auth enforcement, query-vs-body `tenant_id` smuggling rejection (`403`), `check_answerable` (REST + 13th MCP tool), multi-replica-safe background sync worker (`pg_try_advisory_lock`), `GET /metrics`, `GET /v1/metrics`, `GET /ui`, `kg-fabric migrate-db`, and fixed `Neo4jOpenCypherGraphAdapter(username=...)` in `from_env()`.
+   - `enterprise-kg-ontology-fabric/examples/live_docker_v03_full_verification.py` & `tests/test_v03_pypi_and_security_hardening.py`: Full live-Docker & unit adversarial suites.
 4. **Next Steps / Blockers**:
-   - To publish `v0.3.0` to PyPI once PyPI Trusted Publishing is linked to `STHITAPRAJNAS/kg-ontology-fabric`, simply tag & push `git tag v0.3.0 && git push origin v0.3.0` (triggers `.github/workflows/release.yml`).
-   - To run all 14 offline tests on any OS:
-     `PYTHONPATH="enterprise-kg-ontology-fabric/src:enterprise-kg-ontology-fabric" pytest enterprise-kg-ontology-fabric/tests/ -v`
-   - To clone & run the full containerized stack:
-     `docker compose -f enterprise-kg-ontology-fabric/docker-compose.yml --profile app up -d --build`
+   - No PyPI release pushed yet (`v0.3.0` tag intentionally NOT pushed). Whenever ready to publish to PyPI, link Trusted Publishing on PyPI for `STHITAPRAJNAS/kg-ontology-fabric` and push `git tag v0.3.0 && git push origin v0.3.0`.
+   - Optional next step if desired: live LLM extraction test (`KG_FABRIC_USE_LIVE_LLM=true` with a live Gemini/Bedrock/OpenAI API key) on unstructured prose.
