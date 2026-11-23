@@ -255,6 +255,14 @@ class LlamaIndexSchemaAndDynamicExtractor:
     def _infer_entity_class(name: str, default_cls: str, tbox: EnterpriseCompiledTBox) -> str:
         upper = name.upper()
         lower = name.lower()
+        if default_cls in {
+            "OrganizationOrFoundation",
+            "ProgrammingLanguage",
+            "QueryLanguageOrProtocol",
+            "AIConcept",
+            "SoftwarePlatform",
+        }:
+            return tbox.resolve_class(default_cls)
         if upper.startswith("CVE-"):
             return tbox.resolve_class("SecurityVulnerability")
         if upper.startswith("INC-"):
@@ -439,9 +447,231 @@ class LlamaIndexSchemaAndDynamicExtractor:
                     )
                 )
 
+        # 4. Open-Domain Internet Prose Extractor with Document-Title Coreference Resolution
+        # Handles real unstructured Wikipedia / web documentation articles cleanly.
+        if chunk.metadata.get("open_domain_prose") or chunk.metadata.get("source_url"):
+            raw_title = str(chunk.metadata.get("title") or "").strip()
+            clean_title = re.sub(r"\s*\([^)]*\)\s*$", "", raw_title).strip()
+            clean_title = re.sub(r"^The\s+", "", clean_title).strip()
+            self._extract_open_domain_triples(
+                text=text,
+                doc_subject=clean_title,
+                tbox=tbox,
+                t_valid=str(t_valid_override),
+                register_entity=_register_entity,
+                triples=triples,
+                seen_triple_sigs=seen_triple_sigs,
+            )
+
         return ChunkExtractionResult(
             chunk_id=chunk.chunk_id,
             kb_id=chunk.kb_id,
             entities=list(entities_by_key.values()),
             triples=triples,
         )
+
+    @staticmethod
+    def _extract_open_domain_triples(
+        text: str,
+        doc_subject: str,
+        tbox: EnterpriseCompiledTBox,
+        t_valid: str,
+        register_entity: Any,
+        triples: list[ExtractedRelationTriple],
+        seen_triple_sigs: set[tuple[str, str, str]],
+    ) -> None:
+        """
+        Extracts real-world entities and relationships from open-domain internet prose
+        (e.g., Wikipedia articles, technical docs, CVE advisories, regulatory texts)
+        using Document-Title Coreference Resolution + lexico-syntactic relation patterns.
+        """
+        # Canonical domain entity gazetteer & class typing for open-domain tech/cloud/security/AI/legal prose
+        known_entities: list[tuple[str, str, re.Pattern[str]]] = [
+            # Organizations & Foundations
+            ("Google", "OrganizationOrFoundation", re.compile(r"\bGoogle\b")),
+            ("Amazon Web Services", "OrganizationOrFoundation", re.compile(r"\b(?:Amazon Web Services|AWS)\b")),
+            ("Amazon", "OrganizationOrFoundation", re.compile(r"\bAmazon(?:\.com)?\b")),
+            ("Cloud Native Computing Foundation", "OrganizationOrFoundation", re.compile(r"\b(?:Cloud Native Computing Foundation|CNCF)\b")),
+            ("Apache Software Foundation", "OrganizationOrFoundation", re.compile(r"\bApache Software Foundation\b")),
+            ("Linux Foundation", "OrganizationOrFoundation", re.compile(r"\bLinux Foundation\b")),
+            ("HashiCorp", "OrganizationOrFoundation", re.compile(r"\bHashiCorp\b")),
+            ("LinkedIn", "OrganizationOrFoundation", re.compile(r"\bLinkedIn\b")),
+            ("SoundCloud", "OrganizationOrFoundation", re.compile(r"\bSoundCloud\b")),
+            ("Neo4j, Inc.", "OrganizationOrFoundation", re.compile(r"\bNeo4j,?\s*Inc\.?\b")),
+            ("PostgreSQL Global Development Group", "OrganizationOrFoundation", re.compile(r"\bPostgreSQL Global Development Group\b")),
+            ("OWASP", "OrganizationOrFoundation", re.compile(r"\b(?:OWASP|Open Worldwide Application Security Project)\b")),
+            ("European Union", "OrganizationOrFoundation", re.compile(r"\b(?:European Union|European Parliament)\b")),
+            ("Payment Card Industry Security Standards Council", "OrganizationOrFoundation", re.compile(r"\bPayment Card Industry Security Standards Council\b")),
+            ("United States Congress", "OrganizationOrFoundation", re.compile(r"\bUnited States Congress\b")),
+            ("Docker, Inc.", "OrganizationOrFoundation", re.compile(r"\bDocker,?\s*Inc\.?\b")),
+            ("Grafana Labs", "OrganizationOrFoundation", re.compile(r"\bGrafana Labs\b")),
+            # Databases & Streaming Stores
+            ("PostgreSQL", "DatabaseCluster", re.compile(r"\bPostgreSQL\b")),
+            ("Neo4j", "DatabaseCluster", re.compile(r"\bNeo4j\b")),
+            ("Amazon Neptune", "DatabaseCluster", re.compile(r"\bAmazon Neptune\b")),
+            ("Redis", "DatabaseCluster", re.compile(r"\bRedis\b")),
+            ("Apache Kafka", "DatabaseCluster", re.compile(r"\b(?:Apache )?Kafka\b")),
+            ("Vector database", "DatabaseCluster", re.compile(r"\bvector databases?\b", re.I)),
+            # Cloud & Software Platforms
+            ("Kubernetes", "SoftwarePlatform", re.compile(r"\bKubernetes\b")),
+            ("Docker", "SoftwarePlatform", re.compile(r"\bDocker\b")),
+            ("Prometheus", "SoftwarePlatform", re.compile(r"\bPrometheus\b")),
+            ("Grafana", "SoftwarePlatform", re.compile(r"\bGrafana\b")),
+            ("Terraform", "SoftwarePlatform", re.compile(r"\bTerraform\b")),
+            ("Apache Log4j", "SoftwarePlatform", re.compile(r"\b(?:Apache )?Log4j\b")),
+            ("OpenSSL", "SoftwarePlatform", re.compile(r"\bOpenSSL\b")),
+            ("Linux", "SoftwarePlatform", re.compile(r"\bLinux\b")),
+            ("containerd", "SoftwarePlatform", re.compile(r"\bcontainerd\b")),
+            # Security Vulnerabilities
+            ("Log4Shell", "SecurityVulnerability", re.compile(r"\bLog4Shell\b")),
+            ("Heartbleed", "SecurityVulnerability", re.compile(r"\bHeartbleed\b")),
+            # Compliance Standards
+            ("General Data Protection Regulation", "ComplianceStandard", re.compile(r"\b(?:General Data Protection Regulation|GDPR)\b")),
+            ("PCI DSS", "ComplianceStandard", re.compile(r"\b(?:Payment Card Industry Data Security Standard|PCI[\-\s]DSS)\b")),
+            ("HIPAA", "ComplianceStandard", re.compile(r"\b(?:Health Insurance Portability and Accountability Act|HIPAA)\b")),
+            # AI & Semantic Concepts
+            ("Retrieval-augmented generation", "AIConcept", re.compile(r"\b(?:Retrieval-augmented generation|RAG)\b", re.I)),
+            ("Knowledge graph", "AIConcept", re.compile(r"\bknowledge graphs?\b", re.I)),
+            ("Ontology", "AIConcept", re.compile(r"\bontolog(?:y|ies)\b", re.I)),
+            ("Large language model", "AIConcept", re.compile(r"\b(?:large language models?|LLMs?)\b", re.I)),
+            # Programming Languages
+            ("Go", "ProgrammingLanguage", re.compile(r"\b(?:Go\b|Golang\b)")),
+            ("Java", "ProgrammingLanguage", re.compile(r"\bJava\b")),
+            ("Python", "ProgrammingLanguage", re.compile(r"\bPython\b")),
+            ("Scala", "ProgrammingLanguage", re.compile(r"\bScala\b")),
+            ("C", "ProgrammingLanguage", re.compile(r"\bwritten in C\b|\bC programming language\b")),
+            # Query Languages & Protocols
+            ("openCypher", "QueryLanguageOrProtocol", re.compile(r"\bopenCypher\b", re.I)),
+            ("Cypher", "QueryLanguageOrProtocol", re.compile(r"\bCypher\b")),
+            ("Gremlin", "QueryLanguageOrProtocol", re.compile(r"\bGremlin\b")),
+            ("SPARQL", "QueryLanguageOrProtocol", re.compile(r"\bSPARQL\b")),
+            ("SQL", "QueryLanguageOrProtocol", re.compile(r"\bSQL\b")),
+            ("TLS", "QueryLanguageOrProtocol", re.compile(r"\b(?:Transport Layer Security|TLS)\b")),
+            ("RDF", "QueryLanguageOrProtocol", re.compile(r"\b(?:Resource Description Framework|RDF)\b")),
+        ]
+
+        # Resolve doc_subject canonical name and class
+        subj_name = doc_subject
+        subj_cls = "SoftwarePlatform"
+        for k_name, k_cls, k_pat in known_entities:
+            if doc_subject and (doc_subject.lower() == k_name.lower() or k_pat.fullmatch(doc_subject)):
+                subj_name = k_name
+                subj_cls = k_cls
+                break
+        if not subj_name:
+            return
+
+        def _add_triple(s_name: str, s_cls: str, pred: str, o_name: str, o_cls: str, snippet: str) -> None:
+            if s_name.lower() == o_name.lower():
+                return
+            c_pred = tbox.resolve_predicate(pred)
+            sig = (s_name.lower(), c_pred, o_name.lower())
+            if sig in seen_triple_sigs:
+                return
+            seen_triple_sigs.add(sig)
+            s_e = register_entity(s_name, s_cls, conf=0.92)
+            o_e = register_entity(o_name, o_cls, conf=0.92)
+            triples.append(
+                ExtractedRelationTriple(
+                    subject_name=s_e.surface_name,
+                    subject_class=s_e.proposed_class,
+                    predicate=c_pred,
+                    object_name=o_e.surface_name,
+                    object_class=o_e.proposed_class,
+                    evidence_snippet=snippet[:220],
+                    confidence=0.92,
+                    t_valid=t_valid,
+                    is_novel_predicate=(c_pred not in tbox.relations),
+                )
+            )
+
+        # Register the document's primary subject entity
+        register_entity(subj_name, subj_cls, conf=0.95)
+
+        sentences = [s.strip() for s in re.split(r"(?<=[\.\!\?])\s+|\n+", text) if len(s.strip()) > 15]
+        for sent in sentences:
+            # Resolve leading coreference ("It ", "The software ", etc.) to doc_subject
+            resolved_sent = re.sub(
+                r"^(?:It|The\s+(?:software|system|project|database|vulnerability|bug|flaw|library|regulation|platform|framework|tool|standard))\b",
+                subj_name,
+                sent,
+            )
+            sent_lower = resolved_sent.lower()
+
+            # Discover any explicit CVE identifiers in sentence
+            for cve_m in re.finditer(r"\bCVE-\d{4}-\d{4,7}\b", resolved_sent):
+                cve_id = cve_m.group(0)
+                if subj_cls == "SecurityVulnerability":
+                    _add_triple(subj_name, subj_cls, "INTEGRATES_WITH", cve_id, "SecurityVulnerability", sent)
+                else:
+                    _add_triple(cve_id, "SecurityVulnerability", "AFFECTS_ASSET", subj_name, subj_cls, sent)
+
+            # Match known entities mentioned in this sentence
+            found_in_sent: list[tuple[str, str]] = []
+            for k_name, k_cls, k_pat in known_entities:
+                if k_name.lower() == subj_name.lower():
+                    continue
+                if k_pat.search(resolved_sent):
+                    found_in_sent.append((k_name, k_cls))
+
+            for target_name, target_cls in found_in_sent:
+                # 1. Organization / Foundation relationships
+                if target_cls == "OrganizationOrFoundation":
+                    if subj_cls == "ComplianceStandard" and any(
+                        w in sent_lower for w in ("regulation", "law", "enacted", "adopted", "council", "parliament", "congress", "standard")
+                    ):
+                        _add_triple(subj_name, subj_cls, "ENACTED_BY", target_name, target_cls, sent)
+                    elif any(w in sent_lower for w in ("maintained by", "hosted by", "graduated", "foundation", "donated to", "cncf", "apache software foundation")):
+                        if "foundation" in target_name.lower() or target_name in {"OWASP", "Cloud Native Computing Foundation", "Apache Software Foundation", "Linux Foundation"}:
+                            _add_triple(subj_name, subj_cls, "HOSTED_BY_FOUNDATION", target_name, target_cls, sent)
+                        else:
+                            _add_triple(subj_name, subj_cls, "DEVELOPED_BY", target_name, target_cls, sent)
+                    elif any(w in sent_lower for w in ("designed", "developed", "created", "built", "founded", "introduced", "offered", "managed", "released", "originally", "product")):
+                        _add_triple(subj_name, subj_cls, "DEVELOPED_BY", target_name, target_cls, sent)
+
+                # 2. Programming Language relationships
+                elif target_cls == "ProgrammingLanguage":
+                    if any(w in sent_lower for w in ("written in", "implemented in", "programming language", "java logging", "written primarily in")):
+                        _add_triple(subj_name, subj_cls, "WRITTEN_IN", target_name, target_cls, sent)
+
+                # 3. Query Language & Wire Protocol relationships
+                elif target_cls == "QueryLanguageOrProtocol":
+                    if subj_cls == "SecurityVulnerability":
+                        _add_triple(subj_name, subj_cls, "AFFECTS_ASSET", target_name, target_cls, sent)
+                    elif any(w in sent_lower for w in ("support", "query", "language", "implement", "protocol", "uses", "compatible", "relational", "graph", "encryption")):
+                        _add_triple(subj_name, subj_cls, "SUPPORTS_PROTOCOL", target_name, target_cls, sent)
+
+                # 4. Vulnerability -> Affected Software Platform / Database
+                elif subj_cls == "SecurityVulnerability" and target_cls in {"SoftwarePlatform", "DatabaseCluster"}:
+                    if any(w in sent_lower for w in ("vulnerability", "flaw", "bug", "affect", "in ", "exploit", "library", "zero-day", "arbitrary code")):
+                        _add_triple(subj_name, subj_cls, "AFFECTS_ASSET", target_name, target_cls, sent)
+
+                # 5. Software Platform / Database / AI Concept Ecosystem Integrations
+                elif target_cls in {"SoftwarePlatform", "DatabaseCluster", "AIConcept"} and subj_cls in {
+                    "SoftwarePlatform",
+                    "DatabaseCluster",
+                    "AIConcept",
+                }:
+                    if any(
+                        w in sent_lower
+                        for w in (
+                            "integrat",
+                            "work",
+                            "with",
+                            "support",
+                            "container",
+                            "visualiz",
+                            "monitor",
+                            "retriev",
+                            "augment",
+                            "vector",
+                            "graph",
+                            "ontology",
+                            "knowledge",
+                            "language model",
+                            "database",
+                            "data source",
+                            "runtime",
+                        )
+                    ):
+                        _add_triple(subj_name, subj_cls, "INTEGRATES_WITH", target_name, target_cls, sent)

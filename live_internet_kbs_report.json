@@ -1,0 +1,221 @@
+{
+  "data_source": "Live Wikipedia MediaWiki API (https://en.wikipedia.org/w/api.php)",
+  "articles_fetched_live": 25,
+  "total_internet_characters_ingested": 31878,
+  "heterogeneous_pgvector_kbs": [
+    {
+      "kb_id": "kb_internet_cloud_infra_384",
+      "embedding_dim": 384,
+      "model": "bge-small-en-v1.5"
+    },
+    {
+      "kb_id": "kb_internet_databases_768",
+      "embedding_dim": 768,
+      "model": "text-embedding-004"
+    },
+    {
+      "kb_id": "kb_internet_security_cves_1024",
+      "embedding_dim": 1024,
+      "model": "embed-english-v3.0"
+    },
+    {
+      "kb_id": "kb_internet_ai_regulations_1536",
+      "embedding_dim": 1536,
+      "model": "text-embedding-3-large"
+    }
+  ],
+  "chunks_reverse_hydrated_from_postgres": 26,
+  "induced_ontology_classes": [
+    "AIConcept",
+    "ComplianceStandard",
+    "DatabaseCluster",
+    "OrganizationOrFoundation",
+    "ProgrammingLanguage",
+    "QueryLanguageOrProtocol",
+    "SecurityVulnerability",
+    "SoftwarePlatform"
+  ],
+  "induced_ontology_relations": [
+    "AFFECTS_ASSET",
+    "DEPENDS_ON",
+    "DEVELOPED_BY",
+    "ENACTED_BY",
+    "GOVERNED_BY",
+    "HOSTED_BY_FOUNDATION",
+    "INTEGRATES_WITH",
+    "MAINTAINED_BY_TEAM",
+    "SUBSCRIBES_TO_SLA",
+    "SUPPORTS_PROTOCOL",
+    "WRITTEN_IN"
+  ],
+  "neo4j_canonical_entities": 50,
+  "neo4j_cross_kb_bridge_entities_count": 7,
+  "neo4j_active_edges": 45,
+  "shacl_conformance_passed": true,
+  "w3c_owl_shacl_turtle_bytes": 6536,
+  "incremental_watermark_pass2_skipped": 26,
+  "incremental_watermark_pass2_delta": 0,
+  "cross_kb_q1_log4shell_to_apache_bridge": {
+    "contributing_kbs": [
+      "kb_internet_databases_768",
+      "kb_internet_security_cves_1024"
+    ],
+    "nodes_connected": [
+      "Apache Kafka",
+      "Apache Log4j",
+      "Apache Software Foundation",
+      "CVE-2021-44228",
+      "Java",
+      "Linux",
+      "Linux Foundation",
+      "Log4Shell",
+      "Neo4j",
+      "Scala",
+      "openCypher"
+    ],
+    "verified_log4shell_log4j_apache_chain": true
+  },
+  "cross_kb_q2_cloud_native_ecosystem": {
+    "nodes_connected": [
+      "Cloud Native Computing Foundation",
+      "Go",
+      "Google",
+      "Grafana",
+      "Grafana Labs",
+      "Kubernetes",
+      "Linux",
+      "Linux Foundation",
+      "Neo4j",
+      "PostgreSQL",
+      "Prometheus",
+      "SQL",
+      "SoundCloud",
+      "containerd"
+    ],
+    "verified_k8s_google_cncf_prometheus": true
+  },
+  "cross_kb_q3_graph_databases_and_ai": {
+    "contributing_kbs": [
+      "kb_internet_ai_regulations_1536",
+      "kb_internet_cloud_infra_384",
+      "kb_internet_databases_768",
+      "kb_internet_security_cves_1024"
+    ],
+    "nodes_connected": [
+      "Amazon",
+      "Amazon Neptune",
+      "Amazon Web Services",
+      "Apache Kafka",
+      "Apache Log4j",
+      "Apache Software Foundation",
+      "CVE-2021-44228",
+      "Cloud Native Computing Foundation",
+      "Grafana",
+      "Gremlin",
+      "Java",
+      "Kubernetes",
+      "Large language model",
+      "Linux",
+      "Linux Foundation",
+      "Log4Shell",
+      "Neo4j",
+      "PostgreSQL",
+      "Prometheus",
+      "RDF",
+      "Retrieval-augmented generation",
+      "SPARQL",
+      "SQL",
+      "Scala",
+      "Vector database",
+      "openCypher"
+    ],
+    "verified_neptune_aws_opencypher_rag": true
+  },
+  "mcp_live_neo4j_entity_search_hits": 8,
+  "mcp_live_neo4j_subgraph_facts": 13,
+  "mcp_live_neo4j_opencypher_bridge_rows": 14,
+  "sample_opencypher_cross_kb_bridges": [
+    {
+      "source": "Amazon Web Services",
+      "predicate": "DEVELOPED_BY",
+      "bridge_target": "Amazon",
+      "target_kbs": [
+        "kb_internet_cloud_infra_384",
+        "kb_internet_databases_768"
+      ]
+    },
+    {
+      "source": "Cloud Native Computing Foundation",
+      "predicate": "HOSTED_BY_FOUNDATION",
+      "bridge_target": "Linux Foundation",
+      "target_kbs": [
+        "kb_internet_cloud_infra_384",
+        "kb_internet_databases_768"
+      ]
+    },
+    {
+      "source": "Grafana",
+      "predicate": "INTEGRATES_WITH",
+      "bridge_target": "PostgreSQL",
+      "target_kbs": [
+        "kb_internet_cloud_infra_384",
+        "kb_internet_databases_768"
+      ]
+    },
+    {
+      "source": "Amazon Neptune",
+      "predicate": "DEVELOPED_BY",
+      "bridge_target": "Amazon Web Services",
+      "target_kbs": [
+        "kb_internet_cloud_infra_384",
+        "kb_internet_databases_768"
+      ]
+    },
+    {
+      "source": "Amazon Neptune",
+      "predicate": "DEVELOPED_BY",
+      "bridge_target": "Amazon",
+      "target_kbs": [
+        "kb_internet_cloud_infra_384",
+        "kb_internet_databases_768"
+      ]
+    },
+    {
+      "source": "Apache Kafka",
+      "predicate": "WRITTEN_IN",
+      "bridge_target": "Java",
+      "target_kbs": [
+        "kb_internet_databases_768",
+        "kb_internet_security_cves_1024"
+      ]
+    },
+    {
+      "source": "Apache Kafka",
+      "predicate": "HOSTED_BY_FOUNDATION",
+      "bridge_target": "Apache Software Foundation",
+      "target_kbs": [
+        "kb_internet_databases_768",
+        "kb_internet_security_cves_1024"
+      ]
+    },
+    {
+      "source": "Neo4j",
+      "predicate": "HOSTED_BY_FOUNDATION",
+      "bridge_target": "Linux Foundation",
+      "target_kbs": [
+        "kb_internet_cloud_infra_384",
+        "kb_internet_databases_768"
+      ]
+    }
+  ],
+  "sample_source_urls": [
+    "https://en.wikipedia.org/wiki/Amazon_Web_Services",
+    "https://en.wikipedia.org/wiki/Cloud_Native_Computing_Foundation",
+    "https://en.wikipedia.org/wiki/Docker_(software)",
+    "https://en.wikipedia.org/wiki/Grafana",
+    "https://en.wikipedia.org/wiki/Kubernetes",
+    "https://en.wikipedia.org/wiki/Prometheus_(software)",
+    "https://en.wikipedia.org/wiki/Terraform_(software)",
+    "https://en.wikipedia.org/wiki/Amazon_Neptune"
+  ]
+}

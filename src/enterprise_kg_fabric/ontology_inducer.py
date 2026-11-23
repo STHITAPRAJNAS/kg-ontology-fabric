@@ -56,10 +56,10 @@ _CLASS_DISCOVERY_RULES: list[tuple[re.Pattern[str], str, UpperOntologyCategory, 
         "Deployable software microservice, API gateway, or backend workload",
     ),
     (
-        re.compile(r"\b(database\s*cluster|aurora\s*ledger|postgres\s*db|pgvector\s*store|datastore|neptune\s*graph|neo4j\s*cluster|data\s*warehouse)\b", re.I),
+        re.compile(r"\b(database\s*cluster|aurora\s*ledger|postgres(?:ql)?|pgvector|datastore|neptune|neo4j|redis|kafka|data\s*warehouse|graph\s*database|relational\s*database|vector\s*database|database\s*management\s*system)\b", re.I),
         "DatabaseCluster",
         UpperOntologyCategory.SYSTEM_OR_ASSET,
-        "Stateful database, vector store, or graph storage cluster",
+        "Stateful database, vector store, streaming platform, or graph storage cluster",
     ),
     (
         re.compile(r"\b(compliance\s*standard|regulatory\s*policy|pci[\-\s]*dss|gdpr[\-\s]*article|soc2[\-\s]*control|hipaa[\-\s]*rule|iso[\-\s]*27001)\b", re.I),
@@ -120,6 +120,36 @@ _CLASS_DISCOVERY_RULES: list[tuple[re.Pattern[str], str, UpperOntologyCategory, 
         "DataArtifact",
         UpperOntologyCategory.DATA_OR_ARTIFACT,
         "Governed data asset, vector index, or ML training corpus",
+    ),
+    (
+        re.compile(r"\b(container\s*orchestration|open[\-\s]*source\s*(?:software|platform|framework|library|tool|system|logging|monitoring)|infrastructure\s*as\s*code|kubernetes|docker|prometheus|grafana|terraform|log4j|openssl)\b", re.I),
+        "SoftwarePlatform",
+        UpperOntologyCategory.SYSTEM_OR_ASSET,
+        "Open-source or commercial software platform, framework, library, or cloud infrastructure system",
+    ),
+    (
+        re.compile(r"\b(foundation|corporation|company|organization|consortium|google|amazon\s*web\s*services|apache\s*software\s*foundation|cloud\s*native\s*computing\s*foundation|linux\s*foundation|hashicorp|european\s*union|owasp|microsoft|openai)\b", re.I),
+        "OrganizationOrFoundation",
+        UpperOntologyCategory.ACTOR_OR_ORG,
+        "Technology vendor, open-source foundation, regulatory body, or standards consortium",
+    ),
+    (
+        re.compile(r"\b(programming\s*language|written\s*in\s+(?:go|python|java|rust|c\+\+|c|scala|typescript))\b", re.I),
+        "ProgrammingLanguage",
+        UpperOntologyCategory.DATA_OR_ARTIFACT,
+        "Software programming language used to build systems and libraries",
+    ),
+    (
+        re.compile(r"\b(query\s*language|protocol|opencypher|cypher|gremlin|sparql|sql|graphql|tls|ssl|http|json[\-\s]*rpc)\b", re.I),
+        "QueryLanguageOrProtocol",
+        UpperOntologyCategory.DATA_OR_ARTIFACT,
+        "Database query language, wire protocol, or cryptographic network standard",
+    ),
+    (
+        re.compile(r"\b(retrieval[\-\s]*augmented\s*generation|knowledge\s*graph|ontology|large\s*language\s*model|vector\s*database|semantic\s*search)\b", re.I),
+        "AIConcept",
+        UpperOntologyCategory.DATA_OR_ARTIFACT,
+        "Artificial intelligence architecture, semantic web paradigm, or retrieval concept",
     ),
 ]
 
@@ -198,6 +228,36 @@ _CANONICAL_CLASS_EQUIVALENCES: dict[str, tuple[str, UpperOntologyCategory, str, 
         "Governed data asset, vector index, or ML training corpus",
         {"dataartifact", "mldataset", "embeddingindex", "dataproduct"},
     ),
+    "SoftwarePlatform": (
+        "SoftwarePlatform",
+        UpperOntologyCategory.SYSTEM_OR_ASSET,
+        "Open-source or commercial software platform, framework, library, or infrastructure tool",
+        {"softwareplatform", "softwaresystem", "softwarelibrary", "framework", "infrastructuretool", "cloudplatform"},
+    ),
+    "OrganizationOrFoundation": (
+        "OrganizationOrFoundation",
+        UpperOntologyCategory.ACTOR_OR_ORG,
+        "Technology vendor, open-source foundation, regulatory body, or standards consortium",
+        {"organizationorfoundation", "organization", "foundation", "vendor", "techcompany", "regulatorybody"},
+    ),
+    "ProgrammingLanguage": (
+        "ProgrammingLanguage",
+        UpperOntologyCategory.DATA_OR_ARTIFACT,
+        "Software programming language used to build systems and libraries",
+        {"programminglanguage", "language", "codinglanguage"},
+    ),
+    "QueryLanguageOrProtocol": (
+        "QueryLanguageOrProtocol",
+        UpperOntologyCategory.DATA_OR_ARTIFACT,
+        "Database query language, wire protocol, or network standard",
+        {"querylanguageorprotocol", "querylanguage", "protocol", "networkprotocol"},
+    ),
+    "AIConcept": (
+        "AIConcept",
+        UpperOntologyCategory.DATA_OR_ARTIFACT,
+        "Artificial intelligence architecture, semantic web paradigm, or retrieval concept",
+        {"aiconcept", "semanticconcept", "mltechnique", "retrievaltechnique"},
+    ),
 }
 
 
@@ -265,6 +325,54 @@ _CANONICAL_RELATION_EQUIVALENCES: dict[str, tuple[list[str], list[str], str, boo
         False,
         False,
         {"SUBSCRIBES_TO_SLA", "CONTRACTED_UNDER", "USES_PLATFORM_SERVICE"},
+    ),
+    "DEVELOPED_BY": (
+        ["SoftwarePlatform", "DatabaseCluster", "CloudService"],
+        ["OrganizationOrFoundation"],
+        "Organization, company, or foundation that designed, created, or developed a software system",
+        False,
+        False,
+        {"DEVELOPED_BY", "CREATED_BY", "DESIGNED_BY", "BUILT_BY", "AUTHORED_BY", "OFFERED_BY"},
+    ),
+    "HOSTED_BY_FOUNDATION": (
+        ["SoftwarePlatform", "DatabaseCluster"],
+        ["OrganizationOrFoundation"],
+        "Open-source foundation or governing consortium that hosts or maintains a project",
+        False,
+        False,
+        {"HOSTED_BY_FOUNDATION", "MAINTAINED_BY_FOUNDATION", "GRADUATED_FROM", "INCUBATED_BY"},
+    ),
+    "WRITTEN_IN": (
+        ["SoftwarePlatform", "DatabaseCluster", "CloudService"],
+        ["ProgrammingLanguage"],
+        "Primary programming language in which a software system or database is implemented",
+        False,
+        False,
+        {"WRITTEN_IN", "IMPLEMENTED_IN", "CODED_IN"},
+    ),
+    "SUPPORTS_PROTOCOL": (
+        ["SoftwarePlatform", "DatabaseCluster", "AIConcept"],
+        ["QueryLanguageOrProtocol", "AIConcept"],
+        "Query language, API standard, or cryptographic protocol supported by a system",
+        False,
+        False,
+        {"SUPPORTS_PROTOCOL", "SUPPORTS_QUERY_LANGUAGE", "IMPLEMENTS_PROTOCOL", "USES_PROTOCOL"},
+    ),
+    "INTEGRATES_WITH": (
+        ["SoftwarePlatform", "DatabaseCluster", "AIConcept"],
+        ["SoftwarePlatform", "DatabaseCluster", "AIConcept"],
+        "Ecosystem integration, interoperability, or complementary pairing between platforms",
+        False,
+        False,
+        {"INTEGRATES_WITH", "WORKS_WITH", "PAIRS_WITH", "COMPLEMENTS", "USED_WITH"},
+    ),
+    "ENACTED_BY": (
+        ["ComplianceStandard"],
+        ["OrganizationOrFoundation"],
+        "Regulatory body, parliament, or standards council that enacted a regulation or standard",
+        False,
+        False,
+        {"ENACTED_BY", "PUBLISHED_BY", "ADMINISTERED_BY", "ISSUED_BY"},
     ),
 }
 
@@ -484,6 +592,72 @@ class AutomatedOntologyInducer:
                     domain_class="EnterpriseCustomer",
                     range_class="SLAContract",
                     description="Enterprise customer SLA subscription",
+                    kb_id=chunk.kb_id,
+                    chunk_id=chunk.chunk_id,
+                )
+            )
+        if any(w in text_lower for w in ("developed by", "designed by", "created by", "founded by", "authored by", "offered by", "product of")):
+            relations.append(
+                RawCandidateRelation(
+                    raw_predicate="DEVELOPED_BY",
+                    domain_class="SoftwarePlatform",
+                    range_class="OrganizationOrFoundation",
+                    description="Organization that designed or developed the platform",
+                    kb_id=chunk.kb_id,
+                    chunk_id=chunk.chunk_id,
+                )
+            )
+        if any(w in text_lower for w in ("cloud native computing foundation", "apache software foundation", "linux foundation", "hosted by", "maintained by the")):
+            relations.append(
+                RawCandidateRelation(
+                    raw_predicate="HOSTED_BY_FOUNDATION",
+                    domain_class="SoftwarePlatform",
+                    range_class="OrganizationOrFoundation",
+                    description="Open-source foundation hosting the project",
+                    kb_id=chunk.kb_id,
+                    chunk_id=chunk.chunk_id,
+                )
+            )
+        if any(w in text_lower for w in ("written in", "implemented in", "programming language")):
+            relations.append(
+                RawCandidateRelation(
+                    raw_predicate="WRITTEN_IN",
+                    domain_class="SoftwarePlatform",
+                    range_class="ProgrammingLanguage",
+                    description="Primary implementation language",
+                    kb_id=chunk.kb_id,
+                    chunk_id=chunk.chunk_id,
+                )
+            )
+        if any(w in text_lower for w in ("opencypher", "cypher", "gremlin", "sparql", "sql", "tls", "ssl", "supports", "query language")):
+            relations.append(
+                RawCandidateRelation(
+                    raw_predicate="SUPPORTS_PROTOCOL",
+                    domain_class="DatabaseCluster",
+                    range_class="QueryLanguageOrProtocol",
+                    description="Supported query language or wire protocol",
+                    kb_id=chunk.kb_id,
+                    chunk_id=chunk.chunk_id,
+                )
+            )
+        if any(w in text_lower for w in ("integrates with", "works with", "used with", "alongside", "containers", "retrieval-augmented", "knowledge graph")):
+            relations.append(
+                RawCandidateRelation(
+                    raw_predicate="INTEGRATES_WITH",
+                    domain_class="SoftwarePlatform",
+                    range_class="SoftwarePlatform",
+                    description="Ecosystem integration between systems or paradigms",
+                    kb_id=chunk.kb_id,
+                    chunk_id=chunk.chunk_id,
+                )
+            )
+        if any(w in text_lower for w in ("european union", "security standards council", "united states congress", "enacted", "regulation in eu", "law in")):
+            relations.append(
+                RawCandidateRelation(
+                    raw_predicate="ENACTED_BY",
+                    domain_class="ComplianceStandard",
+                    range_class="OrganizationOrFoundation",
+                    description="Regulatory body that enacted the standard",
                     kb_id=chunk.kb_id,
                     chunk_id=chunk.chunk_id,
                 )
