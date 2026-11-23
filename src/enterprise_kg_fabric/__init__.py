@@ -8,23 +8,33 @@ from .adapters import (
     PropertyGraphStorePort,
     get_production_pgvector_ddl,
 )
+from .adaptive_router import AdaptiveQueryRouter, PluggableCrossEncoderReranker
 from .api import create_kg_fabric_app
 from .entity_resolution import CrossKBEntityResolver, SiblingCollisionGuard
+from .eval_harness import GraphRAGEvaluationHarness
+from .graph_analytics import GraphAnalyticsEngine
 from .llama_index_bridge import (
     LlamaIndexHierarchicalNodeParser,
     LlamaIndexSchemaAndDynamicExtractor,
     LlamaTextNode,
     PIIRedactor,
 )
+from .llm_extractor import AsyncCircuitBreaker, StructuredLLMExtractorAdapter
 from .mcp_server import KGFabricMcpServer, create_fastmcp_server
 from .models import (
     ChunkExtractionResult,
     ChunkSearchRequest,
+    CommunitySummaryRecord,
+    DLQFailedChunkRecord,
     EnterpriseCompiledTBox,
     EntitySearchMatch,
     EntitySearchRequest,
+    EvalSuiteReport,
+    EvalTestCase,
     ExtractedEntityMention,
     ExtractedRelationTriple,
+    GlobalCommunitySearchRequest,
+    GlobalCommunitySearchResponse,
     GraphRAGQueryRequest,
     GraphRAGQueryResponse,
     KBSourceType,
@@ -36,6 +46,9 @@ from .models import (
     OntologyInductionReport,
     OntologyRelationDef,
     OntologyStatus,
+    PPRSearchRequest,
+    PPRSearchResponse,
+    QueryRouteDecision,
     RawDocumentInput,
     ReadOnlyCypherSearchRequest,
     ReadOnlyCypherSearchResponse,
@@ -43,11 +56,14 @@ from .models import (
     RetrievedGraphFact,
     SubgraphSearchRequest,
     SubgraphSearchResponse,
+    SyncJobRecord,
+    SyncJobStatus,
     UpperOntologyCategory,
     VectorChunkRecord,
     VectorKBColumnMapping,
     VectorKBRegistration,
 )
+from .multimodal_ingestor import MultimodalDocumentIngestor
 from .ontology_inducer import AutomatedOntologyInducer, OWLSHACLCompiler
 from .pii_redaction import (
     PIIDetectionSpan,
@@ -70,6 +86,7 @@ __all__ = [
     "UpperOntologyCategory",
     "OntologyStatus",
     "KBSourceType",
+    "QueryRouteDecision",
     "VectorKBColumnMapping",
     "VectorKBRegistration",
     "RawDocumentInput",
@@ -89,6 +106,23 @@ __all__ = [
     "GraphRAGQueryResponse",
     "RetrievedChunkContext",
     "RetrievedGraphFact",
+    "ChunkSearchRequest",
+    "EntitySearchRequest",
+    "EntitySearchMatch",
+    "SubgraphSearchRequest",
+    "SubgraphSearchResponse",
+    "ReadOnlyCypherSearchRequest",
+    "ReadOnlyCypherSearchResponse",
+    "CommunitySummaryRecord",
+    "GlobalCommunitySearchRequest",
+    "GlobalCommunitySearchResponse",
+    "PPRSearchRequest",
+    "PPRSearchResponse",
+    "SyncJobStatus",
+    "SyncJobRecord",
+    "DLQFailedChunkRecord",
+    "EvalTestCase",
+    "EvalSuiteReport",
     "EmbeddingProvider",
     "FederatedEmbeddingModelRouter",
     "SemanticFeatureHashEmbeddingProvider",
@@ -105,6 +139,13 @@ __all__ = [
     "LlamaTextNode",
     "LlamaIndexHierarchicalNodeParser",
     "LlamaIndexSchemaAndDynamicExtractor",
+    "AsyncCircuitBreaker",
+    "StructuredLLMExtractorAdapter",
+    "MultimodalDocumentIngestor",
+    "GraphAnalyticsEngine",
+    "AdaptiveQueryRouter",
+    "PluggableCrossEncoderReranker",
+    "GraphRAGEvaluationHarness",
     "SiblingCollisionGuard",
     "CrossKBEntityResolver",
     "PgVectorStorePort",
@@ -117,5 +158,7 @@ __all__ = [
     "NeptuneOpenCypherGraphAdapter",
     "EnterpriseHybridGraphRAGEngine",
     "EnterpriseKGOntologyService",
+    "KGFabricMcpServer",
+    "create_fastmcp_server",
     "create_kg_fabric_app",
 ]

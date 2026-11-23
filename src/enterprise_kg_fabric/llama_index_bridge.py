@@ -146,6 +146,7 @@ class LlamaIndexHierarchicalNodeParser:
                     canonical_embedding=canon_vec,
                     parent_node_id=parent_id,
                     section_path=section_path,
+                    acl_groups=list(doc.acl_groups),
                     metadata={
                         **doc.metadata,
                         "title": doc.title,
@@ -466,6 +467,7 @@ class LlamaIndexSchemaAndDynamicExtractor:
         return ChunkExtractionResult(
             chunk_id=chunk.chunk_id,
             kb_id=chunk.kb_id,
+            acl_groups=list(chunk.acl_groups),
             entities=list(entities_by_key.values()),
             triples=triples,
         )

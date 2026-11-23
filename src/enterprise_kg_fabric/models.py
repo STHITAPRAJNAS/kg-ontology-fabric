@@ -85,6 +85,7 @@ class RawDocumentInput(BaseModel):
     source_uri: str = ""
     mime_type: str = "text/markdown"
     content: str
+    acl_groups: list[str] = Field(default_factory=lambda: ["public"])
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -108,6 +109,7 @@ class VectorChunkRecord(BaseModel):
     prev_node_id: str | None = None
     next_node_id: str | None = None
     section_path: str = ""
+    acl_groups: list[str] = Field(default_factory=lambda: ["public"])
     metadata: dict[str, Any] = Field(default_factory=dict)
     updated_at: str = Field(default_factory=utc_now_iso)
 
@@ -199,11 +201,16 @@ class ExtractedRelationTriple(BaseModel):
     confidence: float = Field(default=0.90, ge=0.0, le=1.0)
     t_valid: str = Field(default_factory=utc_now_iso)
     is_novel_predicate: bool = False
+    qualifiers: dict[str, Any] = Field(
+        default_factory=dict,
+        description="N-ary reified claim qualifiers e.g. {'condition': 'latency > 200ms', 'approved_by': 'vp_sre'}",
+    )
 
 
 class ChunkExtractionResult(BaseModel):
     chunk_id: str
     kb_id: str
+    acl_groups: list[str] = Field(default_factory=lambda: ["public"])
     entities: list[ExtractedEntityMention] = Field(default_factory=list)
     triples: list[ExtractedRelationTriple] = Field(default_factory=list)
 
@@ -224,6 +231,7 @@ class KGEntityNode(BaseModel):
     properties: dict[str, Any] = Field(default_factory=dict)
     source_kb_ids: list[str] = Field(default_factory=list)
     source_chunk_ids: list[str] = Field(default_factory=list)
+    acl_groups: list[str] = Field(default_factory=lambda: ["public"])
     mention_count: int = 1
     confidence: float = 0.92
     governance_bucket: OntologyStatus = OntologyStatus.APPROVED
@@ -234,7 +242,7 @@ class KGEntityNode(BaseModel):
 class KGRelationEdge(BaseModel):
     """
     Bi-Temporal Knowledge Graph Relationship Edge (ABox) in Neo4j/Neptune
-    linking canonical entities across KBs.
+    linking canonical entities across KBs, with N-ary reified qualifiers and ABAC ACLs.
     """
 
     edge_id: str
@@ -249,6 +257,8 @@ class KGRelationEdge(BaseModel):
     source_kb_ids: list[str] = Field(default_factory=list)
     source_chunk_ids: list[str] = Field(default_factory=list)
     evidence_snippets: list[str] = Field(default_factory=list)
+    qualifiers: dict[str, Any] = Field(default_factory=dict)
+    acl_groups: list[str] = Field(default_factory=lambda: ["public"])
     governance_bucket: OntologyStatus = OntologyStatus.APPROVED
 
 
@@ -294,15 +304,30 @@ class KGGraphBuildReport(BaseModel):
     shacl_conformance_passed: bool
 
 
+class QueryRouteDecision(str, Enum):
+    """Adaptive-RAG query routing strategies."""
+
+    FACTUAL_VECTOR = "FACTUAL_VECTOR"
+    LOCAL_MULTIHOP_PPR = "LOCAL_MULTIHOP_PPR"
+    STRUCTURED_AGGREGATION = "STRUCTURED_AGGREGATION"
+    GLOBAL_SENSEMAKING = "GLOBAL_SENSEMAKING"
+
+
 class GraphRAGQueryRequest(BaseModel):
     tenant_id: str = "enterprise_default"
     query: str
     kb_filter: list[str] | None = None
     domain_filter: list[str] | None = None
+    caller_acl_groups: list[str] | None = Field(
+        default=None,
+        description="Optional ABAC caller groups (e.g. ['public', 'sre']). None disables ACL filtering for admin queries.",
+    )
     top_k_chunks: int = Field(default=6, ge=1, le=50)
     max_graph_hops: int = Field(default=2, ge=1, le=4)
     include_quarantined_overflow: bool = False
     as_of_iso: str | None = None
+    use_adaptive_routing: bool = False
+    use_ppr_ranking: bool = True
 
 
 class RetrievedChunkContext(BaseModel):
@@ -313,6 +338,7 @@ class RetrievedChunkContext(BaseModel):
     text: str
     rrf_score: float
     retrieval_channels: list[str] = Field(default_factory=list)
+    acl_groups: list[str] = Field(default_factory=lambda: ["public"])
 
 
 class RetrievedGraphFact(BaseModel):
@@ -328,12 +354,16 @@ class RetrievedGraphFact(BaseModel):
     t_valid: str
     t_invalid: str
     confidence: float
+    ppr_score: float = 0.0
+    qualifiers: dict[str, Any] = Field(default_factory=dict)
+    acl_groups: list[str] = Field(default_factory=lambda: ["public"])
 
 
 class GraphRAGQueryResponse(BaseModel):
     query: str
     tenant_id: str
     tbox_version: str
+    route_taken: QueryRouteDecision = QueryRouteDecision.LOCAL_MULTIHOP_PPR
     synthesized_answer: str
     generated_opencypher_query: str
     opencypher_results: list[dict[str, Any]] = Field(default_factory=list)
@@ -341,6 +371,7 @@ class GraphRAGQueryResponse(BaseModel):
     cross_kb_bridge_entities: list[str] = Field(default_factory=list)
     graph_facts: list[RetrievedGraphFact] = Field(default_factory=list)
     chunk_contexts: list[RetrievedChunkContext] = Field(default_factory=list)
+    community_summaries_used: list[dict[str, Any]] = Field(default_factory=list)
     provenance_kbs_contributing: list[str] = Field(default_factory=list)
     retrieval_latency_ms: float = 0.0
 
@@ -353,6 +384,7 @@ class ChunkSearchRequest(BaseModel):
     top_k: int = Field(default=6, ge=1, le=50)
     kb_filter: list[str] | None = None
     domain_filter: list[str] | None = None
+    caller_acl_groups: list[str] | None = None
 
 
 class EntitySearchRequest(BaseModel):
@@ -363,6 +395,7 @@ class EntitySearchRequest(BaseModel):
     ontology_class_filter: str | None = None
     top_k: int = Field(default=8, ge=1, le=50)
     include_quarantined: bool = False
+    caller_acl_groups: list[str] | None = None
 
 
 class EntitySearchMatch(BaseModel):
@@ -372,6 +405,7 @@ class EntitySearchMatch(BaseModel):
     upper_category: UpperOntologyCategory
     aliases: list[str] = Field(default_factory=list)
     source_kb_ids: list[str] = Field(default_factory=list)
+    acl_groups: list[str] = Field(default_factory=lambda: ["public"])
     is_cross_kb_bridge: bool = False
     match_score: float = 0.0
 
@@ -387,6 +421,7 @@ class SubgraphSearchRequest(BaseModel):
     predicate_filter: list[str] | None = None
     as_of_iso: str | None = None
     include_quarantined: bool = False
+    caller_acl_groups: list[str] | None = None
 
 
 class SubgraphSearchResponse(BaseModel):
@@ -409,3 +444,99 @@ class ReadOnlyCypherSearchResponse(BaseModel):
     cypher_query: str
     rows: list[dict[str, Any]] = Field(default_factory=list)
     row_count: int = 0
+
+
+class CommunitySummaryRecord(BaseModel):
+    """Hierarchical Leiden/Louvain community summary (Microsoft GraphRAG Global Search)."""
+
+    community_id: str
+    tenant_id: str
+    level: int = 0
+    title: str
+    summary: str
+    member_entity_names: list[str] = Field(default_factory=list)
+    member_classes: list[str] = Field(default_factory=list)
+    contributing_kb_ids: list[str] = Field(default_factory=list)
+    top_predicates: list[str] = Field(default_factory=list)
+    high_level_themes: list[str] = Field(default_factory=list)
+    embedding: list[float] = Field(default_factory=list)
+
+
+class GlobalCommunitySearchRequest(BaseModel):
+    tenant_id: str = "enterprise_default"
+    query: str
+    top_k_communities: int = Field(default=4, ge=1, le=20)
+    caller_acl_groups: list[str] | None = None
+
+
+class GlobalCommunitySearchResponse(BaseModel):
+    tenant_id: str
+    query: str
+    synthesized_global_answer: str
+    communities_matched: list[CommunitySummaryRecord] = Field(default_factory=list)
+    engine_used: str = "leiden_or_louvain"
+
+
+class PPRSearchRequest(BaseModel):
+    """HippoRAG 2 Personalized PageRank hub-damped subgraph retrieval request."""
+
+    tenant_id: str = "enterprise_default"
+    seed_entities: list[str]
+    top_k_facts: int = Field(default=15, ge=1, le=100)
+    alpha: float = Field(default=0.85, ge=0.1, le=0.99)
+    as_of_iso: str | None = None
+    caller_acl_groups: list[str] | None = None
+
+
+class PPRSearchResponse(BaseModel):
+    tenant_id: str
+    engine_used: str
+    top_ranked_nodes: list[dict[str, Any]] = Field(default_factory=list)
+    ranked_facts: list[RetrievedGraphFact] = Field(default_factory=list)
+
+
+class SyncJobStatus(str, Enum):
+    QUEUED = "QUEUED"
+    RUNNING = "RUNNING"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+
+
+class DLQFailedChunkRecord(BaseModel):
+    dlq_id: str
+    tenant_id: str
+    kb_id: str
+    chunk_id: str
+    error_message: str
+    retry_count: int = 0
+    failed_at: str = Field(default_factory=utc_now_iso)
+
+
+class SyncJobRecord(BaseModel):
+    job_id: str
+    tenant_id: str
+    status: SyncJobStatus = SyncJobStatus.QUEUED
+    incremental: bool = True
+    report: KGGraphBuildReport | None = None
+    dlq_count: int = 0
+    error: str | None = None
+    created_at: str = Field(default_factory=utc_now_iso)
+    completed_at: str | None = None
+
+
+class EvalTestCase(BaseModel):
+    query: str
+    expected_facts: list[str] = Field(default_factory=list)
+    forbidden_facts: list[str] = Field(default_factory=list)
+    caller_acl_groups: list[str] | None = None
+    as_of_iso: str | None = None
+
+
+class EvalSuiteReport(BaseModel):
+    tenant_id: str
+    cases_evaluated: int
+    mean_multihop_recall: float
+    abac_zero_leakage_rate: float
+    citation_groundedness_rate: float
+    ragas_available: bool = False
+    case_details: list[dict[str, Any]] = Field(default_factory=list)

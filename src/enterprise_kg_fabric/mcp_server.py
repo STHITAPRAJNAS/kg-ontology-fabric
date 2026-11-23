@@ -7,7 +7,9 @@ from typing import Any
 from .models import (
     ChunkSearchRequest,
     EntitySearchRequest,
+    GlobalCommunitySearchRequest,
     GraphRAGQueryRequest,
+    PPRSearchRequest,
     RawDocumentInput,
     ReadOnlyCypherSearchRequest,
     SubgraphSearchRequest,
@@ -127,6 +129,44 @@ class KGFabricMcpServer:
                         "params": {"type": "object"},
                     },
                     "required": ["cypher_query"],
+                },
+            },
+            {
+                "name": "search_ppr_subgraph",
+                "title": "HippoRAG 2 Personalized PageRank (PPR) Subgraph Retrieval",
+                "description": (
+                    "Hub-damped Personalized PageRank traversal seeded from specific entities, "
+                    "penalizing noisy supernodes and enforcing ABAC ACLs."
+                ),
+                "annotations": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True},
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "tenant_id": {"type": "string", "default": "enterprise_default"},
+                        "seed_entities": {"type": "array", "items": {"type": "string"}},
+                        "top_k_facts": {"type": "integer", "default": 15},
+                        "caller_acl_groups": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["seed_entities"],
+                },
+            },
+            {
+                "name": "query_global_communities",
+                "title": "Microsoft GraphRAG Global Community Sensemaking",
+                "description": (
+                    "Answers corpus-wide executive questions across all KBs using Leiden/Louvain "
+                    "hierarchical community detection and LightRAG high-level theme summaries."
+                ),
+                "annotations": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True},
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "tenant_id": {"type": "string", "default": "enterprise_default"},
+                        "query": {"type": "string"},
+                        "top_k_communities": {"type": "integer", "default": 4},
+                        "caller_acl_groups": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["query"],
                 },
             },
             {
@@ -292,6 +332,14 @@ class KGFabricMcpServer:
         if tool_name == "execute_readonly_opencypher":
             c_res = await self.service.execute_readonly_opencypher(ReadOnlyCypherSearchRequest(**args))
             return c_res.model_dump()
+
+        if tool_name == "search_ppr_subgraph":
+            p_res = await self.service.search_ppr_subgraph(PPRSearchRequest(**args))
+            return p_res.model_dump()
+
+        if tool_name == "query_global_communities":
+            g_res = await self.service.query_global_communities(GlobalCommunitySearchRequest(**args))
+            return g_res.model_dump()
 
         if tool_name == "register_vector_kbs":
             regs = [VectorKBRegistration.model_validate(r) for r in args.get("registrations", [])]

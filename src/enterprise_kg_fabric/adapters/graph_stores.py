@@ -53,6 +53,7 @@ class PropertyGraphStorePort(ABC):
         max_hops: int = 2,
         include_quarantined: bool = False,
         as_of_iso: str | None = None,
+        caller_acl_groups: Sequence[str] | None = None,
     ) -> tuple[list[RetrievedGraphFact], list[str]]:
         """
         Traverses 1..K hops from seed entities, returning:
@@ -177,6 +178,15 @@ class InMemoryOpenCypherGraphEmulator(PropertyGraphStorePort):
             return False
         return True
 
+    @staticmethod
+    def _is_acl_allowed(item_acls: Sequence[str], caller_acls: Sequence[str] | None) -> bool:
+        if caller_acls is None or not item_acls:
+            return True
+        item_set = {g.lower() for g in item_acls}
+        if "public" in item_set:
+            return True
+        return bool({g.lower() for g in caller_acls}.intersection(item_set))
+
     async def expand_k_hop_subgraph(
         self,
         tenant_id: str,
@@ -184,13 +194,19 @@ class InMemoryOpenCypherGraphEmulator(PropertyGraphStorePort):
         max_hops: int = 2,
         include_quarantined: bool = False,
         as_of_iso: str | None = None,
+        caller_acl_groups: Sequence[str] | None = None,
     ) -> tuple[list[RetrievedGraphFact], list[str]]:
         ent_store = self._entities.get(tenant_id, {})
         edge_store = self._edges.get(tenant_id, {})
 
-        visited_entities: set[str] = set(seed_entity_ids)
+        allowed_seeds = [
+            eid
+            for eid in seed_entity_ids
+            if eid in ent_store and self._is_acl_allowed(ent_store[eid].acl_groups, caller_acl_groups)
+        ]
+        visited_entities: set[str] = set(allowed_seeds)
         visited_edges: set[str] = set()
-        queue: deque[tuple[str, int]] = deque((eid, 0) for eid in seed_entity_ids if eid in ent_store)
+        queue: deque[tuple[str, int]] = deque((eid, 0) for eid in allowed_seeds)
 
         facts: list[RetrievedGraphFact] = []
         bridge_entities: set[str] = set()
@@ -211,6 +227,8 @@ class InMemoryOpenCypherGraphEmulator(PropertyGraphStorePort):
                     continue
                 if not self._is_edge_valid_at(edge, as_of_iso):
                     continue
+                if not self._is_acl_allowed(edge.acl_groups, caller_acl_groups):
+                    continue
 
                 neighbor_id: str | None = None
                 if edge.source_entity_id == curr_id:
@@ -224,6 +242,10 @@ class InMemoryOpenCypherGraphEmulator(PropertyGraphStorePort):
                 s_ent = ent_store.get(edge.source_entity_id)
                 t_ent = ent_store.get(edge.target_entity_id)
                 if s_ent is None or t_ent is None:
+                    continue
+                if not self._is_acl_allowed(s_ent.acl_groups, caller_acl_groups) or not self._is_acl_allowed(
+                    t_ent.acl_groups, caller_acl_groups
+                ):
                     continue
 
                 visited_edges.add(edge.edge_id)
@@ -248,6 +270,8 @@ class InMemoryOpenCypherGraphEmulator(PropertyGraphStorePort):
                         t_valid=edge.t_valid,
                         t_invalid=edge.t_invalid,
                         confidence=edge.confidence,
+                        qualifiers=edge.qualifiers,
+                        acl_groups=edge.acl_groups,
                     )
                 )
 
@@ -403,6 +427,7 @@ class Neo4jOpenCypherGraphAdapter(PropertyGraphStorePort):
                         n.summary = e.summary,
                         n.source_kb_ids = e.source_kb_ids,
                         n.source_chunk_ids = e.source_chunk_ids,
+                        n.acl_groups = e.acl_groups,
                         n.mention_count = e.mention_count,
                         n.confidence = e.confidence,
                         n.governance_bucket = e.governance_bucket,
@@ -472,6 +497,7 @@ class Neo4jOpenCypherGraphAdapter(PropertyGraphStorePort):
                         rel.source_kb_ids = $r.source_kb_ids,
                         rel.source_chunk_ids = $r.source_chunk_ids,
                         rel.evidence_snippets = $r.evidence_snippets,
+                        rel.acl_groups = $r.acl_groups,
                         rel.confidence = $r.confidence,
                         rel.governance_bucket = $r.governance_bucket
                     """,
@@ -571,6 +597,7 @@ class Neo4jOpenCypherGraphAdapter(PropertyGraphStorePort):
         max_hops: int = 2,
         include_quarantined: bool = False,
         as_of_iso: str | None = None,
+        caller_acl_groups: Sequence[str] | None = None,
     ) -> tuple[list[RetrievedGraphFact], list[str]]:
         if not seed_entity_ids:
             return [], []
@@ -581,6 +608,7 @@ class Neo4jOpenCypherGraphAdapter(PropertyGraphStorePort):
         visited_edges: set[str] = set()
         facts: list[RetrievedGraphFact] = []
         bridge_entities: set[str] = set()
+        caller_acls_list = [g.lower() for g in caller_acl_groups] if caller_acl_groups is not None else None
 
         async with driver.session() as session:
             for hop in range(1, max_hops + 1):
@@ -591,6 +619,11 @@ class Neo4jOpenCypherGraphAdapter(PropertyGraphStorePort):
                     MATCH (a:Entity {tenant_id: $tenant_id})-[rel:KG_RELATION]-(b:Entity {tenant_id: $tenant_id})
                     WHERE a.entity_id IN $frontier
                       AND ($include_q OR coalesce(rel.governance_bucket, 'APPROVED') = 'APPROVED')
+                      AND (
+                        $caller_acls IS NULL
+                        OR 'public' IN coalesce(rel.acl_groups, ['public'])
+                        OR ANY(g IN coalesce(rel.acl_groups, ['public']) WHERE toLower(g) IN $caller_acls)
+                      )
                       AND (
                         ($as_of IS NULL AND rel.t_invalid = 'ACTIVE')
                         OR ($as_of IS NOT NULL AND rel.t_valid <= $as_of AND (rel.t_invalid = 'ACTIVE' OR rel.t_invalid > $as_of))
@@ -606,6 +639,7 @@ class Neo4jOpenCypherGraphAdapter(PropertyGraphStorePort):
                            t.ontology_class AS target_class,
                            coalesce(t.source_kb_ids, []) AS t_kbs,
                            coalesce(rel.source_kb_ids, []) AS edge_kbs,
+                           coalesce(rel.acl_groups, ['public']) AS edge_acls,
                            rel.t_valid AS t_valid,
                            rel.t_invalid AS t_invalid,
                            coalesce(rel.confidence, 0.9) AS confidence,
@@ -615,6 +649,7 @@ class Neo4jOpenCypherGraphAdapter(PropertyGraphStorePort):
                     frontier=frontier,
                     include_q=include_quarantined,
                     as_of=as_of_iso,
+                    caller_acls=caller_acls_list,
                 )
                 rows = await result.data()
                 next_frontier: list[str] = []
@@ -758,6 +793,7 @@ class NeptuneOpenCypherGraphAdapter(PropertyGraphStorePort):
         max_hops: int = 2,
         include_quarantined: bool = False,
         as_of_iso: str | None = None,
+        caller_acl_groups: Sequence[str] | None = None,
     ) -> tuple[list[RetrievedGraphFact], list[str]]:
         return await self._mirror.expand_k_hop_subgraph(
             tenant_id=tenant_id,
@@ -765,6 +801,7 @@ class NeptuneOpenCypherGraphAdapter(PropertyGraphStorePort):
             max_hops=max_hops,
             include_quarantined=include_quarantined,
             as_of_iso=as_of_iso,
+            caller_acl_groups=caller_acl_groups,
         )
 
     async def execute_opencypher(

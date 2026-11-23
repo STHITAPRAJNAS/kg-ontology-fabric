@@ -9,18 +9,26 @@ from pydantic import BaseModel, Field
 from .mcp_server import KGFabricMcpServer
 from .models import (
     ChunkSearchRequest,
+    DLQFailedChunkRecord,
     EntitySearchMatch,
     EntitySearchRequest,
+    EvalSuiteReport,
+    EvalTestCase,
+    GlobalCommunitySearchRequest,
+    GlobalCommunitySearchResponse,
     GraphRAGQueryRequest,
     GraphRAGQueryResponse,
     KGGraphBuildReport,
     OntologyInductionReport,
+    PPRSearchRequest,
+    PPRSearchResponse,
     RawDocumentInput,
     ReadOnlyCypherSearchRequest,
     ReadOnlyCypherSearchResponse,
     RetrievedChunkContext,
     SubgraphSearchRequest,
     SubgraphSearchResponse,
+    SyncJobRecord,
     VectorChunkRecord,
     VectorKBRegistration,
 )
@@ -61,6 +69,11 @@ class PromoteOntologyRequest(BaseModel):
 class McpToolCallRestRequest(BaseModel):
     tool_name: str
     arguments: dict[str, Any] = Field(default_factory=dict)
+
+
+class RunEvalSuiteRequest(BaseModel):
+    tenant_id: str = "enterprise_default"
+    cases: list[EvalTestCase]
 
 
 def create_kg_fabric_app(
@@ -180,6 +193,39 @@ def create_kg_fabric_app(
             return await svc.execute_readonly_opencypher(req)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/v1/search/ppr", response_model=PPRSearchResponse)
+    async def search_ppr(req: PPRSearchRequest) -> PPRSearchResponse:
+        return await svc.search_ppr_subgraph(req)
+
+    @app.post("/v1/search/global", response_model=GlobalCommunitySearchResponse)
+    async def search_global_communities(
+        req: GlobalCommunitySearchRequest,
+    ) -> GlobalCommunitySearchResponse:
+        return await svc.query_global_communities(req)
+
+    @app.post("/v1/jobs/build", response_model=SyncJobRecord)
+    async def submit_build_job(req: BuildGraphRequest) -> SyncJobRecord:
+        return await svc.execute_tracked_build_job(
+            tenant_id=req.tenant_id,
+            incremental=req.incremental,
+            validate_shacl=req.validate_shacl,
+        )
+
+    @app.get("/v1/jobs/dlq", response_model=list[DLQFailedChunkRecord])
+    async def list_dlq(tenant_id: str | None = None) -> list[DLQFailedChunkRecord]:
+        return svc.list_dlq_records(tenant_id=tenant_id)
+
+    @app.get("/v1/jobs/{job_id}", response_model=SyncJobRecord)
+    async def get_job_status(job_id: str) -> SyncJobRecord:
+        job = svc.get_sync_job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
+        return job
+
+    @app.post("/v1/eval/run", response_model=EvalSuiteReport)
+    async def run_eval(req: RunEvalSuiteRequest) -> EvalSuiteReport:
+        return await svc.run_eval_suite(tenant_id=req.tenant_id, cases=req.cases)
 
     @app.get("/v1/telemetry")
     async def get_telemetry(tenant_id: str = "enterprise_default") -> dict[str, Any]:

@@ -56,7 +56,7 @@ _CLASS_DISCOVERY_RULES: list[tuple[re.Pattern[str], str, UpperOntologyCategory, 
         "Deployable software microservice, API gateway, or backend workload",
     ),
     (
-        re.compile(r"\b(database\s*cluster|aurora\s*ledger|postgres(?:ql)?|pgvector|datastore|neptune|neo4j|redis|kafka|data\s*warehouse|graph\s*database|relational\s*database|vector\s*database|database\s*management\s*system)\b", re.I),
+        re.compile(r"\b(database\s*cluster|aurora(?:[\-\s][a-z0-9]+)*|postgres(?:ql)?|pgvector|datastore|neptune|neo4j|redis|kafka|data\s*warehouse|graph\s*database|relational\s*database|vector\s*database|database\s*management\s*system)\b", re.I),
         "DatabaseCluster",
         UpperOntologyCategory.SYSTEM_OR_ASSET,
         "Stateful database, vector store, streaming platform, or graph storage cluster",
@@ -517,7 +517,7 @@ class AutomatedOntologyInducer:
                     is_transitive=True,
                 )
             )
-        if any(w in text_lower for w in ("deployed in", "hosted in", "primary region", "runs in region", "failover to")):
+        if any(w in text_lower for w in ("deployed in", "hosted in", "primary region", "runs in region", "failover to", "failed over to")):
             relations.append(
                 RawCandidateRelation(
                     raw_predicate="DEPLOYED_IN_PRIMARY",

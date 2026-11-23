@@ -1,15 +1,34 @@
-# Enterprise Multi-KB Automated Ontology & Knowledge Graph Fabric (`kg-ontology-fabric`)
+# Enterprise Multi-KB Automated Ontology & Knowledge Graph Fabric (`kg-ontology-fabric` v0.2.0)
 
-An enterprise-grade service that automatically induces, aligns, and governs **formal domain ontologies (W3C OWL 2 / SHACL TBox)** and **bi-temporal knowledge graphs (ABox)** from **100s of heterogeneous PostgreSQL `pgvector` embedding stores** (`384d` / `768d` / `1024d` / `1536d`) and **raw unstructured document streams**, powered by **LlamaIndex**, **Neo4j 5 / Amazon Neptune (`openCypher`)**, **PostgreSQL (`pgvector`)**, and **Microsoft Presidio** PII redaction.
+An enterprise-grade service that automatically induces, aligns, and governs **formal domain ontologies (W3C OWL 2 / SHACL TBox)** and **bi-temporal, ABAC-trimmed knowledge graphs (ABox)** from **100s of heterogeneous PostgreSQL `pgvector` embedding stores** (`384d` / `768d` / `1024d` / `1536d`) and **multimodal/raw document streams**, powered by **LlamaIndex**, **Neo4j 5 / Amazon Neptune (`openCypher`)**, **PostgreSQL (`pgvector`)**, **Microsoft Presidio**, **HippoRAG 2 PPR**, **Leiden Global Search**, **IBM Docling**, and co-hosted **FastAPI + MCP (`2026-07-28`)**.
 
 ---
 
 ## Documentation Hub
 
-* **[Architecture, Algorithms & Explainer Guide](./docs/architecture_and_explainer_guide.md)** — Deep dive into Sub-Linear Vector Centroid Sampling, Cross-KB Synonym Alignment, `SiblingCollisionGuard`, Bi-Temporal Functional Edges, W3C OWL/SHACL Validation, and LlamaIndex 4-Path Hybrid GraphRAG.
+* **[Architecture, Algorithms & Explainer Guide](./docs/architecture_and_explainer_guide.md)** — Deep dive into Sub-Linear Vector Centroid Sampling, Cross-KB Synonym Alignment, `SiblingCollisionGuard`, Bi-Temporal Functional Edges, W3C OWL/SHACL Validation, and Hybrid GraphRAG.
 * **[Usage, Multi-Model Vector Federation, Presidio PII & AWS EKS Deployment Guide](./docs/usage_and_eks_deployment_guide.md)** — End-to-end API/SDK usage, Zero-Re-Embedding Multi-Model Query Fan-Out, Microsoft Presidio PII configuration, Amazon EKS manifests (`deploy/eks/`), and Enterprise Maturity Roadmap.
 * **[Live Docker Messy Cross-KB Benchmark](./examples/live_docker_messy_enterprise_test.py)** & **[Observed Results JSON](./live_docker_observation_report.json)** — Head-to-head comparison against live Docker `pgvector` + Neo4j 5 (`9/9` recall vs. `3/9` Vector-Only RAG).
+* **[Live Internet Wikipedia 5-KB Benchmark](./examples/live_internet_wikipedia_kbs_e2e.py)** & **[Report JSON](./live_internet_kbs_report.json)** — 25 real Wikipedia articles across 5 heterogeneous KBs on live Docker `pgvector` + Neo4j 5.
 * **[120-KB Enterprise Scale Simulation](./examples/simulate_120_kbs_end_to_end.py)** & **[Benchmark Report JSON](./simulation_benchmark_report.json)**.
+
+---
+
+## What's New in `v0.2.0` (2024–2026 SOTA GraphRAG & Enterprise Production Hardening)
+
+Designed to **reuse proven industry & workspace libraries** instead of reinventing the wheel (with deterministic zero-dependency fallbacks when optional extras are not installed):
+
+| Capability | Module / Surface | Reused Library / Standard |
+| :--- | :--- | :--- |
+| **Live Structured-Output LLM Extraction + Circuit Breaker** | `llm_extractor.py` | `google-genai` (Structured JSON), `boto3` Bedrock, `openai`, `agentic_memory_sdk.governance.AsyncCircuitBreaker` |
+| **HippoRAG 2 Personalized PageRank (PPR) + Hub Damping** | `graph_analytics.py`, `POST /v1/search/ppr`, MCP `search_ppr_subgraph` | `networkx.pagerank` + inverse-degree hub damping (`ppr / sqrt(deg)`) |
+| **Microsoft GraphRAG Leiden/Louvain Global Sensemaking** | `graph_analytics.py`, `POST /v1/search/global`, MCP `query_global_communities` | `leidenalg` + `python-igraph` / `networkx.community.louvain_communities` |
+| **Adaptive-RAG Query Router + Cross-Encoder Reranker** | `adaptive_router.py`, `rag_engine.py` | `sentence-transformers` (`CrossEncoder`) / Bedrock Rerank |
+| **Document/Entity/Edge ABAC Security Trimming + N-ary Qualifiers** | `adapters/pgvector_store.py`, `adapters/graph_stores.py`, `models.py` | End-to-end `caller_acl_groups` enforcement (zero-leakage verified) + `qualifiers` (`condition`, `scope`, `exception`) |
+| **Multimodal & Tabular Document Ingestion** | `multimodal_ingestor.py` | **IBM Docling** (`docling.document_converter.DocumentConverter`) + Markdown/CSV table-to-triples parser |
+| **Persistent Multi-Pod TBox Store** | `adapters/pgvector_store.py` (`enterprise_tbox_registry`) | PostgreSQL JSONB persistence for cold-start EKS HPA pods |
+| **Async Sync Jobs, DLQ, OpenTelemetry & Eval Harness** | `service.py`, `api.py`, `eval_harness.py` (`POST /v1/jobs/build`, `GET /v1/jobs/dlq`, `POST /v1/eval/run`) | `opentelemetry-api` / `opentelemetry-sdk`, `ragas`-compatible Continuous GraphRAG Eval |
+| **Co-Hosted FastAPI + MCP Server (`2026-07-28`)** | `mcp_server.py`, `POST /mcp`, `/mcp/http`, `/v1/mcp/call` | `mcp` FastMCP — **12 MCP Tools, 4 Resources, 2 Prompts** |
 
 ---
 
@@ -116,7 +135,7 @@ Rather than ripping and replacing existing RAG pipelines, deploy `kg-ontology-fa
 ### A. Run Unit Tests & 120-KB Scale Simulation (No Docker Required)
 ```bash
 pip install -e ".[dev]"
-pytest tests/test_enterprise_kg_fabric_e2e.py -v
+pytest tests/ -v
 ```
 
 ### B. Run Live Docker Messy Cross-KB Benchmark (`pgvector` + `Neo4j 5`)
@@ -126,10 +145,10 @@ python examples/live_docker_messy_enterprise_test.py
 ```
 Inspect the live induced ontology and knowledge graph in Neo4j Browser at `http://localhost:7475` (`bolt://localhost:7688`).
 
-### C. Run FastAPI Microservice Locally or Deploy to Amazon EKS
+### C. Run FastAPI + MCP Microservice Locally or Deploy to Amazon EKS
 ```bash
-# Local FastAPI server (with optional Microsoft Presidio PII extra)
-pip install -e ".[pii,aws]"
+# Local FastAPI + MCP server (install optional SOTA extras as needed)
+pip install -e ".[pii,aws,mcp,llm,graph-analytics,multimodal,rerank,eval,otel]"
 python -m spacy download en_core_web_lg
 uvicorn enterprise_kg_fabric.api:create_kg_fabric_app --factory --host 0.0.0.0 --port 8080
 

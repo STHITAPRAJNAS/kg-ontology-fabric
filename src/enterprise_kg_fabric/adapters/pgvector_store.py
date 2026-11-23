@@ -7,6 +7,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Sequence
 
 from ..models import (
+    EnterpriseCompiledTBox,
     KBWatermarkState,
     KGEntityNode,
     RetrievedChunkContext,
@@ -93,6 +94,13 @@ CREATE TABLE IF NOT EXISTS canonical_entity_embeddings (
 CREATE INDEX IF NOT EXISTS idx_canonical_entities_hnsw
     ON canonical_entity_embeddings USING hnsw (embedding vector_cosine_ops);
 
+CREATE TABLE IF NOT EXISTS enterprise_tbox_registry (
+    tenant_id TEXT PRIMARY KEY,
+    tbox_version TEXT NOT NULL,
+    tbox_json JSONB NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 ALTER TABLE unified_rag_chunks ENABLE ROW LEVEL SECURITY;
 ALTER TABLE canonical_entity_embeddings ENABLE ROW LEVEL SECURITY;
 """.strip()
@@ -100,6 +108,12 @@ ALTER TABLE canonical_entity_embeddings ENABLE ROW LEVEL SECURITY;
 
 class PgVectorStorePort(ABC):
     """Port interface for multi-KB PostgreSQL + pgvector operations."""
+
+    async def save_tbox(self, tbox: EnterpriseCompiledTBox) -> None:
+        return None
+
+    async def load_tbox(self, tenant_id: str) -> EnterpriseCompiledTBox | None:
+        return None
 
     @abstractmethod
     async def register_kb(self, registration: VectorKBRegistration) -> None:
@@ -145,6 +159,7 @@ class PgVectorStorePort(ABC):
         top_k: int = 6,
         kb_filter: list[str] | None = None,
         domain_filter: list[str] | None = None,
+        caller_acl_groups: list[str] | None = None,
     ) -> list[RetrievedChunkContext]:
         raise NotImplementedError
 
@@ -179,6 +194,13 @@ class InMemoryPgVectorStoreEmulator(PgVectorStorePort):
         self._kb_tables: dict[str, dict[str, VectorChunkRecord]] = {}
         self._watermarks: dict[tuple[str, str], KBWatermarkState] = {}
         self._entity_index: dict[str, KGEntityNode] = {}
+        self._tboxes: dict[str, EnterpriseCompiledTBox] = {}
+
+    async def save_tbox(self, tbox: EnterpriseCompiledTBox) -> None:
+        self._tboxes[tbox.tenant_id] = tbox
+
+    async def load_tbox(self, tenant_id: str) -> EnterpriseCompiledTBox | None:
+        return self._tboxes.get(tenant_id)
 
     async def register_kb(self, registration: VectorKBRegistration) -> None:
         self._kb_registry[registration.kb_id] = registration
@@ -279,10 +301,12 @@ class InMemoryPgVectorStoreEmulator(PgVectorStorePort):
         top_k: int = 6,
         kb_filter: list[str] | None = None,
         domain_filter: list[str] | None = None,
+        caller_acl_groups: list[str] | None = None,
     ) -> list[RetrievedChunkContext]:
         candidate_chunks: list[VectorChunkRecord] = []
         kb_allow = set(kb_filter) if kb_filter else None
         dom_allow = set(domain_filter) if domain_filter else None
+        caller_acls = {g.lower() for g in caller_acl_groups} if caller_acl_groups is not None else None
 
         for kb_id, table in self._kb_tables.items():
             if kb_allow is not None and kb_id not in kb_allow:
@@ -292,6 +316,10 @@ class InMemoryPgVectorStoreEmulator(PgVectorStorePort):
                     continue
                 if dom_allow is not None and chk.domain_tag not in dom_allow:
                     continue
+                if caller_acls is not None:
+                    chk_acls = {g.lower() for g in chk.acl_groups}
+                    if "public" not in chk_acls and not caller_acls.intersection(chk_acls):
+                        continue
                 candidate_chunks.append(chk)
 
         if not candidate_chunks:
@@ -483,6 +511,35 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
         if self._pool is not None:
             await self._pool.close()
             self._pool = None
+
+    async def save_tbox(self, tbox: EnterpriseCompiledTBox) -> None:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO enterprise_tbox_registry (tenant_id, tbox_version, tbox_json)
+                VALUES ($1, $2, $3::jsonb)
+                ON CONFLICT (tenant_id) DO UPDATE SET
+                    tbox_version = EXCLUDED.tbox_version,
+                    tbox_json = EXCLUDED.tbox_json,
+                    updated_at = NOW()
+                """,
+                tbox.tenant_id,
+                tbox.version,
+                tbox.model_dump_json(),
+            )
+
+    async def load_tbox(self, tenant_id: str) -> EnterpriseCompiledTBox | None:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT tbox_json FROM enterprise_tbox_registry WHERE tenant_id = $1",
+                tenant_id,
+            )
+            if not row:
+                return None
+            raw = self._parse_json_safe(row["tbox_json"])
+            return EnterpriseCompiledTBox.model_validate(raw)
 
     async def reverse_hydrate_from_legacy_pgvector_table(
         self,
@@ -681,6 +738,7 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
         top_k: int = 6,
         kb_filter: list[str] | None = None,
         domain_filter: list[str] | None = None,
+        caller_acl_groups: list[str] | None = None,
     ) -> list[RetrievedChunkContext]:
         pool = await self._get_pool()
         vec_str = "[" + ",".join(f"{v:.6f}" for v in query_embedding) + "]"
@@ -688,7 +746,7 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
             rows = await conn.fetch(
                 """
                 WITH dense AS (
-                    SELECT chunk_id, kb_id, domain_tag, doc_id, text,
+                    SELECT chunk_id, kb_id, domain_tag, doc_id, text, metadata,
                            ROW_NUMBER() OVER (ORDER BY canonical_embedding <=> $2::vector) AS dense_rank
                     FROM unified_rag_chunks
                     WHERE tenant_id = $1
@@ -698,7 +756,7 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
                     LIMIT $4
                 ),
                 lexical AS (
-                    SELECT chunk_id, kb_id, domain_tag, doc_id, text,
+                    SELECT chunk_id, kb_id, domain_tag, doc_id, text, metadata,
                            ROW_NUMBER() OVER (ORDER BY ts_rank_cd(tsv, plainto_tsquery('english', $3)) DESC) AS lex_rank
                     FROM unified_rag_chunks
                     WHERE tenant_id = $1
@@ -714,6 +772,7 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
                            COALESCE(d.domain_tag, l.domain_tag) AS domain_tag,
                            COALESCE(d.doc_id, l.doc_id) AS doc_id,
                            COALESCE(d.text, l.text) AS text,
+                           COALESCE(d.metadata, l.metadata) AS metadata,
                            COALESCE(1.0 / (60.0 + d.dense_rank), 0.0)
                              + COALESCE(1.2 / (60.0 + l.lex_rank), 0.0) AS rrf_score,
                            (d.dense_rank IS NOT NULL) AS hit_dense,
@@ -731,10 +790,17 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
                 max(top_k * 4, 25),
                 kb_filter,
                 domain_filter,
-                top_k,
+                top_k * 3 if caller_acl_groups is not None else top_k,
             )
+            caller_acls = {g.lower() for g in caller_acl_groups} if caller_acl_groups is not None else None
             results: list[RetrievedChunkContext] = []
             for r in rows:
+                meta = self._parse_json_safe(r["metadata"]) if r["metadata"] else {}
+                chk_acls = meta.get("acl_groups", ["public"]) if isinstance(meta, dict) else ["public"]
+                if caller_acls is not None:
+                    chk_set = {g.lower() for g in chk_acls}
+                    if "public" not in chk_set and not caller_acls.intersection(chk_set):
+                        continue
                 chans = []
                 if r["hit_dense"]:
                     chans.append("pgvector_hnsw_dense")
@@ -749,8 +815,11 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
                         text=r["text"],
                         rrf_score=round(float(r["rrf_score"]), 5),
                         retrieval_channels=chans,
+                        acl_groups=list(chk_acls),
                     )
                 )
+                if len(results) >= top_k:
+                    break
             return results
 
     async def search_similar_entities(

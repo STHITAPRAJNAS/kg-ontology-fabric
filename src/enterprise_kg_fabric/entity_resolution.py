@@ -147,8 +147,10 @@ class CrossKBEntityResolver:
             mention: ExtractedEntityMention,
             kb_id: str,
             chunk_id: str,
+            acl_groups: list[str] | None = None,
         ) -> KGEntityNode:
             nonlocal sibling_collisions_prevented
+            chunk_acls = list(acl_groups) if acl_groups else ["public"]
 
             canon_cls = tbox.resolve_class(mention.proposed_class)
             cls_def = tbox.classes.get(canon_cls)
@@ -166,7 +168,7 @@ class CrossKBEntityResolver:
             exact_key = f"{upper_cat.value}::{mention.surface_name.lower()}"
             if exact_key in surface_to_entity_id:
                 target_ent = canonical_entities[surface_to_entity_id[exact_key]]
-                self._merge_provenance_into_entity(target_ent, mention, kb_id, chunk_id)
+                self._merge_provenance_into_entity(target_ent, mention, kb_id, chunk_id, chunk_acls)
                 return target_ent
 
             slug = self.normalize_entity_slug(mention.surface_name)
@@ -178,7 +180,7 @@ class CrossKBEntityResolver:
                 )
                 if can_merge:
                     surface_to_entity_id[exact_key] = candidate_ent.entity_id
-                    self._merge_provenance_into_entity(candidate_ent, mention, kb_id, chunk_id)
+                    self._merge_provenance_into_entity(candidate_ent, mention, kb_id, chunk_id, chunk_acls)
                     return candidate_ent
                 else:
                     sibling_collisions_prevented += 1
@@ -215,7 +217,7 @@ class CrossKBEntityResolver:
             if best_match is not None:
                 surface_to_entity_id[exact_key] = best_match.entity_id
                 slug_to_entity_id[slug_key] = best_match.entity_id
-                self._merge_provenance_into_entity(best_match, mention, kb_id, chunk_id)
+                self._merge_provenance_into_entity(best_match, mention, kb_id, chunk_id, chunk_acls)
                 return best_match
 
             # Create new canonical entity node
@@ -232,6 +234,7 @@ class CrossKBEntityResolver:
                 properties=dict(mention.attributes),
                 source_kb_ids=[kb_id],
                 source_chunk_ids=[chunk_id],
+                acl_groups=list(chunk_acls),
                 mention_count=1,
                 confidence=mention.confidence,
                 governance_bucket=gov_bucket,
@@ -245,7 +248,9 @@ class CrossKBEntityResolver:
         # Pass 1: Resolve all entity mentions across all extracted chunks
         for chunk_res in extractions:
             for ent_mention in chunk_res.entities:
-                _resolve_or_create_entity(ent_mention, chunk_res.kb_id, chunk_res.chunk_id)
+                _resolve_or_create_entity(
+                    ent_mention, chunk_res.kb_id, chunk_res.chunk_id, chunk_res.acl_groups
+                )
 
         # Pass 2: Resolve all relationship triples using canonical entity IDs
         edges_by_signature: dict[str, KGRelationEdge] = {}
@@ -259,6 +264,7 @@ class CrossKBEntityResolver:
                     ),
                     chunk_res.kb_id,
                     chunk_res.chunk_id,
+                    chunk_res.acl_groups,
                 )
                 obj_node = _resolve_or_create_entity(
                     ExtractedEntityMention(
@@ -268,6 +274,7 @@ class CrossKBEntityResolver:
                     ),
                     chunk_res.kb_id,
                     chunk_res.chunk_id,
+                    chunk_res.acl_groups,
                 )
                 canon_pred = tbox.resolve_predicate(triple.predicate)
                 rel_def = tbox.relations.get(canon_pred)
@@ -297,6 +304,8 @@ class CrossKBEntityResolver:
                         source_kb_ids=[chunk_res.kb_id],
                         source_chunk_ids=[chunk_res.chunk_id],
                         evidence_snippets=[triple.evidence_snippet] if triple.evidence_snippet else [],
+                        qualifiers=dict(triple.qualifiers),
+                        acl_groups=list(chunk_res.acl_groups),
                         governance_bucket=gov_bucket,
                     )
                 else:
@@ -305,6 +314,11 @@ class CrossKBEntityResolver:
                         existing_edge.source_kb_ids.append(chunk_res.kb_id)
                     if chunk_res.chunk_id not in existing_edge.source_chunk_ids:
                         existing_edge.source_chunk_ids.append(chunk_res.chunk_id)
+                    for acl in chunk_res.acl_groups:
+                        if acl not in existing_edge.acl_groups:
+                            existing_edge.acl_groups.append(acl)
+                    if triple.qualifiers:
+                        existing_edge.qualifiers.update(triple.qualifiers)
                     if (
                         triple.evidence_snippet
                         and triple.evidence_snippet not in existing_edge.evidence_snippets
@@ -330,6 +344,7 @@ class CrossKBEntityResolver:
         mention: ExtractedEntityMention,
         kb_id: str,
         chunk_id: str,
+        acl_groups: list[str] | None = None,
     ) -> None:
         if mention.surface_name not in entity.aliases:
             entity.aliases.append(mention.surface_name)
@@ -340,6 +355,9 @@ class CrossKBEntityResolver:
             entity.source_kb_ids.append(kb_id)
         if chunk_id not in entity.source_chunk_ids:
             entity.source_chunk_ids.append(chunk_id)
+        for acl in acl_groups or []:
+            if acl not in entity.acl_groups:
+                entity.acl_groups.append(acl)
         entity.mention_count += 1
         entity.confidence = max(entity.confidence, mention.confidence)
         entity.updated_at = utc_now_iso()
