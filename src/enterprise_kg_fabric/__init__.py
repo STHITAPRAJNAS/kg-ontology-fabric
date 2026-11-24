@@ -56,21 +56,26 @@ from .models import (
     EvalTestCase,
     ExtractedEntityMention,
     ExtractedRelationTriple,
+    ExtractionAndERQualityMetrics,
     GlobalCommunitySearchRequest,
     GlobalCommunitySearchResponse,
     GraphRAGQueryRequest,
     GraphRAGQueryResponse,
+    GraphTopologyQualityMetrics,
     KBSourceType,
     KBWatermarkState,
     KGEntityNode,
     KGGraphBuildReport,
+    KGQualityScorecardReport,
     KGRelationEdge,
     OntologyClassDef,
     OntologyInductionReport,
     OntologyRelationDef,
     OntologyStatus,
+    OntologyTBoxQualityMetrics,
     PPRSearchRequest,
     PPRSearchResponse,
+    QualityIssueFinding,
     QueryRouteDecision,
     RawDocumentInput,
     ReadOnlyCypherSearchRequest,
@@ -94,6 +99,7 @@ from .pii_redaction import (
     PIIRedactionResult,
     PresidioPIIRedactor,
 )
+from .quality_auditor import KGQualityAuditor
 from .rag_engine import EnterpriseHybridGraphRAGEngine
 from .service import EnterpriseKGOntologyService
 from .vector_clustering import (

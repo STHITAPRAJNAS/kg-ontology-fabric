@@ -16,6 +16,10 @@ All notable changes to `enterprise-kg-ontology-fabric` are documented in this fi
   - Added opt-in multi-replica-safe background incremental CDC sync worker (`start_sync_worker` / `run_scheduled_sync_cycle`) coordinated via `asyncio.Lock` + PostgreSQL `pg_try_advisory_lock`.
   - Added `GET /metrics` (Prometheus exposition), `GET /v1/metrics` (JSON), and lightweight Governance Console SPA at `GET /ui`.
 - **Pluggable Domain Packs (`domain_packs.py`)**: Extracted fallback ontology rules into `DomainRulePack` with built-in `CLOUD_SRE_DOMAIN_PACK` and domain-neutral `GENERIC_DOMAIN_PACK` (`KG_FABRIC_DOMAIN_PACK=generic|cloud_sre`).
+- **Automated Ontology & KG Quality Scorecard (`quality_auditor.py`, `GET /v1/quality/report`, MCP `audit_kg_quality`) + Vector-vs-GraphRAG Eval Lift (`eval_harness.py`)**:
+  - Evaluates 4 quality dimensions (`0–100` grade): **Ontology/TBox** (W3C SHACL, schema utilization, near-duplicate classes, domain/range compliance), **Extraction Fidelity** (zero-extraction chunk rate, DLQ rate, edge provenance, deterministic or optional Gemini LLM-as-a-Judge triple faithfulness), **Entity Resolution** (suspected unmerged duplicates + over-merged alias/sibling conflicts), and **Graph Topology** (orphan entity rate, connected components, GCC ratio, cross-KB linkage coverage, hub skew, Newman-Girvan community modularity).
+  - Surfaces quality score in Prometheus (`kg_fabric_quality_score{tenant_id=...}`), Governance Console (`GET /ui`), and 14th MCP tool (`audit_kg_quality`).
+  - Enhanced `POST /v1/eval/run` (`EvalSuiteReport`) with automated `vector_only_baseline_recall` and `graphrag_recall_lift`.
 - **Live-Docker Adversarial & SOTA Verification (`examples/live_docker_v03_full_verification.py`)**: Verified live on Docker PostgreSQL 16 (`NOBYPASSRLS` `kg_app_user`) + Neo4j 5 + live Uvicorn HTTP server.
 
 ## [0.2.0] - 2026-11-23

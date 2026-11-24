@@ -405,7 +405,7 @@ async def main() -> None:
             r_prom = await client.get("/metrics", headers=pub_hdr)
             assert r_prom.status_code == 200 and "kg_fabric_queries_total" in r_prom.text
 
-            # 6h. Live MCP HTTP tools/list (13 tools) + ABAC-protected MCP call
+            # 6h. Live MCP HTTP tools/list (14 tools) + ABAC-protected MCP call + Quality Scorecard
             r_mcp_list = await client.post(
                 "/mcp",
                 json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
@@ -413,7 +413,21 @@ async def main() -> None:
             )
             assert r_mcp_list.status_code == 200
             mcp_tools = r_mcp_list.json()["result"]["tools"]
-            assert len(mcp_tools) == 13
+            assert len(mcp_tools) == 14
+
+            r_qual = await client.get(
+                "/v1/quality/report",
+                params={"tenant_id": "tenant_alpha"},
+                headers=pub_hdr,
+            )
+            assert r_qual.status_code == 200
+            qual_data = r_qual.json()
+            assert qual_data["overall_score"] >= 70.0
+            assert qual_data["tbox_metrics"]["shacl_conforms"] is True
+            assert qual_data["extraction_er_metrics"]["provenance_grounded_edge_rate"] == 1.0
+
+            r_prom_after = await client.get("/metrics", headers=pub_hdr)
+            assert r_prom_after.status_code == 200 and 'kg_fabric_quality_score{tenant_id="tenant_alpha"}' in r_prom_after.text
 
             r_mcp_call = await client.post(
                 "/mcp",
@@ -471,6 +485,10 @@ async def main() -> None:
             "live_leiden_global_sensemaking_communities": len(global_data["communities_matched"]),
             "live_answerability_check_verified": True,
             "live_mcp_tools_count": len(mcp_tools),
+            "live_quality_scorecard_overall": qual_data["overall_score"],
+            "live_quality_scorecard_grade": qual_data["grade"],
+            "live_quality_dimension_scores": qual_data["dimension_scores"],
+            "live_quality_findings_count": len(qual_data["findings"]),
             "live_cold_start_pod_hydration_tbox_jobs_dlq_acls": True,
         }
         print("=" * 94)

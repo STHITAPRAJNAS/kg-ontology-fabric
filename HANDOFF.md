@@ -1,14 +1,14 @@
 # Session Handoff — `enterprise-kg-ontology-fabric`
 
-1. **Last Updated**: 2026-11-23 16:17 EST (`Windows`)
+1. **Last Updated**: 2026-11-24 11:26 EST (`Windows`)
 2. **Current Goal & Status**:
-   - Completed full **`v0.3.0`** PyPI-ready + cloneable-service hardening with full security/durability parity ported from `adk-memory-platform` (`v0.2.2` + `Unreleased`), and **verified live on Docker PostgreSQL 16 (`NOBYPASSRLS` RLS role) + Neo4j 5 + live Uvicorn HTTP server** (no PyPI tag/push yet per user request).
-   - **`15 / 15` pytest tests pass** (`test_enterprise_kg_fabric_e2e.py`, `test_v02_enterprise_sota_capabilities.py`, `test_v03_pypi_and_security_hardening.py`).
+   - Completed full **`v0.3.0`** PyPI-ready + cloneable-service hardening with full security/durability parity ported from `adk-memory-platform`, **automated 4-dimension Ontology & KG Quality Scorecard (`KGQualityAuditor`)**, **Vector-vs-GraphRAG Lift in `EvalSuiteReport`**, and **live verification on Docker PostgreSQL 16 (`NOBYPASSRLS` RLS) + Neo4j 5 + live Uvicorn HTTP server** (no PyPI tag/push yet per user request).
+   - **`16 / 16` pytest tests pass** (`6.10s`).
    - **Live Docker Verification (`examples/live_docker_v03_full_verification.py`) — ALL PASSED**:
      - Fail-closed PostgreSQL 16 Kernel RLS under least-privilege `NOBYPASSRLS` role `kg_app_user` (`fail_closed=0 rows`, `beta_leak=0`)
      - Live PostgreSQL `pg_try_advisory_lock` multi-replica sync coordination
-     - Live Uvicorn HTTP server (`32+` byte JWT auth, `401`/`403` anti-smuggling, ABAC zero-leakage across live `pgvector`, live Neo4j 5, Path 4 OpenCypher & live `/mcp`, `13` MCP tools, `/metrics`, `/ui`)
-     - Live Neo4j 5 N-ary `qualifiers_json` + `acl_groups` persistence, composite indexes, batched `UNWIND`, HippoRAG PPR hub damping, Leiden global sensemaking (`3` communities), pre-flight `check-answerable`, and cold-start multi-pod disk hydration (`enterprise_tbox_registry`, `kg_sync_jobs`, `kg_dlq_chunks`).
+     - Live Uvicorn HTTP server (`32+` byte JWT auth, `401`/`403` anti-smuggling, ABAC zero-leakage across live `pgvector`, live Neo4j 5, Path 4 OpenCypher & live `/mcp`, `14` MCP tools, `/v1/quality/report`, `/metrics`, `/ui`)
+     - Live Quality Scorecard on real Postgres + Neo4j graph: **`96.18 / 100 (Grade A+)`** (`ontology_tbox=25.0`, `extraction_fidelity=24.69`, `entity_resolution=20.0`, `graph_topology=26.49`, accurately flagging the 1 simulated DLQ chunk).
 3. **Recent Changes**:
    - `enterprise-kg-ontology-fabric/src/enterprise_kg_fabric/auth.py`: Added 32-byte minimum JWT secret guard, `contextvars` (`get_current_principal`/`set_current_principal`/`reset_current_principal`), BYOA hooks (`custom_request_authenticator`/`custom_token_verifier`), and `BoundedApiRateLimiter` (`429`).
    - `enterprise-kg-ontology-fabric/src/enterprise_kg_fabric/adapters/pgvector_store.py`: Added fail-closed RLS `CREATE POLICY` rules across all 6 tables, `get_rls_app_role_ddl()`, `_scoped_conn(tenant_id)` (`SET LOCAL app.current_tenant_id`), `acl_groups` JSONB column + persistence/restoration/SQL filtering, `migrate_schema_and_rls()`, and `try_acquire_advisory_lock`/`release_advisory_lock`.

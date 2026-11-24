@@ -34,6 +34,7 @@ from .models import (
     GraphRAGQueryRequest,
     GraphRAGQueryResponse,
     KGGraphBuildReport,
+    KGQualityScorecardReport,
     OntologyInductionReport,
     PPRSearchRequest,
     PPRSearchResponse,
@@ -126,6 +127,7 @@ _GOVERNANCE_UI_HTML = """<!doctype html>
   </div>
   <div class="grid">
     <div class="card"><h3>Health &amp; Worker</h3><pre id="health">Loading...</pre></div>
+    <div class="card"><h3>KG &amp; Ontology Quality Scorecard</h3><pre id="quality">Click Refresh</pre></div>
     <div class="card"><h3>Tenant Telemetry</h3><pre id="telemetry">Click Refresh</pre></div>
     <div class="card"><h3>Compiled TBox Ontology</h3><pre id="tbox">Click Refresh</pre></div>
     <div class="card"><h3>Dead-Letter Queue (DLQ)</h3><pre id="dlq">Click Refresh</pre></div>
@@ -145,6 +147,7 @@ _GOVERNANCE_UI_HTML = """<!doctype html>
     function refreshAll() {
       const tid = encodeURIComponent(document.getElementById('tenant').value || 'enterprise_default');
       loadJson('/health', 'health');
+      loadJson('/v1/quality/report?tenant_id=' + tid, 'quality');
       loadJson('/v1/telemetry?tenant_id=' + tid, 'telemetry');
       loadJson('/v1/ontology/tbox?tenant_id=' + tid, 'tbox');
       loadJson('/v1/jobs/dlq?tenant_id=' + tid, 'dlq');
@@ -578,6 +581,21 @@ def create_kg_fabric_app(
         for case in req.cases:
             case.caller_acl_groups = enforcer.enforce_acl_groups(p, case.caller_acl_groups)
         return await svc.run_eval_suite(tenant_id=tenant, cases=req.cases)
+
+    @app.get("/v1/quality/report", response_model=KGQualityScorecardReport)
+    async def get_quality_report(
+        tenant_id: str = "enterprise_default",
+        sample_size: int = 25,
+        use_llm_judge: bool = False,
+        principal: AuthPrincipal | None = Depends(get_principal),
+    ) -> KGQualityScorecardReport:
+        p = _unwrap_principal(principal)
+        tenant = enforcer.enforce_tenant(p, tenant_id)
+        return await svc.audit_kg_quality(
+            tenant_id=tenant,
+            sample_size_faithfulness=sample_size,
+            use_llm_judge=use_llm_judge,
+        )
 
     @app.get("/v1/telemetry")
     async def get_telemetry(

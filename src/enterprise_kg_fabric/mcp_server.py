@@ -264,6 +264,24 @@ class KGFabricMcpServer:
                     "required": ["query"],
                 },
             },
+            {
+                "name": "audit_kg_quality",
+                "title": "Automated Ontology & Knowledge Graph Quality Scorecard",
+                "description": (
+                    "Audits the tenant's compiled TBox and Neo4j/Neptune ABox across SHACL conformance, "
+                    "schema utilization, domain/range compliance, extraction faithfulness, entity resolution "
+                    "duplicates/over-merges, orphan nodes, connected components, cross-KB linkage, and modularity."
+                ),
+                "annotations": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True},
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "tenant_id": {"type": "string", "default": "enterprise_default"},
+                        "sample_size_faithfulness": {"type": "integer", "default": 25},
+                        "use_llm_judge": {"type": "boolean", "default": False},
+                    },
+                },
+            },
         ]
 
     @staticmethod
@@ -371,6 +389,14 @@ class KGFabricMcpServer:
         if tool_name == "check_answerable":
             res = await self.service.check_answerable(AnswerabilityCheckRequest(**args))
             return res.model_dump()
+
+        if tool_name == "audit_kg_quality":
+            report = await self.service.audit_kg_quality(
+                tenant_id=args.get("tenant_id", "enterprise_default"),
+                sample_size_faithfulness=int(args.get("sample_size_faithfulness", 25)),
+                use_llm_judge=bool(args.get("use_llm_judge", False)),
+            )
+            return report.model_dump()
 
         if tool_name == "search_vector_chunks":
             chunks = await self.service.search_vector_chunks(ChunkSearchRequest(**args))

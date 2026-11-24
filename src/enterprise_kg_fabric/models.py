@@ -536,10 +536,80 @@ class EvalSuiteReport(BaseModel):
     tenant_id: str
     cases_evaluated: int
     mean_multihop_recall: float
+    vector_only_baseline_recall: float = 0.0
+    graphrag_recall_lift: float = 0.0
     abac_zero_leakage_rate: float
     citation_groundedness_rate: float
     ragas_available: bool = False
     case_details: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class QualityIssueFinding(BaseModel):
+    severity: str  # "HIGH" | "MEDIUM" | "LOW" | "INFO"
+    category: str  # "TBOX" | "EXTRACTION" | "ENTITY_RESOLUTION" | "TOPOLOGY" | "GOVERNANCE"
+    message: str
+    affected_ids: list[str] = Field(default_factory=list)
+    remediation: str = ""
+
+
+class OntologyTBoxQualityMetrics(BaseModel):
+    tbox_version: str
+    approved_classes: int = 0
+    quarantined_classes: int = 0
+    approved_relations: int = 0
+    quarantined_relations: int = 0
+    shacl_conforms: bool = True
+    shacl_violation_count: int = 0
+    schema_utilization_rate: float = 1.0
+    unused_classes: list[str] = Field(default_factory=list)
+    unused_relations: list[str] = Field(default_factory=list)
+    near_duplicate_class_pairs: list[dict[str, Any]] = Field(default_factory=list)
+    domain_range_compliance_rate: float = 1.0
+    domain_range_violations_count: int = 0
+
+
+class ExtractionAndERQualityMetrics(BaseModel):
+    total_chunks_evaluated: int = 0
+    zero_extraction_chunk_count: int = 0
+    zero_extraction_chunk_rate: float = 0.0
+    dlq_failed_chunks_count: int = 0
+    provenance_grounded_edge_rate: float = 1.0
+    sampled_edges_checked: int = 0
+    sampled_triple_faithfulness_score: float = 1.0
+    faithfulness_judge_mode: str = "deterministic_evidence_entailment"
+    suspected_unmerged_duplicate_pairs: list[dict[str, Any]] = Field(default_factory=list)
+    over_merged_suspects: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class GraphTopologyQualityMetrics(BaseModel):
+    canonical_entities_count: int = 0
+    active_edges_count: int = 0
+    superseded_edges_count: int = 0
+    orphan_entity_count: int = 0
+    orphan_entity_rate: float = 0.0
+    connected_components_count: int = 0
+    giant_component_ratio: float = 0.0
+    registered_kbs_count: int = 0
+    connected_kbs_count: int = 0
+    cross_kb_linkage_coverage: float = 0.0
+    cross_kb_bridge_entity_count: int = 0
+    average_degree: float = 0.0
+    top_hub_degree_share: float = 0.0
+    top_hubs: list[dict[str, Any]] = Field(default_factory=list)
+    community_count: int = 0
+    community_modularity: float = 0.0
+
+
+class KGQualityScorecardReport(BaseModel):
+    tenant_id: str
+    generated_at: str = Field(default_factory=utc_now_iso)
+    overall_score: float  # 0.0 - 100.0
+    grade: str  # "A+" | "A" | "A-" | "B+" | "B" | "C" | "D" | "F"
+    dimension_scores: dict[str, float] = Field(default_factory=dict)
+    tbox_metrics: OntologyTBoxQualityMetrics
+    extraction_er_metrics: ExtractionAndERQualityMetrics
+    topology_metrics: GraphTopologyQualityMetrics
+    findings: list[QualityIssueFinding] = Field(default_factory=list)
 
 
 class AnswerabilityCheckRequest(BaseModel):

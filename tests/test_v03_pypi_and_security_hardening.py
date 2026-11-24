@@ -645,3 +645,145 @@ def test_adk_ported_hardenings_32b_jwt_byoa_rate_limit_smuggling_contextvars_ans
         assert "kg_fabric_answerability_checks_total" in prom_text
 
     run_coroutine_sync(_run())
+
+
+def test_kg_quality_auditor_scorecard_defect_detection_and_eval_lift() -> None:
+    """
+    Verifies the 4-dimension `KGQualityAuditor` (`GET /v1/quality/report` + MCP `audit_kg_quality`)
+    and `EvalSuiteReport` Vector-vs-GraphRAG lift calculation:
+      1. Clean connected cross-KB graph achieves high score (grade A/A-/B+) with 100% provenance.
+      2. Intentionally injected defects (unused TBox class, orphan entity, unmerged duplicate pair,
+         ungrounded edge without evidence, and domain/range violation) are ALL detected with
+         actionable findings and measurably lower the scorecard.
+      3. `run_eval_suite` reports `vector_only_baseline_recall` and `graphrag_recall_lift`.
+    """
+    from enterprise_kg_fabric import (
+        EvalTestCase,
+        KGEntityNode,
+        KGFabricMcpServer,
+        KGRelationEdge,
+        OntologyClassDef,
+        OntologyStatus,
+    )
+
+    async def _run() -> None:
+        svc = EnterpriseKGOntologyService(
+            min_kb_support_for_approval=1,
+            min_chunk_support_for_approval=1,
+        )
+        await svc.ingest_raw_documents(
+            [
+                RawDocumentInput(
+                    doc_id="q_doc_1",
+                    kb_id="kb_q_sre",
+                    tenant_id="t_qual",
+                    domain_tag="sre",
+                    title="SRE",
+                    content="Microservice billing-api-01 depends on aurora-billing-01.",
+                ),
+                RawDocumentInput(
+                    doc_id="q_doc_2",
+                    kb_id="kb_q_comp",
+                    tenant_id="t_qual",
+                    domain_tag="compliance",
+                    title="Compliance",
+                    content="Database cluster aurora-billing-01 is governed by PCI-DSS-4.0.",
+                ),
+            ]
+        )
+        await svc.induce_and_align_ontology(tenant_id="t_qual")
+        await svc.build_or_update_knowledge_graph(tenant_id="t_qual", incremental=False)
+
+        # 1. Clean graph audit via REST, MCP, and Prometheus
+        app = create_kg_fabric_app(service=svc)
+        code, clean_report = await _asgi_request(
+            app, "GET", "/v1/quality/report", params={"tenant_id": "t_qual"}
+        )
+        assert code == 200
+        assert clean_report["overall_score"] >= 85.0
+        assert clean_report["grade"] in {"A+", "A", "A-"}
+        assert clean_report["tbox_metrics"]["shacl_conforms"] is True
+        assert clean_report["extraction_er_metrics"]["provenance_grounded_edge_rate"] == 1.0
+        assert clean_report["topology_metrics"]["orphan_entity_count"] == 0
+        assert clean_report["topology_metrics"]["cross_kb_linkage_coverage"] == 1.0
+
+        mcp = KGFabricMcpServer(svc)
+        mcp_qual = await mcp.call_tool("audit_kg_quality", {"tenant_id": "t_qual"})
+        assert mcp_qual["overall_score"] == clean_report["overall_score"]
+        assert 'kg_fabric_quality_score{tenant_id="t_qual"}' in svc.get_prometheus_metrics_text()
+
+        # 2. Eval suite reports vector_only_baseline_recall & graphrag_recall_lift
+        eval_res = await svc.run_eval_suite(
+            tenant_id="t_qual",
+            cases=[
+                EvalTestCase(
+                    query="What compliance standard governs the database used by billing-api-01?",
+                    expected_facts=["aurora-billing-01", "PCI-DSS-4.0"],
+                )
+            ],
+        )
+        assert eval_res.mean_multihop_recall == 1.0
+        assert eval_res.graphrag_recall_lift >= 0.0
+
+        # 3. Inject 5 distinct ontology & KG defects and verify the auditor catches EVERY ONE
+        tbox = await svc.load_or_get_tbox("t_qual")
+        tbox.classes["DeadUnusedSchemaClass"] = OntologyClassDef(
+            class_name="DeadUnusedSchemaClass",
+            upper_category=UpperOntologyCategory.SYSTEM_OR_ASSET,
+            description="Never instantiated class",
+            status=OntologyStatus.APPROVED,
+        )
+        await svc.vector_store.save_tbox(tbox)
+
+        orphan_ent = KGEntityNode(
+            entity_id="ent_orphan_1",
+            tenant_id="t_qual",
+            canonical_name="lone-island-node",
+            ontology_class="CloudService",
+            upper_category=UpperOntologyCategory.SYSTEM_OR_ASSET,
+            source_kb_ids=["kb_q_sre"],
+        )
+        dup_a = KGEntityNode(
+            entity_id="ent_dup_a",
+            tenant_id="t_qual",
+            canonical_name="Acme Bank",
+            ontology_class="EnterpriseCustomer",
+            upper_category=UpperOntologyCategory.ACTOR_OR_ORG,
+            source_kb_ids=["kb_q_sre"],
+        )
+        dup_b = KGEntityNode(
+            entity_id="ent_dup_b",
+            tenant_id="t_qual",
+            canonical_name="Acme Global Bank",
+            ontology_class="EnterpriseCustomer",
+            upper_category=UpperOntologyCategory.ACTOR_OR_ORG,
+            source_kb_ids=["kb_q_comp"],
+        )
+        # Ungrounded edge with NO provenance AND domain/range violation (EnterpriseCustomer -> EnterpriseCustomer via GOVERNED_BY)
+        bad_edge = KGRelationEdge(
+            edge_id="edge_ungrounded_bad",
+            tenant_id="t_qual",
+            source_entity_id="ent_dup_a",
+            target_entity_id="ent_dup_b",
+            predicate="GOVERNED_BY",
+            source_kb_ids=[],
+            source_chunk_ids=[],
+            evidence_snippets=[],
+        )
+        await svc.graph_store.upsert_entities_and_bitemporal_edges(
+            tenant_id="t_qual",
+            entities=[orphan_ent, dup_a, dup_b],
+            edges=[bad_edge],
+        )
+
+        degraded = await svc.audit_kg_quality(tenant_id="t_qual")
+        assert degraded.overall_score < clean_report["overall_score"]
+        assert "DeadUnusedSchemaClass" in degraded.tbox_metrics.unused_classes
+        assert degraded.tbox_metrics.domain_range_violations_count >= 1
+        assert degraded.extraction_er_metrics.provenance_grounded_edge_rate < 1.0
+        assert len(degraded.extraction_er_metrics.suspected_unmerged_duplicate_pairs) >= 1
+        assert degraded.topology_metrics.orphan_entity_count >= 1
+        assert any(f.category == "ENTITY_RESOLUTION" for f in degraded.findings)
+        assert any(f.category == "EXTRACTION" for f in degraded.findings)
+
+    run_coroutine_sync(_run())

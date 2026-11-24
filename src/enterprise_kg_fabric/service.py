@@ -46,6 +46,7 @@ from .models import (
     KBSourceType,
     KBWatermarkState,
     KGGraphBuildReport,
+    KGQualityScorecardReport,
     OntologyInductionReport,
     OntologyStatus,
     PPRSearchRequest,
@@ -65,6 +66,7 @@ from .models import (
 from .multimodal_ingestor import MultimodalDocumentIngestor
 from .ontology_inducer import AutomatedOntologyInducer, OWLSHACLCompiler
 from .pii_redaction import PIIRedactionMode, PresidioPIIRedactor
+from .quality_auditor import KGQualityAuditor
 from .rag_engine import EnterpriseHybridGraphRAGEngine
 from .vector_clustering import (
     EmbeddingProvider,
@@ -180,7 +182,9 @@ class EnterpriseKGOntologyService:
             "ppr_searches_total": 0,
             "global_searches_total": 0,
             "answerability_checks_total": 0,
+            "quality_audits_total": 0,
         }
+        self._last_quality_scores: dict[str, float] = {}
         self._principal_enforcer = AuthEnforcer()
 
     def _enforce_service_principal(
@@ -1067,9 +1071,32 @@ class EnterpriseKGOntologyService:
     async def run_eval_suite(
         self, tenant_id: str, cases: Sequence[EvalTestCase]
     ) -> EvalSuiteReport:
+        safe_tenant, _ = self._enforce_service_principal(tenant_id)
         return await GraphRAGEvaluationHarness.evaluate_suite(
-            service=self, tenant_id=tenant_id, cases=cases
+            service=self, tenant_id=safe_tenant, cases=cases
         )
+
+    async def audit_kg_quality(
+        self,
+        tenant_id: str = "enterprise_default",
+        sample_size_faithfulness: int = 25,
+        use_llm_judge: bool = False,
+    ) -> KGQualityScorecardReport:
+        """
+        Runs the automated 4-dimension Ontology (TBox) & Knowledge Graph (ABox) Quality Scorecard
+        (`0-100` grade + actionable findings across SHACL, utilization, extraction faithfulness,
+        entity resolution duplicates/over-merges, orphan nodes, GCC, cross-KB linkage, modularity).
+        """
+        safe_tenant, _ = self._enforce_service_principal(tenant_id)
+        self._metrics["quality_audits_total"] += 1
+        report = await KGQualityAuditor.audit_tenant(
+            service=self,
+            tenant_id=safe_tenant,
+            sample_size_faithfulness=sample_size_faithfulness,
+            use_llm_judge=use_llm_judge,
+        )
+        self._last_quality_scores[safe_tenant] = report.overall_score
+        return report
 
     @staticmethod
     def _resolve_seed_names_to_ids(
@@ -1110,6 +1137,7 @@ class EnterpriseKGOntologyService:
             "sync_jobs_cached": len(self._sync_jobs),
             "dlq_records_cached": len(self._dlq_records),
             "sync_worker": self.sync_worker_status(),
+            "last_quality_scores": dict(self._last_quality_scores),
             "pii_redaction_audit_counts": dict(self._pii_redaction_audit_counts),
         }
 
@@ -1128,6 +1156,9 @@ class EnterpriseKGOntologyService:
             "# HELP kg_fabric_answerability_checks_total Total pre-flight answerability checks",
             "# TYPE kg_fabric_answerability_checks_total counter",
             f"kg_fabric_answerability_checks_total {snap['answerability_checks_total']}",
+            "# HELP kg_fabric_quality_audits_total Total KG quality scorecard audits run",
+            "# TYPE kg_fabric_quality_audits_total counter",
+            f"kg_fabric_quality_audits_total {snap['quality_audits_total']}",
             "# HELP kg_fabric_dlq_records_cached Current DLQ failed chunk count",
             "# TYPE kg_fabric_dlq_records_cached gauge",
             f"kg_fabric_dlq_records_cached {snap['dlq_records_cached']}",
@@ -1135,6 +1166,12 @@ class EnterpriseKGOntologyService:
             "# TYPE kg_fabric_sync_worker_running gauge",
             f"kg_fabric_sync_worker_running {1 if snap['sync_worker']['running'] else 0}",
         ]
+        if snap["last_quality_scores"]:
+            lines.append("# HELP kg_fabric_quality_score Latest 0-100 KG & Ontology quality scorecard by tenant")
+            lines.append("# TYPE kg_fabric_quality_score gauge")
+            for tid, score in sorted(snap["last_quality_scores"].items()):
+                safe_tid = tid.replace('"', '\\"')
+                lines.append(f'kg_fabric_quality_score{{tenant_id="{safe_tid}"}} {score}')
         return "\n".join(lines) + "\n"
 
     async def execute_readonly_opencypher(
