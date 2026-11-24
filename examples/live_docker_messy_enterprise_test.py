@@ -466,7 +466,10 @@ async def run_live_docker_messy_benchmark() -> dict:
 
     # 2. Wire LIVE PostgresPgVectorStoreAdapter + LIVE Neo4jOpenCypherGraphAdapter + Presidio PII Redactor
     pg_adapter = PostgresPgVectorStoreAdapter(
-        dsn=PG_DSN, embedding_provider=embedder, canonical_dim=256
+        dsn=PG_DSN,
+        embedding_provider=embedder,
+        canonical_dim=256,
+        allowed_legacy_tables=["public.legacy_*"],
     )
     neo4j_adapter = Neo4jOpenCypherGraphAdapter(
         uri=NEO4J_URI, username=NEO4J_USER, password=NEO4J_PASS

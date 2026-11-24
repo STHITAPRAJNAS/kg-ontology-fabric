@@ -10,6 +10,7 @@ from .pgvector_store import (
     PostgresPgVectorStoreAdapter,
     get_production_pgvector_ddl,
     get_rls_app_role_ddl,
+    validate_legacy_table_access,
 )
 
 __all__ = [
@@ -18,6 +19,7 @@ __all__ = [
     "PostgresPgVectorStoreAdapter",
     "get_production_pgvector_ddl",
     "get_rls_app_role_ddl",
+    "validate_legacy_table_access",
     "PropertyGraphStorePort",
     "InMemoryOpenCypherGraphEmulator",
     "Neo4jOpenCypherGraphAdapter",

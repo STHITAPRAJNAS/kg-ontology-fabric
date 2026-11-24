@@ -19,6 +19,7 @@ from .adapters.pgvector_store import (
     InMemoryPgVectorStoreEmulator,
     PgVectorStorePort,
     PostgresPgVectorStoreAdapter,
+    validate_legacy_table_access,
 )
 from .adaptive_router import PluggableCrossEncoderReranker
 from .auth import AuthEnforcer, get_current_principal
@@ -413,6 +414,29 @@ class EnterpriseKGOntologyService:
             registration.tenant_id, required_role="writer"
         )
         registration.tenant_id = safe_tenant
+
+        # Critical #1: Block PostgreSQL system catalogs, internal KG Fabric tables, and unallowlisted
+        # legacy tables at registration time. Physical legacy table registration requires platform_admin
+        # when authenticated against PostgreSQL.
+        if registration.source_type == KBSourceType.EXISTING_PGVECTOR_KB:
+            cm = registration.column_mapping
+            is_pg = isinstance(self.vector_store, PostgresPgVectorStoreAdapter)
+            if is_pg and get_current_principal() is not None:
+                self._principal_enforcer.require_platform_admin(get_current_principal())
+            validate_legacy_table_access(
+                schema_name=registration.schema_name,
+                table_name=registration.table_name,
+                column_names=[
+                    cm.id_column,
+                    cm.doc_id_column,
+                    cm.text_column,
+                    cm.embedding_column,
+                    cm.metadata_column,
+                ],
+                allowed_patterns=getattr(self.vector_store, "allowed_legacy_tables", None),
+                enforce_allowlist=bool(is_pg and get_current_principal() is not None),
+            )
+
         await self.vector_store.register_kb(registration)
         return registration
 
@@ -425,17 +449,35 @@ class EnterpriseKGOntologyService:
 
     async def unregister_kb(self, tenant_id: str, kb_id: str) -> dict[str, Any]:
         safe_tenant, _ = self._enforce_service_principal(tenant_id, required_role="admin")
-        removed_chunks = await self.vector_store.unregister_kb(safe_tenant, kb_id)
-        return {"tenant_id": safe_tenant, "kb_id": kb_id, "chunks_removed": removed_chunks}
+        deleted_chunk_ids = await self.vector_store.unregister_kb_chunks(safe_tenant, kb_id)
+        deleted_ent_ids, deleted_edges = await self.graph_store.delete_chunks_provenance(
+            tenant_id=safe_tenant, chunk_ids=deleted_chunk_ids, kb_id=kb_id
+        )
+        await self.vector_store.delete_canonical_entity_embeddings(safe_tenant, deleted_ent_ids)
+        return {
+            "tenant_id": safe_tenant,
+            "kb_id": kb_id,
+            "chunks_removed": len(deleted_chunk_ids),
+            "graph_entities_removed": len(deleted_ent_ids),
+            "graph_edges_removed": deleted_edges,
+        }
 
     async def delete_document(self, tenant_id: str, kb_id: str, doc_id: str) -> dict[str, Any]:
         safe_tenant, _ = self._enforce_service_principal(tenant_id, required_role="writer")
-        removed_chunks = await self.vector_store.delete_document(safe_tenant, kb_id, doc_id)
+        deleted_chunk_ids = await self.vector_store.delete_document_chunks(
+            safe_tenant, kb_id, doc_id
+        )
+        deleted_ent_ids, deleted_edges = await self.graph_store.delete_chunks_provenance(
+            tenant_id=safe_tenant, chunk_ids=deleted_chunk_ids
+        )
+        await self.vector_store.delete_canonical_entity_embeddings(safe_tenant, deleted_ent_ids)
         return {
             "tenant_id": safe_tenant,
             "kb_id": kb_id,
             "doc_id": doc_id,
-            "chunks_removed": removed_chunks,
+            "chunks_removed": len(deleted_chunk_ids),
+            "graph_entities_removed": len(deleted_ent_ids),
+            "graph_edges_removed": deleted_edges,
         }
 
     async def purge_tenant(self, tenant_id: str) -> dict[str, Any]:
@@ -481,11 +523,14 @@ class EnterpriseKGOntologyService:
         kb_ids: list[str] | None = None,
     ) -> int:
         """
-        Reads real legacy PostgreSQL `pgvector` tables registered as `EXISTING_PGVECTOR_KB`
-        via `PostgresPgVectorStoreAdapter.reverse_hydrate_from_legacy_pgvector_table`,
-        scrubs PII via Microsoft Presidio, and hydrates into `unified_rag_chunks`.
+        Incrementally reads explicitly allowlisted legacy PostgreSQL `pgvector` tables
+        registered as `EXISTING_PGVECTOR_KB` via `reverse_hydrate_from_legacy_pgvector_table`,
+        skipping rows whose `content_sha256` already matches `unified_rag_chunks`, scrubs PII,
+        and upserts only genuinely new/changed delta rows.
         """
         if not isinstance(self.vector_store, PostgresPgVectorStoreAdapter):
+            return 0
+        if not self.vector_store.allowed_legacy_tables:
             return 0
         registered_kbs = await self.vector_store.list_registered_kbs(tenant_id=tenant_id)
         target_ids = set(kb_ids) if kb_ids else None
@@ -496,12 +541,22 @@ class EnterpriseKGOntologyService:
             if target_ids is not None and kb.kb_id not in target_ids:
                 continue
             try:
-                legacy_chunks = await self.vector_store.reverse_hydrate_from_legacy_pgvector_table(kb)
-            except Exception:
-                # Table may be a virtual/pre-hydrated KB without a local physical legacy table
+                legacy_chunks = await self.vector_store.reverse_hydrate_from_legacy_pgvector_table(
+                    kb, enforce_allowlist=True
+                )
+            except (PermissionError, Exception):
                 continue
-            if legacy_chunks:
-                hydrated_total += await self.hydrate_existing_kb_chunks(kb.kb_id, legacy_chunks)
+            if not legacy_chunks:
+                continue
+            existing = await self.vector_store.fetch_kb_chunks(kb.kb_id, tenant_id=tenant_id)
+            existing_hashes = {c.chunk_id: c.content_sha256 for c in existing}
+            delta_legacy = [
+                chk
+                for chk in legacy_chunks
+                if existing_hashes.get(chk.chunk_id) != chk.content_sha256
+            ]
+            if delta_legacy:
+                hydrated_total += await self.hydrate_existing_kb_chunks(kb.kb_id, delta_legacy)
         return hydrated_total
 
     async def ingest_raw_documents(
@@ -1221,18 +1276,26 @@ class EnterpriseKGOntologyService:
                 f"Mutating OpenCypher keyword '{m.group(1)}' is forbidden on read-only search endpoint."
             )
 
-    def get_metrics_snapshot(self) -> dict[str, Any]:
+    def get_metrics_snapshot(self, tenant_id: str | None = None) -> dict[str, Any]:
+        if tenant_id is not None:
+            scores = (
+                {tenant_id: self._last_quality_scores[tenant_id]}
+                if tenant_id in self._last_quality_scores
+                else {}
+            )
+        else:
+            scores = dict(self._last_quality_scores)
         return {
             **self._metrics,
             "sync_jobs_cached": len(self._sync_jobs),
             "dlq_records_cached": len(self._dlq_records),
             "sync_worker": self.sync_worker_status(),
-            "last_quality_scores": dict(self._last_quality_scores),
+            "last_quality_scores": scores,
             "pii_redaction_audit_counts": dict(self._pii_redaction_audit_counts),
         }
 
-    def get_prometheus_metrics_text(self) -> str:
-        snap = self.get_metrics_snapshot()
+    def get_prometheus_metrics_text(self, tenant_id: str | None = None) -> str:
+        snap = self.get_metrics_snapshot(tenant_id=tenant_id)
         lines = [
             "# HELP kg_fabric_queries_total Total GraphRAG queries processed",
             "# TYPE kg_fabric_queries_total counter",
@@ -1267,9 +1330,10 @@ class EnterpriseKGOntologyService:
     async def execute_readonly_opencypher(
         self, request: ReadOnlyCypherSearchRequest
     ) -> ReadOnlyCypherSearchResponse:
-        # Critical #1: Arbitrary raw Cypher over a shared multi-tenant graph DB can omit
-        # `$tenant_id` or read restricted ACL fields. Require `admin` role when authenticated,
-        # reject literal tenant_id overrides, and execute inside Neo4j READ_ACCESS sessions.
+        # High #2: Raw Cypher over a shared graph DB can omit `$tenant_id` or read other tenants'
+        # nodes. Require global `platform_admin` when authenticated (blocks tenant-bound admins too!),
+        # reject literal tenant_id overrides, and run inside Neo4j READ_ACCESS sessions.
+        self._principal_enforcer.require_platform_admin(get_current_principal())
         safe_tenant, _ = self._enforce_service_principal(
             request.tenant_id, required_role="admin"
         )

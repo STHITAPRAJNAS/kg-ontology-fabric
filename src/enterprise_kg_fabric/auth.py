@@ -32,6 +32,11 @@ class AuthPrincipal:
     roles: set[str] = field(default_factory=lambda: {"reader"})
     is_admin: bool = False
 
+    @property
+    def is_platform_admin(self) -> bool:
+        """True ONLY for global platform admins (admin role NOT bound to a single tenant)."""
+        return self.is_admin and (not self.tenant_id or self.tenant_id == "*")
+
     def has_role(self, role: str) -> bool:
         return self.is_admin or role in self.roles
 
@@ -413,4 +418,14 @@ class AuthEnforcer:
             raise HTTPException(
                 status_code=403,
                 detail=f"Insufficient permissions: role '{role}' required",
+            )
+
+    def require_platform_admin(self, principal: AuthPrincipal | None) -> None:
+        """Requires global platform admin (admin with unbound/wildcard tenant_id), blocking tenant-bound admins."""
+        if principal is None:
+            return
+        if not principal.is_platform_admin:
+            raise HTTPException(
+                status_code=403,
+                detail="Platform admin privileges (cross-tenant admin) are required for this operation.",
             )

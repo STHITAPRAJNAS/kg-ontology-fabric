@@ -105,7 +105,13 @@ async def main() -> None:
     print(f"[1] Migrated Postgres 16 schema + RLS policies + provisioned NOBYPASSRLS role '{APP_ROLE}'")
 
     # 2. Connect runtime service strictly as NON-SUPERUSER `kg_app_user` + live Neo4j 5
-    pg_store = PostgresPgVectorStoreAdapter(dsn=app_dsn, embedding_provider=emb, canonical_dim=256)
+    #    Explicitly allowlist ONLY `public.legacy_finops_vectors` for legacy table hydration (fail-closed default!)
+    pg_store = PostgresPgVectorStoreAdapter(
+        dsn=app_dsn,
+        embedding_provider=emb,
+        canonical_dim=256,
+        allowed_legacy_tables=["public.legacy_finops_vectors"],
+    )
     neo_store = Neo4jOpenCypherGraphAdapter(uri=NEO4J_URI, username=NEO4J_USER, password=NEO4J_PASS)
     svc = EnterpriseKGOntologyService(
         vector_store=pg_store,
@@ -188,7 +194,10 @@ async def main() -> None:
             tenant_id="tenant_beta",
             domain_tag="sre",
             title="Tenant Beta Private System",
-            content="Microservice beta-secret-api depends on aurora-beta-vault.",
+            content=(
+                "Microservice beta-secret-api depends on aurora-beta-vault. "
+                "Microservice payment-router-01 depends on aurora-beta-vault."
+            ),
             acl_groups=["public"],
         )
     ]
@@ -321,9 +330,38 @@ async def main() -> None:
         assert legacy_build.delta_chunks_extracted >= 1, (
             f"Expected registered legacy pgvector table to auto-hydrate on build, got {legacy_build}"
         )
+        # Second incremental build MUST skip unchanged legacy rows (no self-copy or re-upsert)
+        legacy_build_2 = await svc.build_or_update_knowledge_graph(tenant_id="tenant_alpha", incremental=True)
+        assert legacy_build_2.delta_chunks_extracted == 0, (
+            f"Expected incremental legacy hydration to skip unchanged rows, got {legacy_build_2}"
+        )
+
+        # 4e. Second-Review Finding #3: Same-named entity (`payment-router-01`) across tenant_alpha & tenant_beta
+        #     MUST coexist in `canonical_entity_embeddings` without overwriting each other!
+        su_conn_check = await asyncpg.connect(admin_dsn)
+        try:
+            alpha_pr_rows = await su_conn_check.fetch(
+                "SELECT tenant_id, entity_id, source_kb_ids FROM canonical_entity_embeddings "
+                "WHERE tenant_id = 'tenant_alpha' AND canonical_name = 'payment-router-01'"
+            )
+            beta_pr_rows = await su_conn_check.fetch(
+                "SELECT tenant_id, entity_id, source_kb_ids FROM canonical_entity_embeddings "
+                "WHERE tenant_id = 'tenant_beta' AND canonical_name = 'payment-router-01'"
+            )
+            assert len(alpha_pr_rows) == 1 and len(beta_pr_rows) == 1, (
+                f"Expected isolated same-name entities across tenants, got alpha={alpha_pr_rows}, beta={beta_pr_rows}"
+            )
+            assert alpha_pr_rows[0]["entity_id"] != beta_pr_rows[0]["entity_id"]
+            assert "kb_beta_core" not in str(alpha_pr_rows[0]["source_kb_ids"])
+            assert "kb_alpha_sre" not in str(beta_pr_rows[0]["source_kb_ids"])
+        finally:
+            await su_conn_check.close()
     finally:
         await su_store.close()
-    print(f"[3] Verified PostgreSQL 16 Kernel RLS (`NOBYPASSRLS`) + Superuser Overwrite Guard + Auto Legacy Table Hydration")
+    print(
+        "[3] Verified PostgreSQL 16 Kernel RLS (`NOBYPASSRLS`) + Superuser Overwrite Guard "
+        "+ Incremental Allowlisted Legacy Hydration + Cross-Tenant Entity Embedding Isolation"
+    )
 
     # 5. Live PostgreSQL `pg_try_advisory_lock` Multi-Replica Sync Worker Proof
     lock_key = svc._sync_lock_key("tenant_alpha")
@@ -344,7 +382,7 @@ async def main() -> None:
     auth_cfg = AuthConfig(
         mode=AuthMode.JWT,
         jwt_secret=jwt_secret,
-        api_rate_limit_rpm=50,
+        api_rate_limit_rpm=120,
     )
     app = create_kg_fabric_app(service=svc, auth_config=auth_cfg)
 
@@ -385,8 +423,23 @@ async def main() -> None:
                 {"sub": "general_counsel", "tenant_id": "tenant_alpha", "acl_groups": ["public", "legal_confidential"], "roles": ["reader"], "exp": int(time.time()) + 3600},
                 jwt_secret,
             )
+            writer_beta_jwt = create_hs256_jwt(
+                {"sub": "beta_writer", "tenant_id": "tenant_beta", "acl_groups": ["public"], "roles": ["reader", "writer"], "exp": int(time.time()) + 3600},
+                jwt_secret,
+            )
+            tenant_admin_alpha_jwt = create_hs256_jwt(
+                {"sub": "alpha_admin", "tenant_id": "tenant_alpha", "acl_groups": ["public"], "roles": ["admin"], "exp": int(time.time()) + 3600},
+                jwt_secret,
+            )
+            platform_admin_jwt = create_hs256_jwt(
+                {"sub": "platform_root", "tenant_id": "*", "acl_groups": ["public"], "roles": ["admin"], "exp": int(time.time()) + 3600},
+                jwt_secret,
+            )
             pub_hdr = {"Authorization": f"Bearer {pub_jwt}"}
             conf_hdr = {"Authorization": f"Bearer {conf_jwt}"}
+            wb_hdr = {"Authorization": f"Bearer {writer_beta_jwt}"}
+            tadm_hdr = {"Authorization": f"Bearer {tenant_admin_alpha_jwt}"}
+            padm_hdr = {"Authorization": f"Bearer {platform_admin_jwt}"}
 
             # 6c. Cross-tenant smuggling, query-vs-body smuggling, reader write block, raw Cypher block,
             #     MCP plural write block, cross-tenant KB/chunk overwrite block, MCP cross-tenant resource -> 403
@@ -426,6 +479,64 @@ async def main() -> None:
                 headers=pub_hdr,
             )
             assert r_mcp_res.status_code == 403 or "error" in r_mcp_res.json()
+
+            # 6c-2. Second-Review Findings #1, #2, #5:
+            #   - Critical #1: Tenant B writer blocked from registering `public.unified_rag_chunks` or `pg_catalog.pg_roles`
+            for bad_schema, bad_table in (
+                ("public", "unified_rag_chunks"),
+                ("pg_catalog", "pg_roles"),
+                ("public", "legacy_finops_vectors"),  # Even allowlisted table requires platform_admin!
+            ):
+                r_exfil = await client.post(
+                    "/v1/kbs/register",
+                    json={
+                        "kb_id": f"kb_exfil_{bad_table}",
+                        "tenant_id": "tenant_beta",
+                        "domain_tag": "evil",
+                        "source_type": KBSourceType.EXISTING_PGVECTOR_KB.value,
+                        "schema_name": bad_schema,
+                        "table_name": bad_table,
+                    },
+                    headers=wb_hdr,
+                )
+                assert r_exfil.status_code == 403, f"Expected 403 for {bad_schema}.{bad_table}, got {r_exfil.status_code}"
+
+            #   - High #2: Tenant-bound admin blocked from raw Cypher on REST & MCP!
+            r_tadm_cypher = await client.post(
+                "/v1/search/cypher",
+                json={"tenant_id": "tenant_alpha", "cypher_query": "MATCH (n) RETURN n.canonical_name"},
+                headers=tadm_hdr,
+            )
+            assert r_tadm_cypher.status_code == 403, f"Tenant-bound admin Cypher NOT blocked: {r_tadm_cypher.status_code}"
+            r_tadm_mcp_cypher = await client.post(
+                "/mcp",
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 99,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "execute_readonly_opencypher",
+                        "arguments": {"tenant_id": "tenant_alpha", "cypher_query": "MATCH (n) RETURN n.canonical_name"},
+                    },
+                },
+                headers=tadm_hdr,
+            )
+            assert r_tadm_mcp_cypher.status_code == 403 or "error" in r_tadm_mcp_cypher.json()
+
+            #   - Global platform admin (`tenant_id="*"`, `roles=["admin"]`) IS permitted parameterized Cypher,
+            #     and still gets 400 on hardcoded literal tenant_id override
+            r_padm_cypher_bad = await client.post(
+                "/v1/search/cypher",
+                json={"tenant_id": "tenant_alpha", "cypher_query": "MATCH (n {tenant_id: 'tenant_beta'}) RETURN n"},
+                headers=padm_hdr,
+            )
+            assert r_padm_cypher_bad.status_code == 400
+
+            #   - Medium #5: Tenant-bound admin blocked from listing another tenant's DLQ
+            r_tadm_dlq_cross = await client.get(
+                "/v1/jobs/dlq", params={"tenant_id": "tenant_beta"}, headers=tadm_hdr
+            )
+            assert r_tadm_dlq_cross.status_code == 403, f"Tenant-bound admin cross-tenant DLQ NOT blocked: {r_tadm_dlq_cross.status_code}"
 
             # 6d. Live ABAC Zero-Leakage over LIVE Postgres + LIVE Neo4j + Path 4 OpenCypher + LIVE /mcp!
             r_pub_rag = await client.post(
@@ -533,6 +644,47 @@ async def main() -> None:
             r_prom_after = await client.get("/metrics", headers=pub_hdr)
             assert r_prom_after.status_code == 200 and 'kg_fabric_quality_score{tenant_id="tenant_alpha"}' in r_prom_after.text
 
+            # Second-Review Finding #6: Audit tenant_beta, then verify tenant_alpha's `/v1/metrics` & `/metrics`
+            # do NOT leak `tenant_beta` tenant IDs or quality scores!
+            r_qual_beta = await client.get(
+                "/v1/quality/report",
+                params={"tenant_id": "tenant_beta"},
+                headers=padm_hdr,
+            )
+            assert r_qual_beta.status_code == 200
+            r_metrics_alpha = await client.get("/v1/metrics", headers=pub_hdr)
+            assert r_metrics_alpha.status_code == 200
+            assert "tenant_beta" not in json.dumps(r_metrics_alpha.json()), (
+                f"/v1/metrics leaked tenant_beta to tenant_alpha: {r_metrics_alpha.json()}"
+            )
+            r_prom_alpha_scoped = await client.get("/metrics", headers=pub_hdr)
+            assert "tenant_beta" not in r_prom_alpha_scoped.text, (
+                f"/metrics leaked tenant_beta to tenant_alpha: {r_prom_alpha_scoped.text}"
+            )
+
+            # Second-Review Finding #4: Complete `DELETE /v1/documents/{kb}/{doc}` removes BOTH Postgres chunks
+            # AND Neo4j graph facts so `/v1/rag/query` stops answering from deleted docs!
+            r_del_doc = await client.delete(
+                "/v1/documents/kb_alpha_tables/doc_table_arch",
+                params={"tenant_id": "tenant_alpha"},
+                headers=tadm_hdr,
+            )
+            assert r_del_doc.status_code == 200
+            del_payload = r_del_doc.json()
+            assert del_payload["chunks_removed"] >= 1
+            assert del_payload["graph_entities_removed"] >= 1
+            assert del_payload["graph_edges_removed"] >= 1
+
+            r_rag_after_del = await client.post(
+                "/v1/rag/query",
+                json={"tenant_id": "tenant_alpha", "query": "What database does settlement-svc-01 use?"},
+                headers=pub_hdr,
+            )
+            assert r_rag_after_del.status_code == 200
+            assert "aurora-settlement-db" not in json.dumps(r_rag_after_del.json()), (
+                f"Deleted document fact leaked after DELETE: {r_rag_after_del.json()}"
+            )
+
             r_mcp_call = await client.post(
                 "/mcp",
                 json={
@@ -553,7 +705,7 @@ async def main() -> None:
             assert r_mcp_call.status_code == 200
             assert "aurora-helios-merger-db" not in json.dumps(r_mcp_call.json())
 
-            print("[5] Verified LIVE Uvicorn HTTP + JWT + Anti-Smuggling + ABAC + PPR + Leiden + Answerability + 13 MCP Tools")
+            print("[5] Verified LIVE Uvicorn HTTP + JWT + Anti-Smuggling + ABAC + PPR + Leiden + Answerability + 14 MCP Tools")
 
         # 7. Cold-Start Multi-Pod Restart Verification (Brand-New Service, Zero RAM Cache -> Live Postgres + Neo4j)
         pod2_pg = PostgresPgVectorStoreAdapter(dsn=app_dsn, embedding_provider=emb, canonical_dim=256)

@@ -324,12 +324,20 @@ def create_kg_fabric_app(
         return _GOVERNANCE_UI_HTML
 
     @app.get("/metrics", response_class=PlainTextResponse)
-    async def prometheus_metrics() -> str:
-        return svc.get_prometheus_metrics_text()
+    async def prometheus_metrics(
+        principal: AuthPrincipal | None = Depends(get_principal),
+    ) -> str:
+        p = _unwrap_principal(principal)
+        scoped_tid = None if (p is None or p.is_platform_admin) else p.tenant_id
+        return svc.get_prometheus_metrics_text(tenant_id=scoped_tid)
 
     @app.get("/v1/metrics")
-    async def json_metrics() -> dict[str, Any]:
-        return svc.get_metrics_snapshot()
+    async def json_metrics(
+        principal: AuthPrincipal | None = Depends(get_principal),
+    ) -> dict[str, Any]:
+        p = _unwrap_principal(principal)
+        scoped_tid = None if (p is None or p.is_platform_admin) else p.tenant_id
+        return svc.get_metrics_snapshot(tenant_id=scoped_tid)
 
     # -------------------------------------------------------------------------
     # 1. Control & Ingestion Plane (`/v1/kbs/*`, `/v1/documents/*`, `/v1/ontology/*`, `/v1/graph/*`)
@@ -513,7 +521,7 @@ def create_kg_fabric_app(
         principal: AuthPrincipal | None = Depends(get_principal),
     ) -> ReadOnlyCypherSearchResponse:
         p = _unwrap_principal(principal)
-        enforcer.require_role(p, "admin")
+        enforcer.require_platform_admin(p)
         req.tenant_id = enforcer.enforce_tenant(p, req.tenant_id)
         try:
             return await svc.execute_readonly_opencypher(req)
@@ -560,8 +568,8 @@ def create_kg_fabric_app(
         principal: AuthPrincipal | None = Depends(get_principal),
     ) -> list[DLQFailedChunkRecord]:
         p = _unwrap_principal(principal)
-        if p is not None and not p.is_admin and p.tenant_id:
-            tenant_id = enforcer.enforce_tenant(p, tenant_id or p.tenant_id)
+        if p is not None and not p.is_platform_admin:
+            tenant_id = enforcer.enforce_tenant(p, tenant_id or p.tenant_id or "")
         return await svc.list_dlq_records_async(tenant_id=tenant_id)
 
     @app.get("/v1/jobs/{job_id}", response_model=SyncJobRecord)

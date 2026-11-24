@@ -189,7 +189,12 @@ async def run_live_internet_kbs_benchmark() -> dict[str, Any]:
     print("=" * 96)
 
     embedder = SemanticFeatureHashEmbeddingProvider(default_dim=256)
-    pg_adapter = PostgresPgVectorStoreAdapter(dsn=PG_DSN, embedding_provider=embedder, canonical_dim=256)
+    pg_adapter = PostgresPgVectorStoreAdapter(
+        dsn=PG_DSN,
+        embedding_provider=embedder,
+        canonical_dim=256,
+        allowed_legacy_tables=["public.internet_*"],
+    )
     neo4j_adapter = Neo4jOpenCypherGraphAdapter(uri=NEO4J_URI, username=NEO4J_USER, password=NEO4J_PASS)
     pii_redactor = PresidioPIIRedactor(mode=PIIRedactionMode.REPLACE_TAG)
 

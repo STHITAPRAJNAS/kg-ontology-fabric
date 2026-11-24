@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import fnmatch
 import json
+import os
 import re
 from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
@@ -22,6 +24,66 @@ from ..vector_clustering import (
     FederatedEmbeddingModelRouter,
     cosine_similarity,
 )
+
+
+_VALID_SQL_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
+_FORBIDDEN_LEGACY_SCHEMAS = {"pg_catalog", "information_schema", "pg_toast"}
+_FORBIDDEN_LEGACY_TABLES = {
+    "unified_rag_chunks",
+    "kb_federation_registry",
+    "kb_ingestion_watermarks",
+    "canonical_entity_embeddings",
+    "enterprise_tbox_registry",
+    "kg_sync_jobs",
+    "kg_dlq_chunks",
+}
+
+
+def validate_legacy_table_access(
+    schema_name: str,
+    table_name: str,
+    column_names: Sequence[str],
+    allowed_patterns: Sequence[str] | None = None,
+    enforce_allowlist: bool = True,
+) -> None:
+    """
+    Fail-closed guard preventing arbitrary SQL table exfiltration via legacy KB registration:
+      1. Rejects invalid SQL identifiers (prevents quoting/injection).
+      2. Unconditionally blocks PostgreSQL system catalogs & all internal KG Fabric tables.
+      3. When `enforce_allowlist=True`, requires `schema.table` (or `table`) to match an explicit
+         operator-configured allowlist (`KG_FABRIC_ALLOWED_LEGACY_TABLES` / `allowed_legacy_tables`).
+    """
+    for ident in [schema_name, table_name, *column_names]:
+        if not _VALID_SQL_IDENT_RE.match(str(ident)):
+            raise PermissionError(f"Invalid SQL identifier in legacy KB mapping: '{ident}'")
+
+    s_low = schema_name.lower()
+    t_low = table_name.lower()
+    if s_low in _FORBIDDEN_LEGACY_SCHEMAS or s_low.startswith("pg_temp"):
+        raise PermissionError(
+            f"Access to PostgreSQL system schema '{schema_name}' is forbidden for legacy KB hydration."
+        )
+    if t_low in _FORBIDDEN_LEGACY_TABLES:
+        raise PermissionError(
+            f"Access to internal KG Fabric table '{table_name}' is forbidden for legacy KB hydration."
+        )
+
+    if enforce_allowlist:
+        patterns = [p.strip().lower() for p in (allowed_patterns or []) if p.strip()]
+        if not patterns:
+            raise PermissionError(
+                "Legacy PostgreSQL table hydration is disabled by default. Configure "
+                "KG_FABRIC_ALLOWED_LEGACY_TABLES (or PostgresPgVectorStoreAdapter(allowed_legacy_tables=...)) "
+                f"to explicitly allow '{schema_name}.{table_name}'."
+            )
+        qualified = f"{s_low}.{t_low}"
+        if not any(
+            fnmatch.fnmatch(qualified, pat) or fnmatch.fnmatch(t_low, pat)
+            for pat in patterns
+        ):
+            raise PermissionError(
+                f"Legacy table '{schema_name}.{table_name}' is not in KG_FABRIC_ALLOWED_LEGACY_TABLES."
+            )
 
 
 def get_production_pgvector_ddl(canonical_dim: int = 256) -> str:
@@ -90,15 +152,31 @@ CREATE INDEX IF NOT EXISTS idx_unified_chunks_acl_gin
     ON unified_rag_chunks USING gin (acl_groups);
 
 CREATE TABLE IF NOT EXISTS canonical_entity_embeddings (
-    entity_id TEXT PRIMARY KEY,
+    entity_id TEXT NOT NULL,
     tenant_id TEXT NOT NULL,
     canonical_name TEXT NOT NULL,
     ontology_class TEXT NOT NULL,
     upper_category TEXT NOT NULL,
     source_kb_ids JSONB NOT NULL,
     embedding vector({canonical_dim}) NOT NULL,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (tenant_id, entity_id)
 );
+
+-- Idempotently upgrade legacy single-column PK (entity_id) -> composite PK (tenant_id, entity_id)
+DO $$
+DECLARE
+    pk_cols INTEGER;
+BEGIN
+    SELECT array_length(conkey, 1) INTO pk_cols
+    FROM pg_constraint
+    WHERE conrelid = 'canonical_entity_embeddings'::regclass AND contype = 'p';
+    IF pk_cols = 1 THEN
+        ALTER TABLE canonical_entity_embeddings DROP CONSTRAINT canonical_entity_embeddings_pkey;
+        ALTER TABLE canonical_entity_embeddings ADD PRIMARY KEY (tenant_id, entity_id);
+    END IF;
+END
+$$;
 
 CREATE INDEX IF NOT EXISTS idx_canonical_entities_hnsw
     ON canonical_entity_embeddings USING hnsw (embedding vector_cosine_ops);
@@ -265,9 +343,20 @@ class PgVectorStorePort(ABC):
         return None
 
     async def unregister_kb(self, tenant_id: str, kb_id: str) -> int:
-        return 0
+        return len(await self.unregister_kb_chunks(tenant_id, kb_id))
+
+    async def unregister_kb_chunks(self, tenant_id: str, kb_id: str) -> list[str]:
+        return []
 
     async def delete_document(self, tenant_id: str, kb_id: str, doc_id: str) -> int:
+        return len(await self.delete_document_chunks(tenant_id, kb_id, doc_id))
+
+    async def delete_document_chunks(self, tenant_id: str, kb_id: str, doc_id: str) -> list[str]:
+        return []
+
+    async def delete_canonical_entity_embeddings(
+        self, tenant_id: str, entity_ids: Sequence[str]
+    ) -> int:
         return 0
 
     async def purge_tenant(self, tenant_id: str) -> dict[str, int]:
@@ -355,7 +444,7 @@ class InMemoryPgVectorStoreEmulator(PgVectorStorePort):
         self._kb_registry: dict[str, VectorKBRegistration] = {}
         self._kb_tables: dict[str, dict[str, VectorChunkRecord]] = {}
         self._watermarks: dict[tuple[str, str], KBWatermarkState] = {}
-        self._entity_index: dict[str, KGEntityNode] = {}
+        self._entity_index: dict[tuple[str, str], KGEntityNode] = {}
         self._tboxes: dict[str, EnterpriseCompiledTBox] = {}
         self._sync_jobs: dict[str, SyncJobRecord] = {}
         self._dlq_records: list[DLQFailedChunkRecord] = []
@@ -399,19 +488,19 @@ class InMemoryPgVectorStoreEmulator(PgVectorStorePort):
         self._kb_registry[registration.kb_id] = registration
         self._kb_tables.setdefault(registration.kb_id, {})
 
-    async def unregister_kb(self, tenant_id: str, kb_id: str) -> int:
+    async def unregister_kb_chunks(self, tenant_id: str, kb_id: str) -> list[str]:
         existing = self._kb_registry.get(kb_id)
         if existing is None:
-            return 0
+            return []
         if existing.tenant_id != tenant_id:
             raise PermissionError(f"KB '{kb_id}' belongs to another tenant.")
         del self._kb_registry[kb_id]
-        removed_chunks = len(self._kb_tables.pop(kb_id, {}))
+        removed_ids = list(self._kb_tables.pop(kb_id, {}).keys())
         for key in [k for k in self._watermarks if k[0] == kb_id]:
             del self._watermarks[key]
-        return removed_chunks
+        return removed_ids
 
-    async def delete_document(self, tenant_id: str, kb_id: str, doc_id: str) -> int:
+    async def delete_document_chunks(self, tenant_id: str, kb_id: str, doc_id: str) -> list[str]:
         existing = self._kb_registry.get(kb_id)
         if existing is not None and existing.tenant_id != tenant_id:
             raise PermissionError(f"KB '{kb_id}' belongs to another tenant.")
@@ -422,7 +511,16 @@ class InMemoryPgVectorStoreEmulator(PgVectorStorePort):
         for cid in to_delete:
             del table[cid]
             self._watermarks.pop((kb_id, cid), None)
-        return len(to_delete)
+        return to_delete
+
+    async def delete_canonical_entity_embeddings(
+        self, tenant_id: str, entity_ids: Sequence[str]
+    ) -> int:
+        removed = 0
+        for eid in entity_ids:
+            if self._entity_index.pop((tenant_id, eid), None) is not None:
+                removed += 1
+        return removed
 
     async def purge_tenant(self, tenant_id: str) -> dict[str, int]:
         kb_ids = [kid for kid, reg in self._kb_registry.items() if reg.tenant_id == tenant_id]
@@ -543,7 +641,7 @@ class InMemoryPgVectorStoreEmulator(PgVectorStorePort):
                     f"{ent.ontology_class} {ent.canonical_name} {ent.summary}",
                     dim=self.canonical_dim,
                 )
-            self._entity_index[ent.entity_id] = ent
+            self._entity_index[(ent.tenant_id, ent.entity_id)] = ent
 
     @staticmethod
     def _tokenize_bm25(text: str) -> list[str]:
@@ -686,11 +784,17 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
         embedding_provider: EmbeddingProvider,
         canonical_dim: int = 256,
         auto_init_schema: bool = True,
+        allowed_legacy_tables: Sequence[str] | None = None,
     ):
         self.dsn = dsn
         self.embedding_provider = embedding_provider
         self.canonical_dim = canonical_dim
         self.auto_init_schema = auto_init_schema
+        if allowed_legacy_tables is not None:
+            self.allowed_legacy_tables = [p.strip() for p in allowed_legacy_tables if p.strip()]
+        else:
+            raw_env = os.getenv("KG_FABRIC_ALLOWED_LEGACY_TABLES", "").strip()
+            self.allowed_legacy_tables = [p.strip() for p in raw_env.split(",") if p.strip()]
         self._pool: Any = None
         self._advisory_lock_conns: dict[int, Any] = {}
 
@@ -794,7 +898,7 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
                 registration.security_classification,
             )
 
-    async def unregister_kb(self, tenant_id: str, kb_id: str) -> int:
+    async def unregister_kb_chunks(self, tenant_id: str, kb_id: str) -> list[str]:
         async with self._scoped_conn("*") as conn:
             owner = await conn.fetchval(
                 "SELECT tenant_id FROM kb_federation_registry WHERE kb_id = $1", kb_id
@@ -802,20 +906,21 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
             if owner is not None and owner != tenant_id:
                 raise PermissionError(f"KB '{kb_id}' belongs to another tenant.")
         async with self._scoped_conn(tenant_id) as conn:
-            deleted_chunks = await conn.fetchval(
-                "WITH d AS (DELETE FROM unified_rag_chunks WHERE tenant_id = $1 AND kb_id = $2 RETURNING 1) SELECT count(*) FROM d",
+            rows = await conn.fetch(
+                "DELETE FROM unified_rag_chunks WHERE tenant_id = $1 AND kb_id = $2 RETURNING chunk_id",
                 tenant_id,
                 kb_id,
             )
+            chunk_ids = [r["chunk_id"] for r in rows]
             await conn.execute("DELETE FROM kb_ingestion_watermarks WHERE kb_id = $1", kb_id)
             await conn.execute(
                 "DELETE FROM kb_federation_registry WHERE tenant_id = $1 AND kb_id = $2",
                 tenant_id,
                 kb_id,
             )
-            return int(deleted_chunks or 0)
+            return chunk_ids
 
-    async def delete_document(self, tenant_id: str, kb_id: str, doc_id: str) -> int:
+    async def delete_document_chunks(self, tenant_id: str, kb_id: str, doc_id: str) -> list[str]:
         async with self._scoped_conn(tenant_id) as conn:
             rows = await conn.fetch(
                 "DELETE FROM unified_rag_chunks WHERE tenant_id = $1 AND kb_id = $2 AND doc_id = $3 RETURNING chunk_id",
@@ -830,7 +935,20 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
                     kb_id,
                     chunk_ids,
                 )
-            return len(chunk_ids)
+            return chunk_ids
+
+    async def delete_canonical_entity_embeddings(
+        self, tenant_id: str, entity_ids: Sequence[str]
+    ) -> int:
+        if not entity_ids:
+            return 0
+        async with self._scoped_conn(tenant_id) as conn:
+            removed = await conn.fetchval(
+                "WITH d AS (DELETE FROM canonical_entity_embeddings WHERE tenant_id = $1 AND entity_id = ANY($2::text[]) RETURNING 1) SELECT count(*) FROM d",
+                tenant_id,
+                list(entity_ids),
+            )
+            return int(removed or 0)
 
     async def purge_tenant(self, tenant_id: str) -> dict[str, int]:
         async with self._scoped_conn(tenant_id) as conn:
@@ -1023,15 +1141,34 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
     async def reverse_hydrate_from_legacy_pgvector_table(
         self,
         registration: VectorKBRegistration,
+        *,
+        enforce_allowlist: bool = True,
     ) -> list[VectorChunkRecord]:
         """
-        Directly reads an existing, heterogeneous legacy PostgreSQL `pgvector` table
+        Directly reads an explicitly allowlisted legacy PostgreSQL `pgvector` table
         (with its own schema, table name, column mapping, and native vector dimension)
-        and reverse-hydrates `VectorChunkRecord`s without re-embedding native vectors.
+        and reverse-hydrates `VectorChunkRecord`s inside a tenant-scoped transaction.
+
+        Security:
+          - Unconditionally blocks PostgreSQL system catalogs (`pg_catalog`, `information_schema`, etc.)
+            and all internal KG Fabric tables (`unified_rag_chunks`, etc.).
+          - When `enforce_allowlist=True` (default), requires `schema.table` to match
+            `self.allowed_legacy_tables` (`KG_FABRIC_ALLOWED_LEGACY_TABLES`).
         """
-        pool = await self._get_pool()
         cm = registration.column_mapping
-        # Safe identifier quoting
+        validate_legacy_table_access(
+            schema_name=registration.schema_name,
+            table_name=registration.table_name,
+            column_names=[
+                cm.id_column,
+                cm.doc_id_column,
+                cm.text_column,
+                cm.embedding_column,
+                cm.metadata_column,
+            ],
+            allowed_patterns=self.allowed_legacy_tables,
+            enforce_allowlist=enforce_allowlist,
+        )
         schema_q = f'"{registration.schema_name}"'
         table_q = f'"{registration.table_name}"'
         sql = (
@@ -1040,7 +1177,7 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
             f'"{cm.metadata_column}" AS meta '
             f"FROM {schema_q}.{table_q}"
         )
-        async with pool.acquire() as conn:
+        async with self._scoped_conn(registration.tenant_id) as conn:
             rows = await conn.fetch(sql)
 
         hydrated: list[VectorChunkRecord] = []
@@ -1247,7 +1384,8 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
                         entity_id, tenant_id, canonical_name, ontology_class,
                         upper_category, source_kb_ids, embedding
                     ) VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7::vector)
-                    ON CONFLICT (entity_id) DO UPDATE SET
+                    ON CONFLICT (tenant_id, entity_id) DO UPDATE SET
+                        canonical_name = EXCLUDED.canonical_name,
                         source_kb_ids = EXCLUDED.source_kb_ids,
                         embedding = EXCLUDED.embedding,
                         updated_at = NOW()

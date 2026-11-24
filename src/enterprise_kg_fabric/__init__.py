@@ -8,6 +8,7 @@ from .adapters import (
     PropertyGraphStorePort,
     get_production_pgvector_ddl,
     get_rls_app_role_ddl,
+    validate_legacy_table_access,
 )
 from .adaptive_router import AdaptiveQueryRouter, PluggableCrossEncoderReranker
 from .api import API_VERSION as __version__
@@ -207,6 +208,7 @@ __all__ = [
     "InMemoryPgVectorStoreEmulator",
     "PostgresPgVectorStoreAdapter",
     "get_production_pgvector_ddl",
+    "validate_legacy_table_access",
     "PropertyGraphStorePort",
     "InMemoryOpenCypherGraphEmulator",
     "Neo4jOpenCypherGraphAdapter",

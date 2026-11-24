@@ -220,8 +220,8 @@ class CrossKBEntityResolver:
                 self._merge_provenance_into_entity(best_match, mention, kb_id, chunk_id, chunk_acls)
                 return best_match
 
-            # Create new canonical entity node
-            entity_id = f"ent::{canon_cls.lower()}::{slug}"
+            # Create new canonical entity node (tenant-scoped ID prevents cross-tenant collisions)
+            entity_id = f"ent::{tbox.tenant_id}::{canon_cls.lower()}::{slug}"
             # Prefer clean hyphenated or canonical display form
             new_node = KGEntityNode(
                 entity_id=entity_id,

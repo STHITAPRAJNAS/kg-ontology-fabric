@@ -873,10 +873,15 @@ def test_review_remediation_critical_security_neptune_promote_delete_and_auth_fa
             {"sub": "adma", "tenant_id": "tenant_a", "acl_groups": ["public", "sre_only"], "roles": ["admin"], "exp": int(time.time()) + 3600},
             jwt_secret,
         )
+        platform_admin_jwt = create_hs256_jwt(
+            {"sub": "root", "tenant_id": "*", "acl_groups": ["public", "sre_only"], "roles": ["admin"], "exp": int(time.time()) + 3600},
+            jwt_secret,
+        )
         hdr_rb = {"Authorization": f"Bearer {reader_b_jwt}"}
         hdr_wb = {"Authorization": f"Bearer {writer_b_jwt}"}
         hdr_wild = {"Authorization": f"Bearer {wildcard_nonadmin_jwt}"}
         hdr_adma = {"Authorization": f"Bearer {admin_a_jwt}"}
+        hdr_padm = {"Authorization": f"Bearer {platform_admin_jwt}"}
 
         # Medium #9b: Non-admin wildcard tenant_id="*" rejected with 403
         code, _ = await _asgi_request(app, "GET", "/v1/telemetry", params={"tenant_id": "tenant_a"}, headers=hdr_wild)
@@ -909,13 +914,23 @@ def test_review_remediation_critical_security_neptune_promote_delete_and_auth_fa
         )
         assert code == 403 or "error" in mcp_cypher
 
-        # Admin attempting literal tenant_id override in Cypher -> 400
+        # Tenant-bound admin is ALSO blocked from raw Cypher (`403`) — only global platform_admin allowed
+        code, _ = await _asgi_request(
+            app,
+            "POST",
+            "/v1/search/cypher",
+            json_body={"tenant_id": "tenant_a", "cypher_query": "MATCH (n) RETURN n"},
+            headers=hdr_adma,
+        )
+        assert code == 403
+
+        # Global platform admin attempting literal tenant_id override in Cypher -> 400
         code, _ = await _asgi_request(
             app,
             "POST",
             "/v1/search/cypher",
             json_body={"tenant_id": "tenant_a", "cypher_query": "MATCH (n {tenant_id: 'tenant_b'}) RETURN n"},
-            headers=hdr_adma,
+            headers=hdr_padm,
         )
         assert code == 400
 
@@ -1043,5 +1058,287 @@ def test_review_remediation_critical_security_neptune_promote_delete_and_auth_fa
         )
         assert code == 200 and purge["kbs_removed"] >= 1
         assert await svc.graph_store.get_all_entities("tenant_a") == {}
+
+    run_coroutine_sync(_run())
+
+
+def test_second_review_remediation_legacy_exfil_platform_admin_entity_pk_delete_dlq_and_metrics() -> None:
+    """
+    Regression suite reproducing EVERY finding from the second external red-team review:
+      1. Critical: `EXISTING_PGVECTOR_KB` registration & `validate_legacy_table_access` block
+         `public.unified_rag_chunks`, `pg_catalog.pg_roles`, SQL injection identifiers, and
+         unallowlisted tables (fail-closed default!).
+      2. High: Tenant-bound admin (`tenant_id="tenant_a"`, `roles=["admin"]`) gets 403 on
+         `/v1/search/cypher` & MCP `execute_readonly_opencypher` (global `platform_admin` required).
+      3. High: Same-named entity (`payment-router-01`) across `tenant_a` and `tenant_b` receives
+         distinct tenant-scoped `entity_id`s and NEVER collides in `canonical_entity_embeddings`.
+      4. Medium: `DELETE /v1/documents/{kb}/{doc}` & `DELETE /v1/kbs/{kb}` remove BOTH vector
+         chunks AND orphaned graph entities/edges AND entity embeddings so `/v1/rag/query` stops
+         answering from deleted docs (while preserving entities/edges shared with surviving docs).
+      5. Medium: Tenant-bound admin gets 403 on `GET /v1/jobs/dlq?tenant_id=tenant_b`.
+      6. Low: `/v1/metrics` and `/metrics` hide other tenants' IDs & quality scores from scoped callers.
+      7. Low: Legacy table registration fails closed when `allowed_legacy_tables` is empty.
+    """
+    from enterprise_kg_fabric import (
+        KBSourceType,
+        VectorKBRegistration,
+        validate_legacy_table_access,
+    )
+
+    # 1. Direct validator proofs (denylist + SQL identifier injection + fail-closed allowlist)
+    for bad_schema, bad_table in (
+        ("public", "unified_rag_chunks"),
+        ("public", "kb_federation_registry"),
+        ("public", "canonical_entity_embeddings"),
+        ("pg_catalog", "pg_roles"),
+        ("information_schema", "tables"),
+        ("pg_temp_1", "evil"),
+        ("public", 'foo"; DROP TABLE unified_rag_chunks; --'),
+    ):
+        with pytest.raises(PermissionError):
+            validate_legacy_table_access(
+                schema_name=bad_schema,
+                table_name=bad_table,
+                column_names=["id", "doc_id", "content"],
+                allowed_patterns=["public.*", "pg_catalog.*"],
+            )
+
+    # Column SQL injection is also rejected
+    with pytest.raises(PermissionError):
+        validate_legacy_table_access(
+            schema_name="public",
+            table_name="legacy_finops_vectors",
+            column_names=['id" FROM pg_roles; --'],
+            allowed_patterns=["public.legacy_*"],
+        )
+
+    # Even a benign table name fails closed when allowlist is empty
+    with pytest.raises(PermissionError, match="disabled"):
+        validate_legacy_table_access(
+            schema_name="public",
+            table_name="legacy_finops_vectors",
+            column_names=["id", "doc_id", "content"],
+            allowed_patterns=[],
+        )
+
+    # Explicitly allowlisted benign table succeeds (returns None without raising)
+    validate_legacy_table_access(
+        schema_name="public",
+        table_name="legacy_finops_vectors",
+        column_names=["id", "doc_id", "content"],
+        allowed_patterns=["public.legacy_*"],
+    )
+
+    async def _run() -> None:
+        svc = EnterpriseKGOntologyService(
+            min_kb_support_for_approval=1,
+            min_chunk_support_for_approval=1,
+        )
+        # Seed BOTH tenant_a (2 docs: one standalone, one shared) and tenant_b (same-named entity!)
+        await svc.ingest_raw_documents(
+            [
+                RawDocumentInput(
+                    doc_id="doc_a_keep",
+                    kb_id="kb_a_core",
+                    tenant_id="tenant_a",
+                    domain_tag="sre",
+                    title="Tenant A Core",
+                    content="Microservice payment-router-01 depends on aurora-alpha-keep.",
+                    acl_groups=["public"],
+                ),
+                RawDocumentInput(
+                    doc_id="doc_a_delete",
+                    kb_id="kb_a_core",
+                    tenant_id="tenant_a",
+                    domain_tag="sre",
+                    title="Tenant A Transient",
+                    content="Microservice transient-svc-99 depends on aurora-transient-db.",
+                    acl_groups=["public"],
+                ),
+                RawDocumentInput(
+                    doc_id="doc_a_kb2",
+                    kb_id="kb_a_ephemeral",
+                    tenant_id="tenant_a",
+                    domain_tag="sre",
+                    title="Tenant A Ephemeral KB",
+                    content="Microservice ephemeral-svc-77 depends on aurora-ephemeral-db.",
+                    acl_groups=["public"],
+                ),
+                RawDocumentInput(
+                    doc_id="doc_b_same_name",
+                    kb_id="kb_b_core",
+                    tenant_id="tenant_b",
+                    domain_tag="sre",
+                    title="Tenant B Same Entity Name",
+                    content="Microservice payment-router-01 depends on aurora-beta-only.",
+                    acl_groups=["public"],
+                ),
+            ]
+        )
+        await svc.induce_and_align_ontology(tenant_id="tenant_a")
+        await svc.induce_and_align_ontology(tenant_id="tenant_b")
+        await svc.build_or_update_knowledge_graph(tenant_id="tenant_a", incremental=False)
+        await svc.build_or_update_knowledge_graph(tenant_id="tenant_b", incremental=False)
+
+        # Finding #3: Same-named entity `payment-router-01` gets distinct tenant-scoped entity_ids
+        # and does NOT overwrite the other tenant's canonical_entity_embeddings row!
+        ents_a = await svc.graph_store.get_all_entities("tenant_a")
+        ents_b = await svc.graph_store.get_all_entities("tenant_b")
+        pr_a = [e for e in ents_a.values() if e.canonical_name == "payment-router-01"]
+        pr_b = [e for e in ents_b.values() if e.canonical_name == "payment-router-01"]
+        assert len(pr_a) == 1 and len(pr_b) == 1
+        assert pr_a[0].entity_id != pr_b[0].entity_id
+        assert "::tenant_a::" in pr_a[0].entity_id
+        assert "::tenant_b::" in pr_b[0].entity_id
+        assert "kb_b_core" not in pr_a[0].source_kb_ids
+        assert "kb_a_core" not in pr_b[0].source_kb_ids
+
+        # Audit both tenants so last_quality_scores has BOTH tenant_a & tenant_b
+        await svc.audit_kg_quality("tenant_a")
+        await svc.audit_kg_quality("tenant_b")
+
+        jwt_secret = "second-review-remediation-signing-key-32-bytes-minimum"
+        app = create_kg_fabric_app(
+            service=svc,
+            auth_config=AuthConfig(mode=AuthMode.JWT, jwt_secret=jwt_secret),
+        )
+        tadm_a_jwt = create_hs256_jwt(
+            {"sub": "ta_admin", "tenant_id": "tenant_a", "acl_groups": ["public"], "roles": ["admin"], "exp": int(time.time()) + 3600},
+            jwt_secret,
+        )
+        writer_b_jwt = create_hs256_jwt(
+            {"sub": "tb_writer", "tenant_id": "tenant_b", "acl_groups": ["public"], "roles": ["reader", "writer"], "exp": int(time.time()) + 3600},
+            jwt_secret,
+        )
+        padm_jwt = create_hs256_jwt(
+            {"sub": "root_admin", "tenant_id": "*", "acl_groups": ["public"], "roles": ["admin"], "exp": int(time.time()) + 3600},
+            jwt_secret,
+        )
+        hdr_ta = {"Authorization": f"Bearer {tadm_a_jwt}"}
+        hdr_wb = {"Authorization": f"Bearer {writer_b_jwt}"}
+        hdr_pa = {"Authorization": f"Bearer {padm_jwt}"}
+
+        # Finding #1 via REST: writer_b cannot register public.unified_rag_chunks or pg_catalog.pg_roles
+        for bad_schema, bad_tbl in (("public", "unified_rag_chunks"), ("pg_catalog", "pg_roles")):
+            code, _ = await _asgi_request(
+                app,
+                "POST",
+                "/v1/kbs/register",
+                json_body=VectorKBRegistration(
+                    kb_id=f"kb_exfil_{bad_tbl}",
+                    tenant_id="tenant_b",
+                    domain_tag="evil",
+                    source_type=KBSourceType.EXISTING_PGVECTOR_KB,
+                    schema_name=bad_schema,
+                    table_name=bad_tbl,
+                ).model_dump(),
+                headers=hdr_wb,
+            )
+            assert code == 403
+
+        # Finding #2: tenant-bound admin gets 403 on Cypher (REST + MCP)
+        code, _ = await _asgi_request(
+            app,
+            "POST",
+            "/v1/search/cypher",
+            json_body={"tenant_id": "tenant_a", "cypher_query": "MATCH (n) RETURN n.canonical_name"},
+            headers=hdr_ta,
+        )
+        assert code == 403
+        code, mcp_cyp = await _asgi_request(
+            app,
+            "POST",
+            "/mcp",
+            json_body={
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "tools/call",
+                "params": {
+                    "name": "execute_readonly_opencypher",
+                    "arguments": {"tenant_id": "tenant_a", "cypher_query": "MATCH (n) RETURN n"},
+                },
+            },
+            headers=hdr_ta,
+        )
+        assert code == 403 or "error" in mcp_cyp
+
+        # Finding #5: tenant-bound admin gets 403 on cross-tenant DLQ list
+        code, _ = await _asgi_request(
+            app, "GET", "/v1/jobs/dlq", params={"tenant_id": "tenant_b"}, headers=hdr_ta
+        )
+        assert code == 403
+        code, _ = await _asgi_request(
+            app, "GET", "/v1/jobs/dlq", params={"tenant_id": "tenant_a"}, headers=hdr_ta
+        )
+        assert code == 200
+
+        # Finding #6: `/v1/metrics` and `/metrics` hide tenant_b from tenant_a caller,
+        #             while platform_admin sees both!
+        code, m_ta = await _asgi_request(app, "GET", "/v1/metrics", headers=hdr_ta)
+        assert code == 200
+        assert "tenant_a" in m_ta["last_quality_scores"]
+        assert "tenant_b" not in m_ta["last_quality_scores"]
+
+        code, m_pa = await _asgi_request(app, "GET", "/v1/metrics", headers=hdr_pa)
+        assert code == 200
+        assert "tenant_a" in m_pa["last_quality_scores"]
+        assert "tenant_b" in m_pa["last_quality_scores"]
+
+        # Finding #4a: DELETE /v1/documents/{kb}/{doc} purges graph entities, edges, AND stops /v1/rag/query
+        code, del_doc = await _asgi_request(
+            app,
+            "DELETE",
+            "/v1/documents/kb_a_core/doc_a_delete",
+            params={"tenant_id": "tenant_a"},
+            headers=hdr_ta,
+        )
+        assert code == 200
+        assert del_doc["chunks_removed"] == 1
+        assert del_doc["graph_entities_removed"] >= 1
+        assert del_doc["graph_edges_removed"] >= 1
+
+        code, rag_del = await _asgi_request(
+            app,
+            "POST",
+            "/v1/rag/query",
+            json_body={"tenant_id": "tenant_a", "query": "What does transient-svc-99 depend on?"},
+            headers=hdr_ta,
+        )
+        assert code == 200
+        assert "aurora-transient-db" not in str(rag_del)
+
+        # Surviving doc in same KB is still intact!
+        code, rag_keep = await _asgi_request(
+            app,
+            "POST",
+            "/v1/rag/query",
+            json_body={"tenant_id": "tenant_a", "query": "What does payment-router-01 depend on?"},
+            headers=hdr_ta,
+        )
+        assert code == 200
+        assert "aurora-alpha-keep" in str(rag_keep)
+
+        # Finding #4b: DELETE /v1/kbs/{kb} purges ephemeral KB graph facts completely
+        code, del_kb = await _asgi_request(
+            app,
+            "DELETE",
+            "/v1/kbs/kb_a_ephemeral",
+            params={"tenant_id": "tenant_a"},
+            headers=hdr_ta,
+        )
+        assert code == 200
+        assert del_kb["chunks_removed"] == 1
+        assert del_kb["graph_entities_removed"] >= 1
+        assert del_kb["graph_edges_removed"] >= 1
+
+        code, rag_kb_del = await _asgi_request(
+            app,
+            "POST",
+            "/v1/rag/query",
+            json_body={"tenant_id": "tenant_a", "query": "What does ephemeral-svc-77 depend on?"},
+            headers=hdr_ta,
+        )
+        assert code == 200
+        assert "aurora-ephemeral-db" not in str(rag_kb_del)
 
     run_coroutine_sync(_run())

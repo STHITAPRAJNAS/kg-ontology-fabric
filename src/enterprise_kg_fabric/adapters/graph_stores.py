@@ -71,6 +71,15 @@ class PropertyGraphStorePort(ABC):
     ) -> list[dict[str, Any]]:
         raise NotImplementedError
 
+    async def delete_chunks_provenance(
+        self,
+        tenant_id: str,
+        chunk_ids: Sequence[str],
+        kb_id: str | None = None,
+    ) -> tuple[list[str], int]:
+        """Removes deleted chunks/KB from graph provenance; deletes orphaned edges & entities."""
+        return [], 0
+
     async def purge_tenant(self, tenant_id: str) -> int:
         return 0
 
@@ -96,6 +105,59 @@ class InMemoryOpenCypherGraphEmulator(PropertyGraphStorePort):
 
     async def persist_ontology_tbox(self, tbox: EnterpriseCompiledTBox) -> None:
         self._tboxes[tbox.tenant_id] = tbox
+
+    async def delete_chunks_provenance(
+        self,
+        tenant_id: str,
+        chunk_ids: Sequence[str],
+        kb_id: str | None = None,
+    ) -> tuple[list[str], int]:
+        chunk_set = set(chunk_ids)
+        if not chunk_set and not kb_id:
+            return [], 0
+
+        edge_store = self._edges.get(tenant_id, {})
+        edges_to_delete: list[str] = []
+        for eid, edge in edge_store.items():
+            touched = bool(chunk_set.intersection(edge.source_chunk_ids)) or (
+                kb_id is not None and kb_id in edge.source_kb_ids
+            )
+            if not touched:
+                continue
+            edge.source_chunk_ids = [c for c in edge.source_chunk_ids if c not in chunk_set]
+            if kb_id is not None:
+                edge.source_kb_ids = [k for k in edge.source_kb_ids if k != kb_id]
+            if not edge.source_chunk_ids or (kb_id is not None and not edge.source_kb_ids):
+                edges_to_delete.append(eid)
+        for eid in edges_to_delete:
+            edge_store.pop(eid, None)
+
+        ent_store = self._entities.get(tenant_id, {})
+        deleted_entity_ids: list[str] = []
+        for ent_id, ent in list(ent_store.items()):
+            touched = bool(chunk_set.intersection(ent.source_chunk_ids)) or (
+                kb_id is not None and kb_id in ent.source_kb_ids
+            )
+            if not touched:
+                continue
+            ent.source_chunk_ids = [c for c in ent.source_chunk_ids if c not in chunk_set]
+            if kb_id is not None:
+                ent.source_kb_ids = [k for k in ent.source_kb_ids if k != kb_id]
+            if not ent.source_chunk_ids or (kb_id is not None and not ent.source_kb_ids):
+                deleted_entity_ids.append(ent_id)
+                ent_store.pop(ent_id, None)
+
+        if deleted_entity_ids:
+            del_set = set(deleted_entity_ids)
+            for eid in [
+                k
+                for k, e in edge_store.items()
+                if e.source_entity_id in del_set or e.target_entity_id in del_set
+            ]:
+                edge_store.pop(eid, None)
+                edges_to_delete.append(eid)
+
+        return deleted_entity_ids, len(set(edges_to_delete))
 
     async def purge_tenant(self, tenant_id: str) -> int:
         ent_count = len(self._entities.pop(tenant_id, {}))
@@ -786,6 +848,68 @@ class Neo4jOpenCypherGraphAdapter(PropertyGraphStorePort):
             records = await result.data()
             return records
 
+    async def delete_chunks_provenance(
+        self,
+        tenant_id: str,
+        chunk_ids: Sequence[str],
+        kb_id: str | None = None,
+    ) -> tuple[list[str], int]:
+        chunk_list = list(chunk_ids)
+        if not chunk_list and not kb_id:
+            return [], 0
+        driver = self._get_driver()
+        deleted_edges = 0
+        deleted_entities: list[str] = []
+        async with driver.session() as session:
+            res_e = await session.run(
+                """
+                MATCH (s:Entity {tenant_id: $tenant_id})-[rel:KG_RELATION]->(t:Entity {tenant_id: $tenant_id})
+                WHERE ANY(c IN coalesce(rel.source_chunk_ids, []) WHERE c IN $chunk_ids)
+                   OR ($kb_id IS NOT NULL AND $kb_id IN coalesce(rel.source_kb_ids, []))
+                SET rel.source_chunk_ids = [c IN coalesce(rel.source_chunk_ids, []) WHERE NOT c IN $chunk_ids],
+                    rel.source_kb_ids = CASE
+                        WHEN $kb_id IS NOT NULL
+                        THEN [k IN coalesce(rel.source_kb_ids, []) WHERE k <> $kb_id]
+                        ELSE coalesce(rel.source_kb_ids, [])
+                    END
+                WITH rel
+                WHERE size(rel.source_chunk_ids) = 0 OR ($kb_id IS NOT NULL AND size(rel.source_kb_ids) = 0)
+                DELETE rel
+                RETURN count(rel) AS del_cnt
+                """,
+                tenant_id=tenant_id,
+                chunk_ids=chunk_list,
+                kb_id=kb_id,
+            )
+            rec_e = await res_e.single()
+            if rec_e and rec_e["del_cnt"] is not None:
+                deleted_edges = int(rec_e["del_cnt"])
+
+            res_n = await session.run(
+                """
+                MATCH (n:Entity {tenant_id: $tenant_id})
+                WHERE ANY(c IN coalesce(n.source_chunk_ids, []) WHERE c IN $chunk_ids)
+                   OR ($kb_id IS NOT NULL AND $kb_id IN coalesce(n.source_kb_ids, []))
+                SET n.source_chunk_ids = [c IN coalesce(n.source_chunk_ids, []) WHERE NOT c IN $chunk_ids],
+                    n.source_kb_ids = CASE
+                        WHEN $kb_id IS NOT NULL
+                        THEN [k IN coalesce(n.source_kb_ids, []) WHERE k <> $kb_id]
+                        ELSE coalesce(n.source_kb_ids, [])
+                    END
+                WITH n
+                WHERE size(n.source_chunk_ids) = 0 OR ($kb_id IS NOT NULL AND size(n.source_kb_ids) = 0)
+                WITH n, n.entity_id AS eid
+                DETACH DELETE n
+                RETURN eid
+                """,
+                tenant_id=tenant_id,
+                chunk_ids=chunk_list,
+                kb_id=kb_id,
+            )
+            rows_n = await res_n.data()
+            deleted_entities = [str(r["eid"]) for r in rows_n if r.get("eid")]
+        return deleted_entities, deleted_edges
+
     async def purge_tenant(self, tenant_id: str) -> int:
         driver = self._get_driver()
         async with driver.session() as session:
@@ -1153,6 +1277,51 @@ class NeptuneOpenCypherGraphAdapter(PropertyGraphStorePort):
         params: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         return await self._run_neptune_cypher(cypher_query, params or {})
+
+    async def delete_chunks_provenance(
+        self,
+        tenant_id: str,
+        chunk_ids: Sequence[str],
+        kb_id: str | None = None,
+    ) -> tuple[list[str], int]:
+        chunk_set = set(chunk_ids)
+        if not chunk_set and not kb_id:
+            return [], 0
+        all_entities = await self.get_all_entities(tenant_id)
+        all_edges = await self.get_all_edges(tenant_id, active_only=False)
+        del_edge_ids: list[str] = []
+        del_entity_ids: list[str] = []
+        for edge in all_edges:
+            if chunk_set.intersection(edge.source_chunk_ids) or (kb_id and kb_id in edge.source_kb_ids):
+                rem_c = [c for c in edge.source_chunk_ids if c not in chunk_set]
+                rem_k = [k for k in edge.source_kb_ids if k != kb_id] if kb_id else edge.source_kb_ids
+                if not rem_c or (kb_id and not rem_k):
+                    del_edge_ids.append(edge.edge_id)
+        if del_edge_ids:
+            await self._run_neptune_cypher(
+                """
+                MATCH (s:Entity {tenant_id: $tenant_id})-[rel:KG_RELATION]->(t:Entity {tenant_id: $tenant_id})
+                WHERE rel.edge_id IN $edge_ids
+                DELETE rel
+                """,
+                {"tenant_id": tenant_id, "edge_ids": del_edge_ids},
+            )
+        for ent in all_entities.values():
+            if chunk_set.intersection(ent.source_chunk_ids) or (kb_id and kb_id in ent.source_kb_ids):
+                rem_c = [c for c in ent.source_chunk_ids if c not in chunk_set]
+                rem_k = [k for k in ent.source_kb_ids if k != kb_id] if kb_id else ent.source_kb_ids
+                if not rem_c or (kb_id and not rem_k):
+                    del_entity_ids.append(ent.entity_id)
+        if del_entity_ids:
+            await self._run_neptune_cypher(
+                """
+                MATCH (n:Entity {tenant_id: $tenant_id})
+                WHERE n.entity_id IN $entity_ids
+                DETACH DELETE n
+                """,
+                {"tenant_id": tenant_id, "entity_ids": del_entity_ids},
+            )
+        return del_entity_ids, len(del_edge_ids)
 
     async def purge_tenant(self, tenant_id: str) -> int:
         res = await self._run_neptune_cypher(

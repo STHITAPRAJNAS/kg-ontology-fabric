@@ -47,6 +47,8 @@ class KGFabricMcpServer:
     }
     _ADMIN_TOOLS = {
         "promote_quarantined_ontology",
+    }
+    _PLATFORM_ADMIN_TOOLS = {
         "execute_readonly_opencypher",
     }
 
@@ -374,7 +376,9 @@ class KGFabricMcpServer:
         args = dict(arguments or {})
         principal = get_current_principal()
         if principal is not None:
-            if tool_name in self._ADMIN_TOOLS:
+            if tool_name in self._PLATFORM_ADMIN_TOOLS:
+                self._enforcer.require_platform_admin(principal)
+            elif tool_name in self._ADMIN_TOOLS:
                 self._enforcer.require_role(principal, "admin")
             elif tool_name in self._WRITER_TOOLS:
                 self._enforcer.require_role(principal, "writer")
