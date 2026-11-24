@@ -57,6 +57,8 @@ On a messy multi-division audit query (*"If VIP customer `Acme-Global-Bank` esca
 
 ## 2. Architecture Overview
 
+> **Interactive Design & Architecture Explorer**: Open [`docs/design_and_architecture.html`](./docs/design_and_architecture.html) in any browser for a self-contained visual walkthrough of the 6-stage pipeline, SVG data-flow topology, Adaptive 4-Path Query Router simulator, Multi-Tenant Security & Concurrency matrix, and full Postgres/Neo4j schema & 15-tool MCP catalog.
+
 ```text
 +---------------------------------------------------------------------------------------+
 | 1. MULTI-KB FEDERATION & LLAMAINDEX RAW DOCUMENT INGESTION                            |

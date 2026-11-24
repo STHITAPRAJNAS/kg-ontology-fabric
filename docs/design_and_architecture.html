@@ -1,0 +1,646 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Enterprise Multi-KB Ontology &amp; Knowledge Graph Fabric — Design &amp; Architecture</title>
+  <style>
+    :root, [data-theme="dark"] {
+      --bg: #0b1120;
+      --bg-elev: #111827;
+      --card: #162033;
+      --card-hover: #1d2a42;
+      --border: #283652;
+      --text: #e5edf8;
+      --muted: #93a4bf;
+      --code-bg: #080d1a;
+      --accent: #38bdf8;
+      --accent-soft: rgba(56, 189, 248, 0.14);
+      --indigo: #818cf8;
+      --emerald: #34d399;
+      --amber: #fbbf24;
+      --rose: #fb7185;
+      --violet: #c084fc;
+      --shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+    }
+    [data-theme="light"] {
+      --bg: #f8fafc;
+      --bg-elev: #ffffff;
+      --card: #ffffff;
+      --card-hover: #f1f5f9;
+      --border: #cbd5e1;
+      --text: #0f172a;
+      --muted: #475569;
+      --code-bg: #0f172a;
+      --accent: #0284c7;
+      --accent-soft: rgba(2, 132, 199, 0.10);
+      --indigo: #4f46e5;
+      --emerald: #059669;
+      --amber: #d97706;
+      --rose: #e11d48;
+      --violet: #7c3aed;
+      --shadow: 0 8px 24px rgba(15, 23, 42, 0.08);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.55;
+    }
+    .wrap { max-width: 1260px; margin: 0 auto; padding: 28px 24px 64px; }
+    header {
+      display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-start;
+      gap: 16px; padding-bottom: 22px; border-bottom: 1px solid var(--border);
+    }
+    .eyebrow {
+      display: inline-flex; align-items: center; gap: 8px;
+      font-size: 12px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
+      color: var(--accent); background: var(--accent-soft);
+      padding: 4px 10px; border-radius: 999px; margin-bottom: 8px;
+    }
+    h1 { margin: 0 0 8px; font-size: 28px; letter-spacing: -0.02em; }
+    .subtitle { margin: 0; color: var(--muted); max-width: 820px; font-size: 15px; }
+    .btn {
+      background: var(--card); color: var(--text); border: 1px solid var(--border);
+      padding: 8px 14px; border-radius: 8px; cursor: pointer; font-size: 13px; font-weight: 600;
+      transition: all 0.15s ease;
+    }
+    .btn:hover { border-color: var(--accent); background: var(--card-hover); }
+    .stats-bar {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(175px, 1fr));
+      gap: 12px; margin: 22px 0 26px;
+    }
+    .stat {
+      background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+      padding: 14px 16px; box-shadow: var(--shadow);
+    }
+    .stat .k { font-size: 22px; font-weight: 800; color: var(--accent); }
+    .stat .l { font-size: 12px; color: var(--muted); margin-top: 2px; }
+    .tabs {
+      display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 22px;
+      border-bottom: 1px solid var(--border); padding-bottom: 12px;
+    }
+    .tab-btn {
+      background: transparent; color: var(--muted); border: 1px solid transparent;
+      padding: 9px 16px; border-radius: 8px; cursor: pointer; font-size: 14px; font-weight: 600;
+    }
+    .tab-btn:hover { color: var(--text); background: var(--card); }
+    .tab-btn.active {
+      color: var(--accent); background: var(--accent-soft); border-color: var(--accent);
+    }
+    .panel { display: none; }
+    .panel.active { display: block; }
+    .card {
+      background: var(--card); border: 1px solid var(--border); border-radius: 14px;
+      padding: 20px; box-shadow: var(--shadow); margin-bottom: 18px;
+    }
+    .card h2 { margin: 0 0 8px; font-size: 19px; }
+    .card h3 { margin: 0 0 8px; font-size: 16px; color: var(--accent); }
+    .muted { color: var(--muted); font-size: 14px; }
+    .grid-2 { display: grid; grid-template-columns: 1.35fr 1fr; gap: 18px; align-items: start; }
+    .grid-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); gap: 16px; }
+    @media (max-width: 960px) { .grid-2 { grid-template-columns: 1fr; } }
+
+    /* Interactive Architecture Nodes */
+    .arch-flow { display: flex; flex-direction: column; gap: 10px; }
+    .stage-node {
+      border: 1px solid var(--border); border-radius: 12px; padding: 13px 16px;
+      background: var(--bg-elev); cursor: pointer; transition: all 0.16s ease;
+      display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    }
+    .stage-node:hover { border-color: var(--accent); transform: translateX(3px); }
+    .stage-node.selected {
+      border-color: var(--accent); background: var(--accent-soft);
+      box-shadow: 0 0 0 1px var(--accent);
+    }
+    .stage-num {
+      width: 30px; height: 30px; border-radius: 8px; display: inline-flex;
+      align-items: center; justify-content: center; font-weight: 800; font-size: 13px;
+      background: var(--card); border: 1px solid var(--border); color: var(--accent); flex-shrink: 0;
+    }
+    .stage-title { font-weight: 700; font-size: 14px; }
+    .stage-sub { font-size: 12px; color: var(--muted); }
+    .arrow-down { text-align: center; color: var(--muted); font-size: 14px; line-height: 1; user-select: none; }
+    .badge {
+      display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px;
+      font-weight: 700; border: 1px solid var(--border); background: var(--bg-elev); color: var(--muted);
+    }
+    .badge.ok { color: var(--emerald); border-color: var(--emerald); }
+    .badge.warn { color: var(--amber); border-color: var(--amber); }
+    .badge.sec { color: var(--rose); border-color: var(--rose); }
+    .badge.info { color: var(--indigo); border-color: var(--indigo); }
+
+    code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    code {
+      font-size: 12px; padding: 2px 6px; border-radius: 5px;
+      background: rgba(148, 163, 184, 0.15); color: var(--accent);
+    }
+    pre {
+      background: var(--code-bg); color: #e2e8f0; padding: 14px; border-radius: 10px;
+      overflow-x: auto; font-size: 12.5px; line-height: 1.5; border: 1px solid var(--border); margin: 10px 0 0;
+    }
+    ul.clean { margin: 8px 0 0; padding-left: 18px; }
+    ul.clean li { margin-bottom: 6px; font-size: 13.5px; }
+
+    /* Query Simulator */
+    .sim-presets { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0 16px; }
+    .preset-btn {
+      background: var(--bg-elev); color: var(--text); border: 1px solid var(--border);
+      padding: 8px 12px; border-radius: 8px; cursor: pointer; font-size: 12.5px; font-weight: 600;
+    }
+    .preset-btn.active { border-color: var(--emerald); background: rgba(52, 211, 153, 0.12); color: var(--emerald); }
+    .route-lanes { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin-top: 14px; }
+    .lane {
+      border: 1px solid var(--border); border-radius: 10px; padding: 12px; background: var(--bg-elev);
+      opacity: 0.42; transition: all 0.2s ease;
+    }
+    .lane.lit { opacity: 1; border-color: var(--emerald); box-shadow: 0 0 0 1px var(--emerald); }
+    .lane h4 { margin: 0 0 4px; font-size: 13.5px; }
+    .lane p { margin: 0; font-size: 12px; color: var(--muted); }
+
+    table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 8px; }
+    th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+    th { color: var(--muted); font-weight: 700; font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div>
+        <div class="eyebrow">System Design &amp; Interactive Architecture Guide · v0.3.0</div>
+        <h1>Enterprise Multi-KB Ontology &amp; Knowledge Graph Fabric</h1>
+        <p class="subtitle">
+          Non-invasive semantic governance and multi-hop GraphRAG overlay unifying 100s of heterogeneous
+          <code>pgvector</code> knowledge bases (<code>384d–1536d</code>) and multimodal documents into a
+          W3C OWL 2 / SHACL Ontology (TBox) and Bi-Temporal Property Graph (ABox) over PostgreSQL 16 RLS + Neo4j 5 / AWS Neptune.
+        </p>
+      </div>
+      <button class="btn" onclick="toggleTheme()" id="themeBtn">Switch to Light Theme</button>
+    </header>
+
+    <div class="stats-bar">
+      <div class="stat"><div class="k">4-Path + Leiden</div><div class="l">Adaptive Hybrid GraphRAG Router</div></div>
+      <div class="stat"><div class="k">7 RLS Tables</div><div class="l">Fail-Closed <code>NOBYPASSRLS</code> Postgres 16</div></div>
+      <div class="stat"><div class="k">15 MCP Tools</div><div class="l">100% HTTP <code>/mcp</code> &amp; <code>stdio</code> Parity</div></div>
+      <div class="stat"><div class="k">85–98% Lower</div><div class="l">Ontology Induction Cost via Centroid Sampling</div></div>
+      <div class="stat"><div class="k">0 Full Scans</div><div class="l">Indexed Entities, Ego-PPR &amp; Cached Communities</div></div>
+    </div>
+
+    <nav class="tabs">
+      <button class="tab-btn active" onclick="openTab('tab-flow', this)">1. End-to-End Architecture Flow</button>
+      <button class="tab-btn" onclick="openTab('tab-router', this)">2. Adaptive 4-Path Query Simulator</button>
+      <button class="tab-btn" onclick="openTab('tab-security', this)">3. Multi-Tenant Security &amp; Concurrency</button>
+      <button class="tab-btn" onclick="openTab('tab-catalog', this)">4. Storage Schemas, REST &amp; 15 MCP Tools</button>
+    </nav>
+
+    <!-- TAB 1: END-TO-END ARCHITECTURE FLOW -->
+    <section id="tab-flow" class="panel active">
+      <div class="grid-2">
+        <div class="card">
+          <h2>Interactive 6-Stage Pipeline (Click Any Stage)</h2>
+          <p class="muted" style="margin-top:0;">Select a stage below to inspect its internal classes, data flow, and safety invariants.</p>
+
+          <div class="arch-flow">
+            <div class="stage-node selected" onclick="selectStage(0, this)">
+              <div style="display:flex;align-items:center;gap:12px;">
+                <span class="stage-num">1</span>
+                <div>
+                  <div class="stage-title">Siloed Sources, Allowlisted Legacy KBs &amp; PII Redaction</div>
+                  <div class="stage-sub">Raw Docs · Docling/Markdown Tables · Multi-DB <code>pgvector</code> Overlay · Presidio HMAC/Tag</div>
+                </div>
+              </div>
+              <span class="badge sec">PII + Allowlist</span>
+            </div>
+            <div class="arrow-down">▼</div>
+
+            <div class="stage-node" onclick="selectStage(1, this)">
+              <div style="display:flex;align-items:center;gap:12px;">
+                <span class="stage-num">2</span>
+                <div>
+                  <div class="stage-title">Sub-Linear Ontology Induction &amp; Steward Governance (TBox)</div>
+                  <div class="stage-sub">K-Means++ Centroids · Two-Bucket Quarantine · Per-Concept Approve/Reject/Merge · OWL/SHACL</div>
+                </div>
+              </div>
+              <span class="badge info">W3C OWL/SHACL</span>
+            </div>
+            <div class="arrow-down">▼</div>
+
+            <div class="stage-node" onclick="selectStage(2, this)">
+              <div style="display:flex;align-items:center;gap:12px;">
+                <span class="stage-num">3</span>
+                <div>
+                  <div class="stage-title">Concurrent Delta Extraction, Entity Resolution &amp; Bi-Temporal ABox</div>
+                  <div class="stage-sub">SHA-256 Watermarks · Semaphore LLM Batch · SiblingCollisionGuard · Post-Extract Retraction</div>
+                </div>
+              </div>
+              <span class="badge ok">DLQ Isolated</span>
+            </div>
+            <div class="arrow-down">▼</div>
+
+            <div class="stage-node" onclick="selectStage(3, this)">
+              <div style="display:flex;align-items:center;gap:12px;">
+                <span class="stage-num">4</span>
+                <div>
+                  <div class="stage-title">Dual Storage Kernel (PostgreSQL 16 <code>pgvector</code> + Neo4j 5 / Neptune)</div>
+                  <div class="stage-sub">7 <code>NOBYPASSRLS</code> Tables · Composite Entity PK · Partial Unique Job Lease · Bolt / SigV4</div>
+                </div>
+              </div>
+              <span class="badge sec">Kernel RLS</span>
+            </div>
+            <div class="arrow-down">▼</div>
+
+            <div class="stage-node" onclick="selectStage(4, this)">
+              <div style="display:flex;align-items:center;gap:12px;">
+                <span class="stage-num">5</span>
+                <div>
+                  <div class="stage-title">Zero-Full-Scan Adaptive 4-Path Hybrid GraphRAG Engine</div>
+                  <div class="stage-sub">Native + Canonical HNSW · BM25 · Ego-Graph HippoRAG 2 PPR · Safe Cypher Plan · Cached Leiden</div>
+                </div>
+              </div>
+              <span class="badge ok">O(k) Query Scale</span>
+            </div>
+            <div class="arrow-down">▼</div>
+
+            <div class="stage-node" onclick="selectStage(5, this)">
+              <div style="display:flex;align-items:center;gap:12px;">
+                <span class="stage-num">6</span>
+                <div>
+                  <div class="stage-title">Co-Hosted FastAPI REST, 15-Tool MCP, Quality Scorecard &amp; Console</div>
+                  <div class="stage-sub">JWT/JWKS/API-Key/BYOA · Platform vs Tenant Admin · 0–100 Quality Auditor · Writable <code>/ui</code></div>
+                </div>
+              </div>
+              <span class="badge info">REST + MCP</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="card" id="stage-inspector">
+          <!-- Populated dynamically by JS -->
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>End-to-End Architectural Topology (Visual Data Flow)</h2>
+        <svg viewBox="0 0 1120 300" width="100%" style="max-height:300px;display:block;margin-top:8px;">
+          <defs>
+            <marker id="arr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M 0 1 L 10 5 L 0 9 z" fill="#38bdf8" />
+            </marker>
+          </defs>
+          <!-- Column 1: Sources -->
+          <rect x="14" y="24" width="200" height="74" rx="10" fill="#111827" stroke="#38bdf8" stroke-width="1.5"/>
+          <text x="114" y="50" fill="#e5edf8" font-size="13" font-weight="700" text-anchor="middle">100s Legacy pgvector KBs</text>
+          <text x="114" y="70" fill="#93a4bf" font-size="11" text-anchor="middle">384d / 768d / 1024d / 1536d</text>
+          <text x="114" y="86" fill="#34d399" font-size="10" text-anchor="middle">Allowlisted + Multi-DB DSN Aliases</text>
+
+          <rect x="14" y="120" width="200" height="74" rx="10" fill="#111827" stroke="#818cf8" stroke-width="1.5"/>
+          <text x="114" y="146" fill="#e5edf8" font-size="13" font-weight="700" text-anchor="middle">Raw &amp; Multimodal Docs</text>
+          <text x="114" y="166" fill="#93a4bf" font-size="11" text-anchor="middle">PDF / DOCX / MD Tables / CSV</text>
+          <text x="114" y="182" fill="#fbbf24" font-size="10" text-anchor="middle">Presidio Scrub (Tag / HMAC)</text>
+
+          <!-- Column 2: Induction + Extraction -->
+          <rect x="264" y="24" width="230" height="74" rx="10" fill="#111827" stroke="#c084fc" stroke-width="1.5"/>
+          <text x="379" y="48" fill="#e5edf8" font-size="13" font-weight="700" text-anchor="middle">Ontology Inducer (TBox)</text>
+          <text x="379" y="67" fill="#93a4bf" font-size="11" text-anchor="middle">Centroid Sampler + OWL/SHACL</text>
+          <text x="379" y="84" fill="#c084fc" font-size="10" text-anchor="middle">Approve / Reject / Merge + Audit</text>
+
+          <rect x="264" y="120" width="230" height="90" rx="10" fill="#111827" stroke="#34d399" stroke-width="1.5"/>
+          <text x="379" y="145" fill="#e5edf8" font-size="13" font-weight="700" text-anchor="middle">Concurrent KG Builder (ABox)</text>
+          <text x="379" y="164" fill="#93a4bf" font-size="11" text-anchor="middle">SHA-256 CDC + Semaphore Batch</text>
+          <text x="379" y="181" fill="#93a4bf" font-size="11" text-anchor="middle">SiblingGuard + Bi-Temporal Edges</text>
+          <text x="379" y="198" fill="#34d399" font-size="10" text-anchor="middle">Post-Extract Retract + DLQ</text>
+
+          <!-- Column 3: Dual Stores -->
+          <rect x="548" y="24" width="245" height="86" rx="10" fill="#111827" stroke="#38bdf8" stroke-width="1.5"/>
+          <text x="670" y="48" fill="#38bdf8" font-size="13" font-weight="700" text-anchor="middle">PostgreSQL 16 + pgvector</text>
+          <text x="670" y="67" fill="#e5edf8" font-size="11" text-anchor="middle">7 NOBYPASSRLS Tenant Tables</text>
+          <text x="670" y="84" fill="#93a4bf" font-size="10.5" text-anchor="middle">HNSW + GIN BM25 + Communities</text>
+          <text x="670" y="100" fill="#fb7185" font-size="10" text-anchor="middle">Partial Unique Job Lease + Heartbeat</text>
+
+          <rect x="548" y="128" width="245" height="86" rx="10" fill="#111827" stroke="#34d399" stroke-width="1.5"/>
+          <text x="670" y="152" fill="#34d399" font-size="13" font-weight="700" text-anchor="middle">Neo4j 5 / AWS Neptune</text>
+          <text x="670" y="171" fill="#e5edf8" font-size="11" text-anchor="middle">:Entity (TEXT INDEX) + :KG_RELATION</text>
+          <text x="670" y="188" fill="#93a4bf" font-size="10.5" text-anchor="middle">Bi-Temporal t_valid/t_invalid + Qualifiers</text>
+          <text x="670" y="204" fill="#fbbf24" font-size="10" text-anchor="middle">ABAC acl_groups Before LIMIT</text>
+
+          <!-- Column 4: Serving & Agents -->
+          <rect x="846" y="24" width="258" height="190" rx="12" fill="#111827" stroke="#fbbf24" stroke-width="1.6"/>
+          <text x="975" y="50" fill="#fbbf24" font-size="13.5" font-weight="700" text-anchor="middle">Adaptive 4-Path GraphRAG</text>
+          <text x="975" y="72" fill="#e5edf8" font-size="11" text-anchor="middle">1. Native + Canonical Vector RRF</text>
+          <text x="975" y="90" fill="#e5edf8" font-size="11" text-anchor="middle">2. GIN BM25 + Cross-Encoder Rerank</text>
+          <text x="975" y="108" fill="#e5edf8" font-size="11" text-anchor="middle">3. Ego-Graph HippoRAG 2 PPR</text>
+          <text x="975" y="126" fill="#e5edf8" font-size="11" text-anchor="middle">4. Safe JSON-Plan OpenCypher</text>
+          <text x="975" y="144" fill="#c084fc" font-size="11" text-anchor="middle">+ Cached Leiden Global Communities</text>
+          <line x1="866" y1="158" x2="1084" y2="158" stroke="#283652" />
+          <text x="975" y="178" fill="#38bdf8" font-size="11.5" font-weight="700" text-anchor="middle">FastAPI REST · 15 MCP Tools · /ui</text>
+          <text x="975" y="196" fill="#93a4bf" font-size="10.5" text-anchor="middle">ADK · LangGraph · Claude · Cursor</text>
+
+          <!-- Bottom Bar: Quality & Governance -->
+          <rect x="14" y="238" width="1090" height="44" rx="10" fill="#162033" stroke="#283652"/>
+          <text x="559" y="265" fill="#e5edf8" font-size="12" font-weight="600" text-anchor="middle">
+            Continuous Governance Loop:  Answerability Pre-Flight (/v1/rag/check-answerable)  ·  4-Dimension KG Quality Auditor (/v1/quality/report 0–100)  ·  Eval Lift Harness (/v1/eval/run)
+          </text>
+
+          <!-- Connectors -->
+          <line x1="214" y1="61" x2="260" y2="61" stroke="#38bdf8" stroke-width="1.6" marker-end="url(#arr)"/>
+          <line x1="214" y1="157" x2="260" y2="157" stroke="#38bdf8" stroke-width="1.6" marker-end="url(#arr)"/>
+          <line x1="379" y1="98" x2="379" y2="116" stroke="#38bdf8" stroke-width="1.6" marker-end="url(#arr)"/>
+          <line x1="494" y1="61" x2="544" y2="61" stroke="#38bdf8" stroke-width="1.6" marker-end="url(#arr)"/>
+          <line x1="494" y1="165" x2="544" y2="165" stroke="#38bdf8" stroke-width="1.6" marker-end="url(#arr)"/>
+          <line x1="793" y1="67" x2="842" y2="85" stroke="#38bdf8" stroke-width="1.6" marker-end="url(#arr)"/>
+          <line x1="793" y1="171" x2="842" y2="145" stroke="#38bdf8" stroke-width="1.6" marker-end="url(#arr)"/>
+        </svg>
+      </div>
+    </section>
+
+    <!-- TAB 2: ADAPTIVE 4-PATH QUERY SIMULATOR -->
+    <section id="tab-router" class="panel">
+      <div class="card">
+        <h2>Interactive Adaptive Query Router Simulator (<code>AdaptiveQueryRouter</code>)</h2>
+        <p class="muted" style="margin-top:0;">
+          Every query runs in <strong>O(k)</strong> without loading the full tenant graph. Click a realistic enterprise query below to trace which retrieval paths activate and how ABAC + bi-temporal rules filter the result.
+        </p>
+
+        <div class="sim-presets">
+          <button class="preset-btn active" onclick="runSim(0, this)">Multi-Hop Blast Radius (Local PPR + Safe Cypher)</button>
+          <button class="preset-btn" onclick="runSim(1, this)">Point-in-Time Historical Audit (<code>as_of_iso</code>)</button>
+          <button class="preset-btn" onclick="runSim(2, this)">Global Estate Sensemaking (Persisted Leiden)</button>
+          <button class="preset-btn" onclick="runSim(3, this)">Simple Factual Snippet Lookup (Fast Vector)</button>
+        </div>
+
+        <div id="sim-header" class="card" style="background:var(--bg-elev);margin-bottom:12px;"></div>
+
+        <div class="route-lanes">
+          <div class="lane" id="lane-vec">
+            <h4>Path 1 &amp; 2: Hybrid Vector + BM25 RRF</h4>
+            <p>Queries <code>unified_rag_chunks</code> (canonical HNSW + <code>tsvector</code> GIN) + native-dim allowlisted legacy tables, then Cross-Encoder reranks.</p>
+          </div>
+          <div class="lane" id="lane-ppr">
+            <h4>Path 3: Indexed Seeds + Bounded Ego-PPR</h4>
+            <p>Finds seeds via Neo4j <code>TEXT INDEX</code> (ABAC before <code>LIMIT</code>) + <code>pgvector</code> HNSW, expands 2–3 hop ego-subgraph, applies HippoRAG 2 inverse-degree hub damping.</p>
+          </div>
+          <div class="lane" id="lane-cypher">
+            <h4>Path 4: Safe Template OpenCypher</h4>
+            <p>Compiles TBox-validated <code>{predicate, entity_hint}</code> into hardcoded <code>{tenant_id: $tenant_id}</code> Cypher + fail-closed <code>(source, predicate, target)</code> ABAC filter.</p>
+          </div>
+          <div class="lane" id="lane-global">
+            <h4>Global Route: Cached Leiden Communities</h4>
+            <p>Reads build-time <code>kg_community_summaries</code> in O(C), strips restricted member entities per caller <code>acl_groups</code>, and ranks thematic clusters.</p>
+          </div>
+        </div>
+
+        <pre id="sim-trace"></pre>
+      </div>
+    </section>
+
+    <!-- TAB 3: MULTI-TENANT SECURITY & CONCURRENCY -->
+    <section id="tab-security" class="panel">
+      <div class="grid-3">
+        <div class="card">
+          <h3>1. Identity, JWKS &amp; Role Separation</h3>
+          <ul class="clean">
+            <li><strong>Auth Modes</strong>: <code>jwt</code> (HS256 &ge; 32-byte secret, or non-blocking <code>to_thread</code> OIDC/JWKS RS256/ES256 requiring <code>iss</code> + <code>aud</code>), <code>api_key</code>, and <code>custom</code> BYOA gateway hooks.</li>
+            <li><strong>Platform Admin vs Tenant Admin</strong>: <code>is_platform_admin</code> requires <code>admin</code> role with unscoped/<code>*</code> tenant. Tenant-bound admins get <code>403</code> on raw OpenCypher, legacy physical table registration, and cross-tenant DLQ/metrics.</li>
+            <li><strong>Zero Unprivileged LLM Spend</strong>: Plain <code>reader</code>s get <code>403</code> on <code>use_llm_judge=true</code> and <code>synthesize_with_llm=true</code>, trigger <code>0</code> LLM calls per query, and receive redacted physical DB names on <code>GET /v1/kbs</code>.</li>
+          </ul>
+        </div>
+
+        <div class="card">
+          <h3>2. Kernel RLS, ABAC &amp; Legacy Table Guard</h3>
+          <ul class="clean">
+            <li><strong>PostgreSQL 16 <code>NOBYPASSRLS</code></strong>: All 7 multi-tenant tables enforce fail-closed RLS via transaction-local <code>SET LOCAL app.current_tenant_id</code>.</li>
+            <li><strong>Cross-Tenant Overwrite &amp; PK Isolation</strong>: Tenant-scoped <code>chunk_id</code> + composite <code>PRIMARY KEY (tenant_id, entity_id)</code> on <code>canonical_entity_embeddings</code> block collisions even under DB superuser.</li>
+            <li><strong>Fail-Closed Legacy Tables</strong>: <code>validate_legacy_table_access</code> denies <code>pg_catalog</code>, <code>information_schema</code>, and internal tables; requires <code>KG_FABRIC_ALLOWED_LEGACY_TABLES</code> + <code>platform_admin</code>; and blocks re-pointing existing legacy KBs via <code>source_type</code> mutation.</li>
+            <li><strong>Dynamic ABAC Narrowing</strong>: Document/KB deletes prune Neo4j/Neptune provenance AND recompute surviving entity/edge <code>acl_groups</code> from remaining chunks.</li>
+          </ul>
+        </div>
+
+        <div class="card">
+          <h3>3. Multi-Replica Concurrency &amp; Fault Tolerance</h3>
+          <ul class="clean">
+            <li><strong>Atomic 1-Job-Per-Tenant</strong>: Enforced across concurrent requests and pods via Postgres partial unique index <code>uq_kg_sync_jobs_active_tenant WHERE status IN ('QUEUED','RUNNING')</code> + <code>_job_submit_lock</code> (burst of 5 submits &rarr; <code>1x 202</code> + <code>4x 409</code>).</li>
+            <li><strong>Distributed Heartbeat Leases</strong>: Active workers pulse <code>heartbeat_at</code>; sibling replicas see live <code>RUNNING</code> jobs without false <code>FAILED</code> flips, while genuinely dead jobs auto-expire after <code>job_stale_timeout_sec</code>.</li>
+            <li><strong><code>0ms</code> Immediate Cancel &amp; Safe Retract</strong>: Cancelling right after submit immediately transitions to <code>CANCELLED</code>; modified chunks retract old facts <em>only after</em> new extraction succeeds so DLQ failures never drop live facts.</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 4: SCHEMAS, REST & 15 MCP TOOLS -->
+    <section id="tab-catalog" class="panel">
+      <div class="card">
+        <h2>PostgreSQL 16 (<code>pgvector</code>) &amp; Neo4j 5 / Neptune Storage Layout</h2>
+        <table>
+          <thead>
+            <tr><th>Store / Table</th><th>Primary Key / Index</th><th>Purpose &amp; Isolation Mechanism</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>kb_federation_registry</code></td><td><code>PK (kb_id)</code> + RLS</td><td>Registered managed &amp; allowlisted legacy KBs, DSN aliases, column mappings, vector dims.</td></tr>
+            <tr><td><code>kb_ingestion_watermarks</code></td><td><code>PK (kb_id, chunk_id)</code></td><td>SHA-256 chunk hashes + TBox version + <code>__legacy_cursor__</code> timestamp watermarks.</td></tr>
+            <tr><td><code>unified_rag_chunks</code></td><td><code>PK (chunk_id)</code> · HNSW + GIN <code>tsv</code> + GIN <code>acl_groups</code> + RLS</td><td>Scrubbed chunks, canonical embeddings, lexical search vectors, and document ABAC groups.</td></tr>
+            <tr><td><code>canonical_entity_embeddings</code></td><td><code>PK (tenant_id, entity_id)</code> · HNSW + RLS</td><td>Tenant-isolated canonical entity embeddings for fast semantic seed resolution.</td></tr>
+            <tr><td><code>enterprise_tbox_registry</code></td><td><code>PK (tenant_id)</code> + RLS</td><td>Compiled TBox classes, relations, synonym maps, and immutable <code>OntologyAuditEntry</code> trail.</td></tr>
+            <tr><td><code>kg_sync_jobs</code> &amp; <code>kg_dlq_chunks</code></td><td><code>PK (job_id)</code> + Partial Unique Active Tenant Index + RLS</td><td>Async <code>202</code> build jobs with <code>heartbeat_at</code> leases and per-chunk poison-pill DLQ records.</td></tr>
+            <tr><td><code>kg_community_summaries</code></td><td><code>PK (tenant_id, community_id)</code> + RLS</td><td>Build-time Leiden/Louvain community summaries with per-entity ACL metadata for O(C) global search.</td></tr>
+            <tr><td>Neo4j 5 / Neptune Graph</td><td><code>:Entity(tenant_id, entity_id)</code> + <code>TEXT INDEX canonical_name</code></td><td><code>:OntologyClass</code>, <code>:OntologyRelation</code>, <code>:Entity</code>, and bi-temporal <code>:KG_RELATION</code> with N-ary <code>qualifiers</code>.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="grid-2">
+        <div class="card">
+          <h2>Key FastAPI REST Endpoints</h2>
+          <table>
+            <thead><tr><th>Method &amp; Path</th><th>Role</th><th>Description</th></tr></thead>
+            <tbody>
+              <tr><td><code>POST /v1/kbs/register</code> · <code>GET /v1/kbs</code></td><td>writer / reader</td><td>Register KBs (legacy requires <code>platform_admin</code>) or list paginated KBs (DB internals redacted for readers).</td></tr>
+              <tr><td><code>POST /v1/documents/ingest</code> · <code>GET /v1/kbs/{kb}/documents</code></td><td>writer / reader</td><td>Ingest raw/Markdown-table docs with Presidio redaction; list ACL-visible documents.</td></tr>
+              <tr><td><code>POST /v1/ontology/induce</code> · <code>POST /v1/ontology/review</code></td><td>writer / admin</td><td>Induce TBox via centroid sampling; per-concept <code>approve</code> / <code>reject</code> / <code>merge</code> + <code>GET /v1/ontology/audit</code>.</td></tr>
+              <tr><td><code>POST /v1/jobs/build</code> · <code>POST /v1/jobs/{id}/cancel</code></td><td>writer</td><td>Async <code>202</code> build job (1 active per tenant via Postgres partial unique index + heartbeat) &amp; instant cancel.</td></tr>
+              <tr><td><code>POST /v1/rag/query</code> · <code>POST /v1/rag/check-answerable</code></td><td>reader</td><td>Adaptive 4-Path Hybrid GraphRAG (opt-in writer <code>synthesize_with_llm</code>) &amp; pre-flight coverage check.</td></tr>
+              <tr><td><code>POST /v1/search/ppr</code> · <code>POST /v1/search/global</code> · <code>GET /v1/entities/{id}</code></td><td>reader</td><td>Bounded ego-graph HippoRAG 2 PPR, cached Leiden global search, and ABAC-scoped entity details.</td></tr>
+              <tr><td><code>GET /v1/quality/report</code> · <code>POST /v1/eval/run</code></td><td>reader</td><td>4-dimension <code>0–100</code> KG/Ontology Quality Scorecard &amp; Vector-vs-GraphRAG recall lift harness.</td></tr>
+              <tr><td><code>DELETE /v1/documents/{kb}/{doc}</code> · <code>/v1/kbs/{kb}</code> · <code>/v1/tenants/{t}</code></td><td>writer / admin</td><td>Complete vector + graph provenance deletion, ACL narrowing, and zero-residue GDPR tenant purge.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="card">
+          <h2>15 MCP Tools (HTTP <code>/mcp</code> &amp; <code>kg-fabric mcp</code> stdio Parity)</h2>
+          <ul class="clean">
+            <li><code>query_hybrid_graph_rag</code> — One-shot 4-Path Adaptive Hybrid GraphRAG</li>
+            <li><code>check_answerable</code> — Pre-flight ontology &amp; ABAC coverage check</li>
+            <li><code>search_vector_chunks</code> — Multi-KB RRF dense + BM25 lexical search</li>
+            <li><code>search_kg_entities</code> — Indexed Neo4j + <code>pgvector</code> entity lookup</li>
+            <li><code>traverse_entity_subgraph</code> — Bi-temporal K-hop subgraph traversal (<code>as_of_iso</code>)</li>
+            <li><code>search_ppr_subgraph</code> — HippoRAG 2 hub-damped Personalized PageRank</li>
+            <li><code>query_global_communities</code> — Leiden/Louvain global sensemaking over cached communities</li>
+            <li><code>audit_kg_quality</code> — 4-dimension <code>0–100</code> ontology &amp; graph quality scorecard</li>
+            <li><code>register_vector_kbs</code> — Batch KB registration (<code>writer</code> / <code>platform_admin</code>)</li>
+            <li><code>ingest_raw_documents</code> — Hierarchical PII-scrubbed document ingestion (<code>writer</code>)</li>
+            <li><code>induce_and_align_ontology</code> — Sub-linear centroid ontology induction (<code>writer</code>)</li>
+            <li><code>build_or_update_knowledge_graph</code> — Incremental SHA-256 + concurrent LLM KG build (<code>writer</code>)</li>
+            <li><code>promote_quarantined_ontology</code> — Bulk confidence threshold promotion (<code>admin</code>)</li>
+            <li><code>review_ontology_concept</code> — Per-concept <code>approve</code> / <code>reject</code> / <code>merge</code> + audit trail (<code>admin</code>)</li>
+            <li><code>execute_readonly_opencypher</code> — Neo4j <code>READ_ACCESS</code> guarded Cypher (<code>platform_admin</code>)</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <script>
+    const STAGES = [
+      {
+        title: "Stage 1 — Siloed Sources, Allowlisted Legacy KBs & PII Redaction",
+        modules: "llama_index_bridge.py · multimodal_ingestor.py · pii_redaction.py · adapters/pgvector_store.py",
+        bullets: [
+          "<strong>Raw &amp; Multimodal Ingestion</strong>: Parses Markdown sections, PDFs/DOCX (IBM Docling when installed), and auto-extracts structured triples from embedded Markdown/CSV tables.",
+          "<strong>Configured PII Redaction Everywhere</strong>: Both <code>ingest_raw_documents</code> and <code>hydrate_existing_kb_chunks</code> route through <code>service.pii_redactor</code> (<code>REPLACE_TAG</code> or deterministic <code>HMAC_PSEUDONYMIZE</code> <code>&lt;EMAIL_ADDRESS_0cea5b8a&gt;</code>) while preserving cloud/CVE identifiers.",
+          "<strong>Fail-Closed Legacy Table Overlay</strong>: <code>validate_legacy_table_access</code> blocks SQL injection, <code>pg_catalog</code>, and internal tables; requires <code>KG_FABRIC_ALLOWED_LEGACY_TABLES</code> + <code>platform_admin</code>; supports cross-DB <code>KG_FABRIC_PG_DSN_ALIASES</code> and incremental <code>updated_at_column</code> cursors."
+        ],
+        code: "# Zero rip-and-replace overlay on existing team pgvector tables\nKG_FABRIC_ALLOWED_LEGACY_TABLES=public.legacy_*\nKG_FABRIC_PG_DSN_ALIASES='{\"finops_db\":\"postgresql://...\"}'"
+      },
+      {
+        title: "Stage 2 — Sub-Linear Ontology Induction & Steward Governance (TBox)",
+        modules: "vector_clustering.py · ontology_inducer.py · domain_packs.py · models.py",
+        bullets: [
+          "<strong>Sub-Linear Centroid Sampling</strong>: <code>SubLinearVectorCentroidSampler</code> selects K-Means++ medoids + high-entropy boundary outliers per KB, cutting LLM induction volume by 85–98% across 100s of KBs.",
+          "<strong>Hybrid Rule + Live LLM Induction</strong>: Combines pluggable <code>DomainRulePack</code>s (<code>cloud_sre</code>, <code>generic</code>, or custom SDK packs) with optional structured JSON LLM concept discovery when <code>KG_FABRIC_USE_LIVE_LLM=true</code>.",
+          "<strong>Two-Bucket Governance &amp; Per-Concept Review</strong>: Novel concepts land in <code>QUARANTINED_CANDIDATE</code>. Stewards run <code>POST /v1/ontology/review</code> (or <code>/ui</code>) to <code>approve</code>, <code>reject</code>, or <code>merge</code> individual classes/relations with an immutable <code>OntologyAuditEntry</code> trail and W3C OWL 2 / SHACL <code>.ttl</code> export."
+        ],
+        code: "POST /v1/ontology/review\n{\n  \"tenant_id\": \"acme\",\n  \"concept_kind\": \"CLASS\",\n  \"concept_name\": \"LegacyServiceDup\",\n  \"action\": \"merge\",\n  \"target_name\": \"CloudService\",\n  \"reason\": \"Consolidate duplicate class\"\n}"
+      },
+      {
+        title: "Stage 3 — Concurrent Delta Extraction, Entity Resolution & Bi-Temporal ABox",
+        modules: "llm_extractor.py · entity_resolution.py · service.py",
+        bullets: [
+          "<strong>Incremental SHA-256 Watermarks &amp; Concurrent Extraction</strong>: Unchanged chunks are skipped in O(1). Delta chunks run through <code>extract_batch_async</code> (<code>asyncio.Semaphore</code> + <code>asyncio.to_thread</code>) with Gemini, OpenAI, or AWS Bedrock.",
+          "<strong>Safe Post-Extraction Fact Retraction &amp; DLQ</strong>: Failed chunks go to <code>kg_dlq_chunks</code> without dropping their previously valid graph facts; succeeded modified chunks retract stale provenance via <code>delete_chunks_provenance</code> before upserting new facts.",
+          "<strong>SiblingCollisionGuard &amp; Bi-Temporal Edges</strong>: Prevents false merges across numeric/regional/env siblings (<code>payment-router-01</code> vs <code>-02</code>, <code>us-east-1</code> vs <code>us-west-2</code>). Functional predicates (<code>DEPLOYED_IN_PRIMARY</code>) automatically close superseded edges (<code>t_invalid</code>) while preserving time-travel history."
+        ],
+        code: "# Generated entity IDs are strictly tenant-scoped:\nent::<tenant_id>::<canonical_class>::<slug>\n# Bi-temporal functional superseding:\nold_edge.t_invalid = new_edge.t_valid  # Historical audit preserved!"
+      },
+      {
+        title: "Stage 4 — Dual Storage Kernel (PostgreSQL 16 pgvector + Neo4j 5 / Neptune)",
+        modules: "adapters/pgvector_store.py · adapters/graph_stores.py",
+        bullets: [
+          "<strong>7 Fail-Closed RLS PostgreSQL Tables</strong>: Provisioned with <code>kg-fabric migrate-db --app-role kg_app_user</code> (<code>NOBYPASSRLS</code>). Unscoped queries return 0 rows.",
+          "<strong>Distributed Job Coordination</strong>: Partial unique index <code>uq_kg_sync_jobs_active_tenant</code> guarantees at most 1 active build per tenant across concurrent requests and pods, paired with <code>heartbeat_at</code> leases and <code>0ms</code> cancellation.",
+          "<strong>Live Neo4j 5 &amp; Neptune OpenCypher</strong>: Composite <code>(tenant_id, entity_id)</code> + <code>TEXT INDEX</code> on <code>canonical_name</code>, batched <code>UNWIND</code> edge upserts, N-ary <code>qualifiers_json</code>, and ABAC <code>acl_groups</code> narrowing on document deletion."
+        ],
+        code: "CREATE UNIQUE INDEX uq_kg_sync_jobs_active_tenant\n  ON kg_sync_jobs (tenant_id)\n  WHERE status IN ('QUEUED', 'RUNNING');"
+      },
+      {
+        title: "Stage 5 — Zero-Full-Scan Adaptive 4-Path Hybrid GraphRAG Engine",
+        modules: "adaptive_router.py · rag_engine.py · graph_analytics.py",
+        bullets: [
+          "<strong>Zero Full-Graph Loads Per Query</strong>: All 5 query primitives avoid <code>get_all_entities()</code> / <code>get_all_edges()</code> — using Neo4j indexed search (with ABAC pushed before <code>LIMIT</code>), <code>pgvector</code> HNSW entity search, bounded 2–3 hop ego-subgraphs, and build-time persisted <code>kg_community_summaries</code>.",
+          "<strong>HippoRAG 2 Inverse-Degree Hub Damping</strong>: Dampens generic super-hubs (e.g., <code>SOC2-Type-II</code> connected to 100s of leaves) so specific operational dependencies rank first.",
+          "<strong>Injection-Proof Path 4 OpenCypher</strong>: Never executes raw LLM-written Cypher — compiles TBox-validated JSON intent into hardcoded <code>{tenant_id: $tenant_id}</code> templates + fail-closed <code>(source, predicate, target)</code> ABAC verification."
+        ],
+        code: "# Env-selectable real embeddings in production:\nKG_FABRIC_EMBEDDING_PROVIDER=gemini   # hash | gemini | openai | bedrock | sentence_transformers"
+      },
+      {
+        title: "Stage 6 — Co-Hosted FastAPI REST, 15-Tool MCP, Quality Scorecard & Console",
+        modules: "api.py · mcp_server.py · quality_auditor.py · eval_harness.py · cli.py",
+        bullets: [
+          "<strong>One Process or Embedded SDK</strong>: Installable via <code>pip install -e .</code> (<code>kg-fabric serve</code> / <code>kg-fabric mcp</code>) or self-hosted via Docker Compose &amp; Amazon EKS manifests.",
+          "<strong>4-Dimension KG Quality Auditor (0–100 Grade)</strong>: Evaluates TBox SHACL &amp; utilization (25 pts), extraction provenance &amp; faithfulness (25 pts), entity resolution duplicate/sibling health (20 pts), and topology modularity &amp; cross-KB bridge coverage (30 pts).",
+          "<strong>Interactive Governance Console (<code>GET /ui</code>)</strong>: Inspect health, quality scorecards, tenant-scoped telemetry, jobs, DLQ, audit logs, and execute per-concept Approve / Reject / Merge actions."
+        ],
+        code: "kg-fabric serve --host 127.0.0.1 --port 8080\nkg-fabric mcp --transport stdio   # Full 15-tool parity with HTTP /mcp"
+      }
+    ];
+
+    const SIMS = [
+      {
+        query: "What compliance mandates and CVEs impact upstream databases connected to payment-router-01?",
+        route: "LOCAL_MULTIHOP_PPR",
+        lanes: ["lane-vec", "lane-ppr", "lane-cypher"],
+        trace: `1. AdaptiveQueryRouter -> LOCAL_MULTIHOP_PPR (multi-hop relational keywords + entity detected)
+2. Path 1 & 2 (pgvector): Hybrid HNSW + GIN BM25 + native legacy table RRF (filtered by caller_acl_groups) -> Cross-Encoder reranked
+3. Path 3 (Neo4j Index + Bounded Ego-PPR):
+   - search_entities_indexed('payment-router-01') [ABAC filter applied BEFORE LIMIT] -> ent::tenant_alpha::cloudservice::payment-router-01
+   - expand_k_hop_subgraph(max_hops=2) + fetch_ego_subgraph -> HippoRAG 2 inverse-degree hub damping penalizes noisy hubs
+   - Cross-KB Bridge detected: payment-router-01 -> aurora-ledger-01 -> [PCI-DSS-4.0, GDPR-Article-32] across 4 KBs
+4. Path 4 (Safe Template OpenCypher): TBox predicate GOVERNED_BY compiled into {tenant_id: $tenant_id} template + fail-closed ABAC row check`
+      },
+      {
+        query: "Where was payment-router-01 deployed and which cost center owned it on 2026-06-01?",
+        route: "LOCAL_MULTIHOP_PPR (Bi-Temporal Time-Travel as_of_iso='2026-06-01T00:00:00Z')",
+        lanes: ["lane-vec", "lane-ppr"],
+        trace: `1. AdaptiveQueryRouter -> LOCAL_MULTIHOP_PPR with point-in-time predicate:
+   edge.t_valid <= '2026-06-01T00:00:00Z' AND (edge.t_invalid == 'ACTIVE' OR edge.t_invalid > '2026-06-01T00:00:00Z')
+2. Active October failover edge (eu-central-1, CC-209-Global) is automatically EXCLUDED (t_valid > as_of_iso)
+3. Superseded historical functional edges (us-east-1, CC-104-Core) ARE RECALLED accurately from Neo4j!`
+      },
+      {
+        query: "Summarize the overall architecture themes and regulatory clusters across our entire enterprise estate.",
+        route: "GLOBAL_SENSEMAKING",
+        lanes: ["lane-global"],
+        trace: `1. AdaptiveQueryRouter -> GLOBAL_SENSEMAKING (corpus-wide thematic sensemaking intent)
+2. Loads build-time materialized summaries from PostgreSQL kg_community_summaries in O(C) (0 Neo4j full-graph scan!)
+3. GraphAnalyticsEngine.filter_communities_by_acl(caller_acl_groups):
+   - Strips restricted member entities (e.g., aurora-helios-merger-db for 'public' callers) and regenerates safe community summary text
+4. Ranks top-K Leiden/Louvain community summaries by query embedding cosine + cross-KB span bonus`
+      },
+      {
+        query: "Show runbook snippet for rotating debug tokens.",
+        route: "FACTUAL_VECTOR",
+        lanes: ["lane-vec"],
+        trace: `1. AdaptiveQueryRouter -> FACTUAL_VECTOR (direct single-hop document snippet lookup; skips graph traversal overhead)
+2. Executes PostgreSQL unified_rag_chunks HNSW + tsvector BM25 RRF + allowlisted native legacy table fan-out
+3. Scrubbed chunk returned (<BEARER_JWT_TOKEN> redacted at ingest) + Cross-Encoder reranked in single-digit milliseconds`
+      }
+    ];
+
+    function selectStage(idx, el) {
+      document.querySelectorAll('.stage-node').forEach(n => n.classList.remove('selected'));
+      if (el) el.classList.add('selected');
+      const s = STAGES[idx];
+      document.getElementById('stage-inspector').innerHTML = `
+        <div class="eyebrow">Stage ${idx + 1} Deep Dive</div>
+        <h2>${s.title}</h2>
+        <p class="muted" style="margin:4px 0 12px;"><strong>Modules:</strong> <code>${s.modules}</code></p>
+        <ul class="clean">${s.bullets.map(b => `<li>${b}</li>`).join('')}</ul>
+        <pre>${s.code}</pre>
+      `;
+    }
+
+    function runSim(idx, el) {
+      document.querySelectorAll('.preset-btn').forEach(b => b.classList.remove('active'));
+      if (el) el.classList.add('active');
+      const s = SIMS[idx];
+      document.getElementById('sim-header').innerHTML = `
+        <div style="font-size:13px;color:var(--muted);">Sample Query</div>
+        <div style="font-size:16px;font-weight:700;margin:2px 0 6px;">"${s.query}"</div>
+        <div><span class="badge ok">Route: ${s.route}</span></div>
+      `;
+      ['lane-vec', 'lane-ppr', 'lane-cypher', 'lane-global'].forEach(id => {
+        document.getElementById(id).classList.toggle('lit', s.lanes.includes(id));
+      });
+      document.getElementById('sim-trace').textContent = s.trace;
+    }
+
+    function openTab(id, btn) {
+      document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+      document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+      document.getElementById(id).classList.add('active');
+      btn.classList.add('active');
+    }
+
+    function toggleTheme() {
+      const root = document.documentElement;
+      const next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+      root.setAttribute('data-theme', next);
+      document.getElementById('themeBtn').textContent = next === 'dark' ? 'Switch to Light Theme' : 'Switch to Dark Theme';
+    }
+
+    selectStage(0);
+    runSim(0);
+  </script>
+</body>
+</html>
