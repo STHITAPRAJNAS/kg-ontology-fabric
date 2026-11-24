@@ -76,8 +76,9 @@ class PropertyGraphStorePort(ABC):
         tenant_id: str,
         chunk_ids: Sequence[str],
         kb_id: str | None = None,
+        remaining_chunk_acls: dict[str, list[str]] | None = None,
     ) -> tuple[list[str], int]:
-        """Removes deleted chunks/KB from graph provenance; deletes orphaned edges & entities."""
+        """Removes deleted chunks/KB from graph provenance; deletes orphaned edges & entities and narrows surviving ACLs."""
         return [], 0
 
     async def purge_tenant(self, tenant_id: str) -> int:
@@ -111,10 +112,19 @@ class InMemoryOpenCypherGraphEmulator(PropertyGraphStorePort):
         tenant_id: str,
         chunk_ids: Sequence[str],
         kb_id: str | None = None,
+        remaining_chunk_acls: dict[str, list[str]] | None = None,
     ) -> tuple[list[str], int]:
         chunk_set = set(chunk_ids)
         if not chunk_set and not kb_id:
             return [], 0
+
+        def _narrow_acls(rem_chunks: list[str], current_acls: list[str]) -> list[str]:
+            if remaining_chunk_acls is None:
+                return current_acls
+            recomputed = sorted(
+                {g for cid in rem_chunks for g in remaining_chunk_acls.get(cid, [])}
+            )
+            return recomputed if recomputed else current_acls
 
         edge_store = self._edges.get(tenant_id, {})
         edges_to_delete: list[str] = []
@@ -129,6 +139,8 @@ class InMemoryOpenCypherGraphEmulator(PropertyGraphStorePort):
                 edge.source_kb_ids = [k for k in edge.source_kb_ids if k != kb_id]
             if not edge.source_chunk_ids or (kb_id is not None and not edge.source_kb_ids):
                 edges_to_delete.append(eid)
+            else:
+                edge.acl_groups = _narrow_acls(edge.source_chunk_ids, edge.acl_groups)
         for eid in edges_to_delete:
             edge_store.pop(eid, None)
 
@@ -146,6 +158,8 @@ class InMemoryOpenCypherGraphEmulator(PropertyGraphStorePort):
             if not ent.source_chunk_ids or (kb_id is not None and not ent.source_kb_ids):
                 deleted_entity_ids.append(ent_id)
                 ent_store.pop(ent_id, None)
+            else:
+                ent.acl_groups = _narrow_acls(ent.source_chunk_ids, ent.acl_groups)
 
         if deleted_entity_ids:
             del_set = set(deleted_entity_ids)
@@ -853,6 +867,7 @@ class Neo4jOpenCypherGraphAdapter(PropertyGraphStorePort):
         tenant_id: str,
         chunk_ids: Sequence[str],
         kb_id: str | None = None,
+        remaining_chunk_acls: dict[str, list[str]] | None = None,
     ) -> tuple[list[str], int]:
         chunk_list = list(chunk_ids)
         if not chunk_list and not kb_id:
@@ -861,6 +876,7 @@ class Neo4jOpenCypherGraphAdapter(PropertyGraphStorePort):
         deleted_edges = 0
         deleted_entities: list[str] = []
         async with driver.session() as session:
+            # 1. Narrow & prune edges
             res_e = await session.run(
                 """
                 MATCH (s:Entity {tenant_id: $tenant_id})-[rel:KG_RELATION]->(t:Entity {tenant_id: $tenant_id})
@@ -872,19 +888,52 @@ class Neo4jOpenCypherGraphAdapter(PropertyGraphStorePort):
                         THEN [k IN coalesce(rel.source_kb_ids, []) WHERE k <> $kb_id]
                         ELSE coalesce(rel.source_kb_ids, [])
                     END
-                WITH rel
-                WHERE size(rel.source_chunk_ids) = 0 OR ($kb_id IS NOT NULL AND size(rel.source_kb_ids) = 0)
-                DELETE rel
-                RETURN count(rel) AS del_cnt
+                RETURN rel.edge_id AS edge_id,
+                       rel.source_chunk_ids AS rem_chunks,
+                       rel.source_kb_ids AS rem_kbs
                 """,
                 tenant_id=tenant_id,
                 chunk_ids=chunk_list,
                 kb_id=kb_id,
             )
-            rec_e = await res_e.single()
-            if rec_e and rec_e["del_cnt"] is not None:
-                deleted_edges = int(rec_e["del_cnt"])
+            edge_rows = await res_e.data()
+            del_edge_ids: list[str] = []
+            edge_acl_updates: list[dict[str, Any]] = []
+            for r in edge_rows:
+                rem_c = list(r.get("rem_chunks") or [])
+                rem_k = list(r.get("rem_kbs") or [])
+                eid = str(r["edge_id"])
+                if not rem_c or (kb_id is not None and not rem_k):
+                    del_edge_ids.append(eid)
+                elif remaining_chunk_acls is not None:
+                    narrowed = sorted(
+                        {g for cid in rem_c for g in remaining_chunk_acls.get(str(cid), [])}
+                    )
+                    if narrowed:
+                        edge_acl_updates.append({"edge_id": eid, "acl_groups": narrowed})
+            if del_edge_ids:
+                await session.run(
+                    """
+                    MATCH (s:Entity {tenant_id: $tenant_id})-[rel:KG_RELATION]->(t:Entity {tenant_id: $tenant_id})
+                    WHERE rel.edge_id IN $edge_ids
+                    DELETE rel
+                    """,
+                    tenant_id=tenant_id,
+                    edge_ids=del_edge_ids,
+                )
+                deleted_edges = len(del_edge_ids)
+            if edge_acl_updates:
+                await session.run(
+                    """
+                    UNWIND $updates AS u
+                    MATCH (s:Entity {tenant_id: $tenant_id})-[rel:KG_RELATION {edge_id: u.edge_id}]->(t:Entity {tenant_id: $tenant_id})
+                    SET rel.acl_groups = u.acl_groups
+                    """,
+                    tenant_id=tenant_id,
+                    updates=edge_acl_updates,
+                )
 
+            # 2. Narrow & prune entities
             res_n = await session.run(
                 """
                 MATCH (n:Entity {tenant_id: $tenant_id})
@@ -896,18 +945,48 @@ class Neo4jOpenCypherGraphAdapter(PropertyGraphStorePort):
                         THEN [k IN coalesce(n.source_kb_ids, []) WHERE k <> $kb_id]
                         ELSE coalesce(n.source_kb_ids, [])
                     END
-                WITH n
-                WHERE size(n.source_chunk_ids) = 0 OR ($kb_id IS NOT NULL AND size(n.source_kb_ids) = 0)
-                WITH n, n.entity_id AS eid
-                DETACH DELETE n
-                RETURN eid
+                RETURN n.entity_id AS eid,
+                       n.source_chunk_ids AS rem_chunks,
+                       n.source_kb_ids AS rem_kbs
                 """,
                 tenant_id=tenant_id,
                 chunk_ids=chunk_list,
                 kb_id=kb_id,
             )
-            rows_n = await res_n.data()
-            deleted_entities = [str(r["eid"]) for r in rows_n if r.get("eid")]
+            node_rows = await res_n.data()
+            node_acl_updates: list[dict[str, Any]] = []
+            for r in node_rows:
+                rem_c = list(r.get("rem_chunks") or [])
+                rem_k = list(r.get("rem_kbs") or [])
+                eid = str(r["eid"])
+                if not rem_c or (kb_id is not None and not rem_k):
+                    deleted_entities.append(eid)
+                elif remaining_chunk_acls is not None:
+                    narrowed = sorted(
+                        {g for cid in rem_c for g in remaining_chunk_acls.get(str(cid), [])}
+                    )
+                    if narrowed:
+                        node_acl_updates.append({"entity_id": eid, "acl_groups": narrowed})
+            if deleted_entities:
+                await session.run(
+                    """
+                    MATCH (n:Entity {tenant_id: $tenant_id})
+                    WHERE n.entity_id IN $entity_ids
+                    DETACH DELETE n
+                    """,
+                    tenant_id=tenant_id,
+                    entity_ids=deleted_entities,
+                )
+            if node_acl_updates:
+                await session.run(
+                    """
+                    UNWIND $updates AS u
+                    MATCH (n:Entity {tenant_id: $tenant_id, entity_id: u.entity_id})
+                    SET n.acl_groups = u.acl_groups
+                    """,
+                    tenant_id=tenant_id,
+                    updates=node_acl_updates,
+                )
         return deleted_entities, deleted_edges
 
     async def purge_tenant(self, tenant_id: str) -> int:
@@ -1283,6 +1362,7 @@ class NeptuneOpenCypherGraphAdapter(PropertyGraphStorePort):
         tenant_id: str,
         chunk_ids: Sequence[str],
         kb_id: str | None = None,
+        remaining_chunk_acls: dict[str, list[str]] | None = None,
     ) -> tuple[list[str], int]:
         chunk_set = set(chunk_ids)
         if not chunk_set and not kb_id:
@@ -1290,13 +1370,29 @@ class NeptuneOpenCypherGraphAdapter(PropertyGraphStorePort):
         all_entities = await self.get_all_entities(tenant_id)
         all_edges = await self.get_all_edges(tenant_id, active_only=False)
         del_edge_ids: list[str] = []
+        upd_edges: list[dict[str, Any]] = []
         del_entity_ids: list[str] = []
+        upd_entities: list[dict[str, Any]] = []
         for edge in all_edges:
             if chunk_set.intersection(edge.source_chunk_ids) or (kb_id and kb_id in edge.source_kb_ids):
                 rem_c = [c for c in edge.source_chunk_ids if c not in chunk_set]
                 rem_k = [k for k in edge.source_kb_ids if k != kb_id] if kb_id else edge.source_kb_ids
                 if not rem_c or (kb_id and not rem_k):
                     del_edge_ids.append(edge.edge_id)
+                else:
+                    narrowed = (
+                        sorted({g for cid in rem_c for g in remaining_chunk_acls.get(cid, [])})
+                        if remaining_chunk_acls is not None
+                        else edge.acl_groups
+                    ) or edge.acl_groups
+                    upd_edges.append(
+                        {
+                            "edge_id": edge.edge_id,
+                            "source_chunk_ids_json": json.dumps(rem_c),
+                            "source_kb_ids_json": json.dumps(rem_k),
+                            "acl_groups_json": json.dumps(narrowed),
+                        }
+                    )
         if del_edge_ids:
             await self._run_neptune_cypher(
                 """
@@ -1306,12 +1402,37 @@ class NeptuneOpenCypherGraphAdapter(PropertyGraphStorePort):
                 """,
                 {"tenant_id": tenant_id, "edge_ids": del_edge_ids},
             )
+        if upd_edges:
+            await self._run_neptune_cypher(
+                """
+                UNWIND $updates AS u
+                MATCH (s:Entity {tenant_id: $tenant_id})-[rel:KG_RELATION {edge_id: u.edge_id}]->(t:Entity {tenant_id: $tenant_id})
+                SET rel.source_chunk_ids_json = u.source_chunk_ids_json,
+                    rel.source_kb_ids_json = u.source_kb_ids_json,
+                    rel.acl_groups_json = u.acl_groups_json
+                """,
+                {"tenant_id": tenant_id, "updates": upd_edges},
+            )
         for ent in all_entities.values():
             if chunk_set.intersection(ent.source_chunk_ids) or (kb_id and kb_id in ent.source_kb_ids):
                 rem_c = [c for c in ent.source_chunk_ids if c not in chunk_set]
                 rem_k = [k for k in ent.source_kb_ids if k != kb_id] if kb_id else ent.source_kb_ids
                 if not rem_c or (kb_id and not rem_k):
                     del_entity_ids.append(ent.entity_id)
+                else:
+                    narrowed = (
+                        sorted({g for cid in rem_c for g in remaining_chunk_acls.get(cid, [])})
+                        if remaining_chunk_acls is not None
+                        else ent.acl_groups
+                    ) or ent.acl_groups
+                    upd_entities.append(
+                        {
+                            "entity_id": ent.entity_id,
+                            "source_chunk_ids_json": json.dumps(rem_c),
+                            "source_kb_ids_json": json.dumps(rem_k),
+                            "acl_groups_json": json.dumps(narrowed),
+                        }
+                    )
         if del_entity_ids:
             await self._run_neptune_cypher(
                 """
@@ -1320,6 +1441,17 @@ class NeptuneOpenCypherGraphAdapter(PropertyGraphStorePort):
                 DETACH DELETE n
                 """,
                 {"tenant_id": tenant_id, "entity_ids": del_entity_ids},
+            )
+        if upd_entities:
+            await self._run_neptune_cypher(
+                """
+                UNWIND $updates AS u
+                MATCH (n:Entity {tenant_id: $tenant_id, entity_id: u.entity_id})
+                SET n.source_chunk_ids_json = u.source_chunk_ids_json,
+                    n.source_kb_ids_json = u.source_kb_ids_json,
+                    n.acl_groups_json = u.acl_groups_json
+                """,
+                {"tenant_id": tenant_id, "updates": upd_entities},
             )
         return del_entity_ids, len(del_edge_ids)
 

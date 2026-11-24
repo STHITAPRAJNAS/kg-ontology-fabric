@@ -538,6 +538,35 @@ async def main() -> None:
             )
             assert r_tadm_dlq_cross.status_code == 403, f"Tenant-bound admin cross-tenant DLQ NOT blocked: {r_tadm_dlq_cross.status_code}"
 
+            # 6c-3. Third-Review Findings #1 & #4:
+            #   - Medium #1: Tenant Alpha writer CANNOT re-point owned legacy KB (`kb_legacy_auto_finops`)
+            #     to another table by sending `source_type=MANAGED_RAW_DOC_KB` -> 403!
+            writer_alpha_jwt = create_hs256_jwt(
+                {"sub": "alpha_writer", "tenant_id": "tenant_alpha", "acl_groups": ["public"], "roles": ["reader", "writer"], "exp": int(time.time()) + 3600},
+                jwt_secret,
+            )
+            wa_hdr = {"Authorization": f"Bearer {writer_alpha_jwt}"}
+            r_repoint = await client.post(
+                "/v1/kbs/register",
+                json={
+                    "kb_id": "kb_legacy_auto_finops",
+                    "tenant_id": "tenant_alpha",
+                    "domain_tag": "finops",
+                    "source_type": KBSourceType.MANAGED_RAW_DOC_KB.value,
+                    "table_name": "legacy_other_tenant_table",
+                },
+                headers=wa_hdr,
+            )
+            assert r_repoint.status_code == 403, f"Legacy KB re-pointing NOT blocked: {r_repoint.status_code}"
+
+            #   - Low #4: Reader blocked from spending LLM calls via `use_llm_judge=true` -> 403!
+            r_judge_reader = await client.get(
+                "/v1/quality/report",
+                params={"tenant_id": "tenant_alpha", "use_llm_judge": "true"},
+                headers=pub_hdr,
+            )
+            assert r_judge_reader.status_code == 403, f"Reader use_llm_judge NOT blocked: {r_judge_reader.status_code}"
+
             # 6d. Live ABAC Zero-Leakage over LIVE Postgres + LIVE Neo4j + Path 4 OpenCypher + LIVE /mcp!
             r_pub_rag = await client.post(
                 "/v1/rag/query",
@@ -683,6 +712,42 @@ async def main() -> None:
             assert r_rag_after_del.status_code == 200
             assert "aurora-settlement-db" not in json.dumps(r_rag_after_del.json()), (
                 f"Deleted document fact leaked after DELETE: {r_rag_after_del.json()}"
+            )
+
+            # Third-Review Finding #3 (Live Neo4j 5 ACL Narrowing):
+            # Ingest a temporary `sre_temp` doc referencing `payment-router-01`, verify `sre_temp`
+            # appears on Neo4j entity `acl_groups`, then delete it and verify `sre_temp` is narrowed away!
+            await svc.ingest_raw_documents(
+                [
+                    RawDocumentInput(
+                        doc_id="doc_sre_narrow_test",
+                        kb_id="kb_alpha_sre",
+                        tenant_id="tenant_alpha",
+                        domain_tag="sre",
+                        title="Temporary SRE ACL Narrow Test",
+                        content="Microservice payment-router-01 depends on aurora-temp-narrow-db.",
+                        acl_groups=["sre_temp"],
+                    )
+                ]
+            )
+            await svc.build_or_update_knowledge_graph(tenant_id="tenant_alpha", incremental=True)
+            ents_before_narrow = await neo_store.get_all_entities("tenant_alpha")
+            pr_before_narrow = next(
+                e for e in ents_before_narrow.values() if e.canonical_name == "payment-router-01"
+            )
+            assert "sre_temp" in pr_before_narrow.acl_groups
+            r_del_narrow = await client.delete(
+                "/v1/documents/kb_alpha_sre/doc_sre_narrow_test",
+                params={"tenant_id": "tenant_alpha"},
+                headers=tadm_hdr,
+            )
+            assert r_del_narrow.status_code == 200
+            ents_after_narrow = await neo_store.get_all_entities("tenant_alpha")
+            pr_after_narrow = next(
+                e for e in ents_after_narrow.values() if e.canonical_name == "payment-router-01"
+            )
+            assert "sre_temp" not in pr_after_narrow.acl_groups, (
+                f"Expected Neo4j entity ACL narrowed to remove 'sre_temp', got {pr_after_narrow.acl_groups}"
             )
 
             r_mcp_call = await client.post(

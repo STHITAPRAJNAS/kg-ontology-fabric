@@ -73,18 +73,31 @@ class LlamaIndexHierarchicalNodeParser:
         max_chunk_chars: int = 650,
         chunk_overlap_chars: int = 80,
         canonical_embedding_dim: int = 256,
+        pii_redactor: Any | None = None,
     ):
         self.embedding_provider = embedding_provider
         self.max_chunk_chars = max_chunk_chars
         self.chunk_overlap_chars = chunk_overlap_chars
         self.canonical_embedding_dim = canonical_embedding_dim
+        self.pii_redactor = pii_redactor
 
     def parse_document(
         self,
         doc: RawDocumentInput,
         native_kb_dim: int = 768,
+        audit_counts: dict[str, int] | None = None,
     ) -> list[VectorChunkRecord]:
-        scrubbed_content = PIIRedactor.scrub(doc.content.strip())
+        raw_text = doc.content.strip()
+        if not raw_text:
+            return []
+        if self.pii_redactor is not None:
+            redaction_res = self.pii_redactor.analyze_and_redact(raw_text)
+            scrubbed_content = redaction_res.scrubbed_text
+            if audit_counts is not None:
+                for k, v in redaction_res.redaction_counts.items():
+                    audit_counts[k] = audit_counts.get(k, 0) + v
+        else:
+            scrubbed_content = PIIRedactor.scrub(raw_text)
         if not scrubbed_content:
             return []
 

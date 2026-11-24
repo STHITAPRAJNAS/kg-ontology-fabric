@@ -137,6 +137,7 @@ class EnterpriseKGOntologyService:
         self.node_parser = LlamaIndexHierarchicalNodeParser(
             embedding_provider=self.embedding_provider,
             canonical_embedding_dim=canonical_embedding_dim,
+            pii_redactor=self.pii_redactor,
         )
         self.ontology_inducer = AutomatedOntologyInducer(
             embedding_provider=self.embedding_provider,
@@ -415,27 +416,37 @@ class EnterpriseKGOntologyService:
         )
         registration.tenant_id = safe_tenant
 
-        # Critical #1: Block PostgreSQL system catalogs, internal KG Fabric tables, and unallowlisted
-        # legacy tables at registration time. Physical legacy table registration requires platform_admin
-        # when authenticated against PostgreSQL.
-        if registration.source_type == KBSourceType.EXISTING_PGVECTOR_KB:
-            cm = registration.column_mapping
+        # Block PostgreSQL system catalogs, internal KG Fabric tables, and unallowlisted
+        # legacy tables at registration time. Also check whether an EXISTING registration
+        # with the same `kb_id` is ALREADY an `EXISTING_PGVECTOR_KB` so a tenant writer cannot
+        # re-point an existing legacy KB at another allowlisted table by sending a different
+        # incoming `source_type`.
+        existing_regs = await self.vector_store.list_registered_kbs(tenant_id=safe_tenant)
+        existing_reg = next((r for r in existing_regs if r.kb_id == registration.kb_id), None)
+        is_existing_legacy = (
+            existing_reg is not None
+            and existing_reg.source_type == KBSourceType.EXISTING_PGVECTOR_KB
+        )
+        is_incoming_legacy = registration.source_type == KBSourceType.EXISTING_PGVECTOR_KB
+        if is_existing_legacy or is_incoming_legacy:
             is_pg = isinstance(self.vector_store, PostgresPgVectorStoreAdapter)
-            if is_pg and get_current_principal() is not None:
+            if get_current_principal() is not None:
                 self._principal_enforcer.require_platform_admin(get_current_principal())
-            validate_legacy_table_access(
-                schema_name=registration.schema_name,
-                table_name=registration.table_name,
-                column_names=[
-                    cm.id_column,
-                    cm.doc_id_column,
-                    cm.text_column,
-                    cm.embedding_column,
-                    cm.metadata_column,
-                ],
-                allowed_patterns=getattr(self.vector_store, "allowed_legacy_tables", None),
-                enforce_allowlist=bool(is_pg and get_current_principal() is not None),
-            )
+            if is_incoming_legacy:
+                cm = registration.column_mapping
+                validate_legacy_table_access(
+                    schema_name=registration.schema_name,
+                    table_name=registration.table_name,
+                    column_names=[
+                        cm.id_column,
+                        cm.doc_id_column,
+                        cm.text_column,
+                        cm.embedding_column,
+                        cm.metadata_column,
+                    ],
+                    allowed_patterns=getattr(self.vector_store, "allowed_legacy_tables", None),
+                    enforce_allowlist=bool(is_pg and get_current_principal() is not None),
+                )
 
         await self.vector_store.register_kb(registration)
         return registration
@@ -450,8 +461,12 @@ class EnterpriseKGOntologyService:
     async def unregister_kb(self, tenant_id: str, kb_id: str) -> dict[str, Any]:
         safe_tenant, _ = self._enforce_service_principal(tenant_id, required_role="admin")
         deleted_chunk_ids = await self.vector_store.unregister_kb_chunks(safe_tenant, kb_id)
+        remaining_acls = await self.vector_store.fetch_tenant_chunk_acl_map(safe_tenant)
         deleted_ent_ids, deleted_edges = await self.graph_store.delete_chunks_provenance(
-            tenant_id=safe_tenant, chunk_ids=deleted_chunk_ids, kb_id=kb_id
+            tenant_id=safe_tenant,
+            chunk_ids=deleted_chunk_ids,
+            kb_id=kb_id,
+            remaining_chunk_acls=remaining_acls,
         )
         await self.vector_store.delete_canonical_entity_embeddings(safe_tenant, deleted_ent_ids)
         return {
@@ -467,8 +482,11 @@ class EnterpriseKGOntologyService:
         deleted_chunk_ids = await self.vector_store.delete_document_chunks(
             safe_tenant, kb_id, doc_id
         )
+        remaining_acls = await self.vector_store.fetch_tenant_chunk_acl_map(safe_tenant)
         deleted_ent_ids, deleted_edges = await self.graph_store.delete_chunks_provenance(
-            tenant_id=safe_tenant, chunk_ids=deleted_chunk_ids
+            tenant_id=safe_tenant,
+            chunk_ids=deleted_chunk_ids,
+            remaining_chunk_acls=remaining_acls,
         )
         await self.vector_store.delete_canonical_entity_embeddings(safe_tenant, deleted_ent_ids)
         return {
@@ -593,7 +611,11 @@ class EnterpriseKGOntologyService:
                     **doc.metadata,
                     "structured_triples": list(doc.metadata.get("structured_triples", [])) + table_triples,
                 }
-            parsed = self.node_parser.parse_document(doc, native_kb_dim=native_kb_dim)
+            parsed = self.node_parser.parse_document(
+                doc,
+                native_kb_dim=native_kb_dim,
+                audit_counts=self._pii_redaction_audit_counts,
+            )
             for chk in parsed:
                 chk.metadata["acl_groups"] = list(chk.acl_groups)
             all_chunks.extend(parsed)
@@ -1232,7 +1254,8 @@ class EnterpriseKGOntologyService:
         (`0-100` grade + actionable findings across SHACL, utilization, extraction faithfulness,
         entity resolution duplicates/over-merges, orphan nodes, GCC, cross-KB linkage, modularity).
         """
-        safe_tenant, _ = self._enforce_service_principal(tenant_id)
+        required_role = "writer" if use_llm_judge else "reader"
+        safe_tenant, _ = self._enforce_service_principal(tenant_id, required_role=required_role)
         self._metrics["quality_audits_total"] += 1
         report = await KGQualityAuditor.audit_tenant(
             service=self,

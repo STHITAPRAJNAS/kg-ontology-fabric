@@ -1,24 +1,19 @@
 # Session Handoff — `enterprise-kg-ontology-fabric`
 
-1. **Last Updated**: 2026-11-24 12:27 EST (`Windows`)
+1. **Last Updated**: 2026-11-24 13:16 EST (`Windows`)
 2. **Current Goal & Status**:
-   - Remediated **ALL 12 findings from Red-Team Review #1 AND ALL 7 findings from Red-Team Review #2** on `v0.3.0` (no PyPI tag pushed yet).
+   - Remediated **ALL findings across External Red-Team Reviews #1 (12 findings), #2 (7 findings), and #3 (4 findings)** on `v0.3.0` (no PyPI tag pushed yet).
    - **`ruff check src tests` — 0 errors** (`All checks passed!`).
-   - **`18 / 18` pytest tests pass (`6.32s`)**, including both adversarial security regression suites (`test_review_remediation_critical_security_neptune_promote_delete_and_auth_fail_closed` and `test_second_review_remediation_legacy_exfil_platform_admin_entity_pk_delete_dlq_and_metrics`).
-   - **Live Docker Verification (`examples/live_docker_v03_full_verification.py` & `examples/live_docker_messy_enterprise_test.py`) — ALL PASSED** & live Postgres/Neo4j demo stores cleanly repaired/reset:
-     - Fail-closed `EXISTING_PGVECTOR_KB` allowlist (`KG_FABRIC_ALLOWED_LEGACY_TABLES`) + unconditional denylist of `pg_catalog`/`information_schema`/`unified_rag_chunks` + `platform_admin` requirement (`403` verified live) + incremental SHA-256 skip (`delta=0` on 2nd build).
-     - Tenant-bound admin blocked (`403`) from raw Cypher (REST + MCP) and cross-tenant `/v1/jobs/dlq`; global `platform_admin` (`tenant_id="*"`, `roles=["admin"]`) enforced.
-     - Same-named entity (`payment-router-01`) across `tenant_alpha` & `tenant_beta` isolated via composite `PRIMARY KEY (tenant_id, entity_id)` & tenant-scoped `entity_id` (`ent::<tenant_id>::<class>::<slug>`).
-     - Complete `DELETE /v1/documents/{kb}/{doc}` & `DELETE /v1/kbs/{kb}` prunes Postgres chunks, Neo4j 5 graph entities/edges, and `canonical_entity_embeddings` (verified `/v1/rag/query` stops returning deleted facts).
-     - `/v1/metrics` and `/metrics` scoped to caller's `tenant_id` (zero cross-tenant ID/score leaks).
-     - PostgreSQL 16 Kernel RLS under `NOBYPASSRLS` `kg_app_user` (`fail_closed=0`, `beta_leak=0`), `14` MCP tools, `GET /v1/quality/report` **`96.71 / 100 A+`**.
-3. **Recent Changes**:
-   - `enterprise-kg-ontology-fabric/src/enterprise_kg_fabric/auth.py`: Added `AuthPrincipal.is_platform_admin` and `AuthEnforcer.require_platform_admin`.
-   - `enterprise-kg-ontology-fabric/src/enterprise_kg_fabric/entity_resolution.py`: Tenant-scoped generated `entity_id` (`ent::<tenant_id>::<class>::<slug>`).
-   - `enterprise-kg-ontology-fabric/src/enterprise_kg_fabric/adapters/pgvector_store.py`: Added `validate_legacy_table_access`, fail-closed `allowed_legacy_tables` / `KG_FABRIC_ALLOWED_LEGACY_TABLES`, `_scoped_conn` legacy hydration, composite `PRIMARY KEY (tenant_id, entity_id)` DDL + idempotent migration, `delete_canonical_entity_embeddings`, and `unregister_kb_chunks`/`delete_document_chunks` returning deleted `chunk_ids`.
-   - `enterprise-kg-ontology-fabric/src/enterprise_kg_fabric/adapters/graph_stores.py`: Implemented `delete_chunks_provenance` across In-Memory, Neo4j 5, and Neptune adapters.
-   - `enterprise-kg-ontology-fabric/src/enterprise_kg_fabric/service.py`, `api.py`, `mcp_server.py`: Wired `require_platform_admin` on raw Cypher & legacy KB registration, incremental legacy SHA-256 skip, complete graph+vector deletion, tenant-bound admin DLQ guard, and tenant-scoped `/v1/metrics` & `/metrics`.
-   - `enterprise-kg-ontology-fabric/tests/test_v03_pypi_and_security_hardening.py` & `examples/live_docker_v03_full_verification.py`: Added comprehensive unit and live-Docker adversarial proofs for all 7 second-review findings.
+   - **`19 / 19` pytest tests pass (`6.13s`)**, including all 3 adversarial security regression suites:
+     - `test_review_remediation_critical_security_neptune_promote_delete_and_auth_fail_closed`
+     - `test_second_review_remediation_legacy_exfil_platform_admin_entity_pk_delete_dlq_and_metrics`
+     - `test_third_review_remediation_legacy_repoint_hmac_ingest_acl_narrowing_and_llm_judge_rbac`
+   - Note: Live Docker verification (`examples/live_docker_v03_full_verification.py`) passed on Review #2 (`96.71 / 100 A+`), and was extended with Review #3 live checks (legacy re-point `403`, `use_llm_judge=true` `403`, Neo4j 5 entity ACL narrowing); Docker Desktop was stopped on the host during the Review #3 check so re-run `examples/live_docker_v03_full_verification.py` once Docker Desktop is started.
+3. **Recent Changes (Review #3)**:
+   - `enterprise-kg-ontology-fabric/src/enterprise_kg_fabric/service.py` & `adapters/pgvector_store.py`: Blocked tenant writers from re-pointing an existing `EXISTING_PGVECTOR_KB` to another table via `source_type=MANAGED_RAW_DOC_KB` (`403`, requires `platform_admin`), and synced `source_type`/`schema_name`/`column_mapping`/`embedding_model_id` on `ON CONFLICT (kb_id) DO UPDATE`.
+   - `enterprise-kg-ontology-fabric/src/enterprise_kg_fabric/llama_index_bridge.py` & `service.py`: Wired `service.pii_redactor` into `LlamaIndexHierarchicalNodeParser` so `ingest_raw_documents` honors `PIIRedactionMode.HMAC_PSEUDONYMIZE` (and updates `_pii_redaction_audit_counts`) identically to `hydrate_existing_kb_chunks`.
+   - `enterprise-kg-ontology-fabric/src/enterprise_kg_fabric/adapters/pgvector_store.py`, `adapters/graph_stores.py`, & `service.py`: Added `fetch_tenant_chunk_acl_map` and narrowed surviving entity/edge `acl_groups` inside `delete_chunks_provenance` across In-Memory, Neo4j 5, and Neptune adapters.
+   - `enterprise-kg-ontology-fabric/src/enterprise_kg_fabric/service.py` & `api.py`: Gated `use_llm_judge=true` on `GET /v1/quality/report` and MCP `audit_kg_quality` to `writer`/`admin` (`reader` gets `403`).
 4. **Next Steps / Blockers**:
    - No PyPI release pushed yet (`v0.3.0` tag intentionally NOT pushed). Whenever ready to publish to PyPI, link Trusted Publishing on PyPI for `STHITAPRAJNAS/kg-ontology-fabric` and push `git tag v0.3.0 && git push origin v0.3.0`.
-   - Optional next step if desired: live LLM extraction test (`KG_FABRIC_USE_LIVE_LLM=true` with a live Gemini/Bedrock/OpenAI API key) on unstructured prose.
+   - When Docker Desktop is running, optionally re-run `python examples/live_docker_v03_full_verification.py` to exercise the 3 newly added Review #3 assertions against live Postgres 16 + Neo4j 5.

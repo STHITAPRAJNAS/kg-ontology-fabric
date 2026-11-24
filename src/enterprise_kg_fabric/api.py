@@ -603,6 +603,8 @@ def create_kg_fabric_app(
         principal: AuthPrincipal | None = Depends(get_principal),
     ) -> KGQualityScorecardReport:
         p = _unwrap_principal(principal)
+        if use_llm_judge:
+            enforcer.require_role(p, "writer")
         tenant = enforcer.enforce_tenant(p, tenant_id)
         return await svc.audit_kg_quality(
             tenant_id=tenant,

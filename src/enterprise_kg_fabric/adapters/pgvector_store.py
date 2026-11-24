@@ -359,6 +359,9 @@ class PgVectorStorePort(ABC):
     ) -> int:
         return 0
 
+    async def fetch_tenant_chunk_acl_map(self, tenant_id: str) -> dict[str, list[str]]:
+        return {}
+
     async def purge_tenant(self, tenant_id: str) -> dict[str, int]:
         return {}
 
@@ -521,6 +524,14 @@ class InMemoryPgVectorStoreEmulator(PgVectorStorePort):
             if self._entity_index.pop((tenant_id, eid), None) is not None:
                 removed += 1
         return removed
+
+    async def fetch_tenant_chunk_acl_map(self, tenant_id: str) -> dict[str, list[str]]:
+        acl_map: dict[str, list[str]] = {}
+        for kb_chunks in self._kb_tables.values():
+            for cid, chk in kb_chunks.items():
+                if chk.tenant_id == tenant_id:
+                    acl_map[cid] = list(chk.acl_groups or ["public"])
+        return acl_map
 
     async def purge_tenant(self, tenant_id: str) -> dict[str, int]:
         kb_ids = [kid for kid, reg in self._kb_registry.items() if reg.tenant_id == tenant_id]
@@ -880,8 +891,12 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12)
                 ON CONFLICT (kb_id) DO UPDATE SET
                     domain_tag = EXCLUDED.domain_tag,
+                    source_type = EXCLUDED.source_type,
+                    schema_name = EXCLUDED.schema_name,
                     table_name = EXCLUDED.table_name,
-                    embedding_dim = EXCLUDED.embedding_dim
+                    embedding_dim = EXCLUDED.embedding_dim,
+                    embedding_model_id = EXCLUDED.embedding_model_id,
+                    column_mapping = EXCLUDED.column_mapping
                 WHERE kb_federation_registry.tenant_id = EXCLUDED.tenant_id
                 """,
                 registration.kb_id,
@@ -949,6 +964,24 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
                 list(entity_ids),
             )
             return int(removed or 0)
+
+    async def fetch_tenant_chunk_acl_map(self, tenant_id: str) -> dict[str, list[str]]:
+        async with self._scoped_conn(tenant_id) as conn:
+            rows = await conn.fetch(
+                "SELECT chunk_id, acl_groups FROM unified_rag_chunks WHERE tenant_id = $1",
+                tenant_id,
+            )
+            acl_map: dict[str, list[str]] = {}
+            for r in rows:
+                raw_acls = r["acl_groups"]
+                if isinstance(raw_acls, str):
+                    parsed = json.loads(raw_acls)
+                elif isinstance(raw_acls, list):
+                    parsed = raw_acls
+                else:
+                    parsed = ["public"]
+                acl_map[str(r["chunk_id"])] = [str(g) for g in parsed] if parsed else ["public"]
+            return acl_map
 
     async def purge_tenant(self, tenant_id: str) -> dict[str, int]:
         async with self._scoped_conn(tenant_id) as conn:

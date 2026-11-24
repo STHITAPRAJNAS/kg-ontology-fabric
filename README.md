@@ -164,7 +164,7 @@ docker compose --profile app up -d --build
 docker compose up -d --wait
 python examples/live_docker_messy_enterprise_test.py
 
-# Run full offline pytest suite (18 tests, no Docker required) & ruff lint:
+# Run full offline pytest suite (19 tests, no Docker required) & ruff lint:
 pip install -e ".[dev,mcp,auth]"
 ruff check src tests
 pytest tests/ -v

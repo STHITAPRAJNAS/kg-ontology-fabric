@@ -1342,3 +1342,221 @@ def test_second_review_remediation_legacy_exfil_platform_admin_entity_pk_delete_
         assert "aurora-ephemeral-db" not in str(rag_kb_del)
 
     run_coroutine_sync(_run())
+
+
+def test_third_review_remediation_legacy_repoint_hmac_ingest_acl_narrowing_and_llm_judge_rbac() -> None:
+    """
+    Regression suite reproducing EVERY finding from the third external review:
+      1. Medium: Tenant writer CANNOT re-point an existing `EXISTING_PGVECTOR_KB` to another table
+         by sending `source_type=MANAGED_RAW_DOC_KB` (`403` — requires `platform_admin`).
+      2. Medium: `ingest_raw_documents` honors the service's configured `PresidioPIIRedactor`
+         (e.g., `HMAC_PSEUDONYMIZE` produces `<EMAIL_ADDRESS:hmac_...>`, NOT plain `<EMAIL_ADDRESS>`).
+      3. Low: Deleting a document narrows surviving entities' & edges' `acl_groups` in both
+         directions (`["public", "sre"]` -> `["public"]`, and `["public", "sec_only"]` -> `["sec_only"]`).
+      4. Low: `GET /v1/quality/report?use_llm_judge=true` & MCP `audit_kg_quality(use_llm_judge=True)`
+         require `writer` role (`reader` gets `403`, preventing unprivileged LLM spend).
+    """
+    from enterprise_kg_fabric import (
+        KBSourceType,
+        PIIRedactionMode,
+        PresidioPIIRedactor,
+        VectorKBRegistration,
+    )
+
+    async def _run() -> None:
+        # 2. Configure HMAC_PSEUDONYMIZE PII redactor on the service
+        hmac_redactor = PresidioPIIRedactor(
+            mode=PIIRedactionMode.HMAC_PSEUDONYMIZE,
+            hmac_secret_key="unit-test-hmac-key-for-ingest-pii-mode",
+        )
+        svc = EnterpriseKGOntologyService(
+            pii_redactor=hmac_redactor,
+            min_kb_support_for_approval=1,
+            min_chunk_support_for_approval=1,
+        )
+
+        # Ingest raw doc with email -> MUST use HMAC pseudonymization, not <EMAIL_ADDRESS>
+        ingested = await svc.ingest_raw_documents(
+            [
+                RawDocumentInput(
+                    doc_id="doc_hmac_pub",
+                    kb_id="kb_a",
+                    tenant_id="tenant_a",
+                    domain_tag="sre",
+                    title="Public SRE",
+                    content=(
+                        "Owner alice.smith@corp.example confirmed microservice shared-router-01 "
+                        "depends on aurora-pub-01."
+                    ),
+                    acl_groups=["public"],
+                ),
+                RawDocumentInput(
+                    doc_id="doc_sre_extra",
+                    kb_id="kb_a",
+                    tenant_id="tenant_a",
+                    domain_tag="sre",
+                    title="SRE Restricted",
+                    content="Microservice shared-router-01 depends on aurora-sre-01.",
+                    acl_groups=["sre"],
+                ),
+                RawDocumentInput(
+                    doc_id="doc_priv_pub",
+                    kb_id="kb_a",
+                    tenant_id="tenant_a",
+                    domain_tag="sre",
+                    title="Temp Public Mention",
+                    content="Microservice priv-router-02 depends on aurora-temp-02.",
+                    acl_groups=["public"],
+                ),
+                RawDocumentInput(
+                    doc_id="doc_priv_sec",
+                    kb_id="kb_a",
+                    tenant_id="tenant_a",
+                    domain_tag="security",
+                    title="Secret Mention",
+                    content="Microservice priv-router-02 depends on aurora-sec-02.",
+                    acl_groups=["sec_only"],
+                ),
+            ]
+        )
+        hmac_chunk = next(c for c in ingested if c.doc_id == "doc_hmac_pub")
+        assert "alice.smith@corp.example" not in hmac_chunk.text
+        assert "<EMAIL_ADDRESS>" not in hmac_chunk.text
+        assert re.search(r"<EMAIL_ADDRESS_[0-9a-f]{8}>", hmac_chunk.text), (
+            f"Expected HMAC pseudonymized email (<EMAIL_ADDRESS_xxxxxxxx>) on ingest, got: {hmac_chunk.text}"
+        )
+        assert svc._pii_redaction_audit_counts.get("EMAIL_ADDRESS", 0) >= 1
+
+        await svc.induce_and_align_ontology(tenant_id="tenant_a")
+        await svc.build_or_update_knowledge_graph(tenant_id="tenant_a", incremental=False)
+
+        # 3a. Entity `shared-router-01` starts with ['public', 'sre']; deleting `doc_sre_extra` narrows it to ['public']
+        ents_before = await svc.graph_store.get_all_entities("tenant_a")
+        shared_ent = next(e for e in ents_before.values() if e.canonical_name == "shared-router-01")
+        assert sorted(shared_ent.acl_groups) == ["public", "sre"]
+
+        await svc.delete_document(tenant_id="tenant_a", kb_id="kb_a", doc_id="doc_sre_extra")
+        ents_after_1 = await svc.graph_store.get_all_entities("tenant_a")
+        shared_after = next(e for e in ents_after_1.values() if e.canonical_name == "shared-router-01")
+        assert shared_after.acl_groups == ["public"], (
+            f"Expected entity ACL narrowed to ['public'], got {shared_after.acl_groups}"
+        )
+
+        # 3b. Inverse: `priv-router-02` starts with ['public', 'sec_only']; deleting `doc_priv_pub`
+        #     narrows it to ['sec_only'] so public callers can no longer see it!
+        priv_before = next(e for e in ents_after_1.values() if e.canonical_name == "priv-router-02")
+        assert sorted(priv_before.acl_groups) == ["public", "sec_only"]
+
+        await svc.delete_document(tenant_id="tenant_a", kb_id="kb_a", doc_id="doc_priv_pub")
+        ents_after_2 = await svc.graph_store.get_all_entities("tenant_a")
+        priv_after = next(e for e in ents_after_2.values() if e.canonical_name == "priv-router-02")
+        assert priv_after.acl_groups == ["sec_only"], (
+            f"Expected entity ACL narrowed to ['sec_only'], got {priv_after.acl_groups}"
+        )
+
+        # 1 & 4. Auth checks via HTTP + MCP
+        jwt_secret = "third-review-remediation-signing-key-32-bytes-minimum"
+        app = create_kg_fabric_app(
+            service=svc,
+            auth_config=AuthConfig(mode=AuthMode.JWT, jwt_secret=jwt_secret),
+        )
+        reader_jwt = create_hs256_jwt(
+            {"sub": "r1", "tenant_id": "tenant_a", "acl_groups": ["public"], "roles": ["reader"], "exp": int(time.time()) + 3600},
+            jwt_secret,
+        )
+        writer_jwt = create_hs256_jwt(
+            {"sub": "w1", "tenant_id": "tenant_a", "acl_groups": ["public"], "roles": ["reader", "writer"], "exp": int(time.time()) + 3600},
+            jwt_secret,
+        )
+        padm_jwt = create_hs256_jwt(
+            {"sub": "root", "tenant_id": "*", "acl_groups": ["public"], "roles": ["admin"], "exp": int(time.time()) + 3600},
+            jwt_secret,
+        )
+        hdr_r = {"Authorization": f"Bearer {reader_jwt}"}
+        hdr_w = {"Authorization": f"Bearer {writer_jwt}"}
+        hdr_p = {"Authorization": f"Bearer {padm_jwt}"}
+
+        # Platform admin registers an existing legacy KB for tenant_a
+        code, _ = await _asgi_request(
+            app,
+            "POST",
+            "/v1/kbs/register",
+            json_body=VectorKBRegistration(
+                kb_id="kb_legacy_owned_a",
+                tenant_id="tenant_a",
+                domain_tag="finops",
+                source_type=KBSourceType.EXISTING_PGVECTOR_KB,
+                table_name="legacy_tenant_a_table",
+            ).model_dump(),
+            headers=hdr_p,
+        )
+        assert code == 200
+
+        # Finding #1: Tenant A writer tries to re-point `kb_legacy_owned_a` to another table by sending
+        # `source_type=MANAGED_RAW_DOC_KB` -> MUST be blocked with 403!
+        code, _ = await _asgi_request(
+            app,
+            "POST",
+            "/v1/kbs/register",
+            json_body=VectorKBRegistration(
+                kb_id="kb_legacy_owned_a",
+                tenant_id="tenant_a",
+                domain_tag="finops",
+                source_type=KBSourceType.MANAGED_RAW_DOC_KB,
+                table_name="legacy_tenant_b_secret_table",
+            ).model_dump(),
+            headers=hdr_w,
+        )
+        assert code == 403
+        regs = await svc.vector_store.list_registered_kbs("tenant_a")
+        leg_reg = next(r for r in regs if r.kb_id == "kb_legacy_owned_a")
+        assert leg_reg.table_name == "legacy_tenant_a_table"
+        assert leg_reg.source_type == KBSourceType.EXISTING_PGVECTOR_KB
+
+        # Finding #4: Reader CAN call deterministic quality report, CANNOT call use_llm_judge=true (REST or MCP)
+        code, _ = await _asgi_request(
+            app,
+            "GET",
+            "/v1/quality/report",
+            params={"tenant_id": "tenant_a", "use_llm_judge": "false"},
+            headers=hdr_r,
+        )
+        assert code == 200
+
+        code, _ = await _asgi_request(
+            app,
+            "GET",
+            "/v1/quality/report",
+            params={"tenant_id": "tenant_a", "use_llm_judge": "true"},
+            headers=hdr_r,
+        )
+        assert code == 403
+
+        code, mcp_judge = await _asgi_request(
+            app,
+            "POST",
+            "/mcp",
+            json_body={
+                "jsonrpc": "2.0",
+                "id": 11,
+                "method": "tools/call",
+                "params": {
+                    "name": "audit_kg_quality",
+                    "arguments": {"tenant_id": "tenant_a", "use_llm_judge": True},
+                },
+            },
+            headers=hdr_r,
+        )
+        assert code == 403 or "error" in mcp_judge
+
+        # Writer IS allowed to request use_llm_judge=true
+        code, _ = await _asgi_request(
+            app,
+            "GET",
+            "/v1/quality/report",
+            params={"tenant_id": "tenant_a", "use_llm_judge": "true"},
+            headers=hdr_w,
+        )
+        assert code == 200
+
+    run_coroutine_sync(_run())
