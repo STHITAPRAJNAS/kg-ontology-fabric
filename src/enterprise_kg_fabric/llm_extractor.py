@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import re
 from typing import Any
@@ -121,6 +120,21 @@ class StructuredLLMExtractorAdapter:
             qualifiers["negated_or_prohibited"] = True
         return qualifiers
 
+    def _build_extraction_prompt(
+        self, chunk: VectorChunkRecord, tbox: EnterpriseCompiledTBox
+    ) -> str:
+        allowed_classes = sorted(tbox.classes.keys())
+        allowed_preds = sorted(tbox.relations.keys())
+        return (
+            "Extract factual knowledge graph triples with optional N-ary qualifiers "
+            "(condition, approved_by) strictly using these ontology classes and predicates.\n"
+            'Return ONLY valid JSON matching: {"triples": [{"subject": str, "subject_class": str, '
+            '"predicate": str, "object": str, "object_class": str, "confidence": float, "qualifiers": {}}]}.\n'
+            f"Allowed Classes: {allowed_classes}\n"
+            f"Allowed Predicates: {allowed_preds}\n\n"
+            f"Text:\n{chunk.text}"
+        )
+
     def _call_gemini_structured(
         self, chunk: VectorChunkRecord, tbox: EnterpriseCompiledTBox
     ) -> _LLMStructuredExtractionPayload:
@@ -128,18 +142,9 @@ class StructuredLLMExtractorAdapter:
         from google.genai import types
 
         client = genai.Client(api_key=self.api_key)
-        allowed_classes = sorted(tbox.classes.keys())
-        allowed_preds = sorted(tbox.relations.keys())
-        prompt = (
-            "Extract factual knowledge graph triples with optional N-ary qualifiers "
-            "(condition, approved_by) strictly using these ontology classes and predicates.\n"
-            f"Allowed Classes: {allowed_classes}\n"
-            f"Allowed Predicates: {allowed_preds}\n\n"
-            f"Text:\n{chunk.text}"
-        )
         resp = client.models.generate_content(
             model=self.model_name,
-            contents=prompt,
+            contents=self._build_extraction_prompt(chunk, tbox),
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
                 response_schema=_LLMStructuredExtractionPayload,
@@ -147,6 +152,48 @@ class StructuredLLMExtractorAdapter:
             ),
         )
         return _LLMStructuredExtractionPayload.model_validate_json(resp.text or "{}")
+
+    def _call_openai_structured(
+        self, chunk: VectorChunkRecord, tbox: EnterpriseCompiledTBox
+    ) -> _LLMStructuredExtractionPayload:
+        from openai import OpenAI
+
+        client = OpenAI(api_key=self.openai_key)
+        resp = client.chat.completions.create(
+            model=self.model_name,
+            temperature=0.0,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": "You are a strict Knowledge Graph triple extractor."},
+                {"role": "user", "content": self._build_extraction_prompt(chunk, tbox)},
+            ],
+        )
+        raw = resp.choices[0].message.content or "{}"
+        return _LLMStructuredExtractionPayload.model_validate_json(raw)
+
+    def _call_bedrock_structured(
+        self, chunk: VectorChunkRecord, tbox: EnterpriseCompiledTBox
+    ) -> _LLMStructuredExtractionPayload:
+        import boto3
+
+        client = boto3.client(
+            "bedrock-runtime",
+            region_name=os.environ.get("AWS_REGION", "us-east-1"),
+        )
+        resp = client.converse(
+            modelId=self.model_name,
+            inferenceConfig={"temperature": 0.0, "maxTokens": 2048},
+            messages=[
+                {
+                    "role": "user",
+                    "content": [{"text": self._build_extraction_prompt(chunk, tbox)}],
+                }
+            ],
+        )
+        content_blocks = resp.get("output", {}).get("message", {}).get("content", [])
+        text = "".join(b.get("text", "") for b in content_blocks if isinstance(b, dict)).strip()
+        m = re.search(r"\{.*\}", text, re.S)
+        return _LLMStructuredExtractionPayload.model_validate_json(m.group(0) if m else "{}")
 
     def extract_from_chunk(
         self,
@@ -157,14 +204,18 @@ class StructuredLLMExtractorAdapter:
         nary_qualifiers = self.extract_nary_qualifiers(chunk.text)
         base_result: ChunkExtractionResult | None = None
 
-        if (
-            self.use_live_llm
-            and self.api_key
-            and self.provider in ("gemini", "auto")
-            and self.circuit_breaker.state != "OPEN"
-        ):
+        live_caller = None
+        if self.use_live_llm and self.circuit_breaker.state != "OPEN":
+            if self.provider in ("gemini", "auto") and self.api_key:
+                live_caller = self._call_gemini_structured
+            elif self.provider in ("openai", "auto") and self.openai_key:
+                live_caller = self._call_openai_structured
+            elif self.provider == "bedrock":
+                live_caller = self._call_bedrock_structured
+
+        if live_caller is not None:
             try:
-                payload = self._call_gemini_structured(chunk, tbox)
+                payload = live_caller(chunk, tbox)
                 self.circuit_breaker.record_success()
                 entities: list[ExtractedEntityMention] = []
                 triples: list[ExtractedRelationTriple] = []

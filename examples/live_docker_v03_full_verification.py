@@ -222,7 +222,7 @@ async def main() -> None:
         f"Job1 DLQ={job_1.dlq_count} | Job2 Delta={job_2.report.delta_chunks_extracted}"
     )
 
-    # 4. Direct PostgreSQL Kernel RLS Enforcement Proof (Raw asyncpg as `kg_app_user`)
+    # 4. Direct PostgreSQL Kernel RLS Enforcement Proof (Raw asyncpg as `kg_app_user`) + Superuser Cross-Tenant Overwrite Guard
     raw_conn = await asyncpg.connect(app_dsn)
     try:
         # 4a. Without app.current_tenant_id -> FAIL-CLOSED (0 rows visible!)
@@ -239,7 +239,91 @@ async def main() -> None:
             assert alpha_count > 0 and beta_leak == 0
     finally:
         await raw_conn.close()
-    print(f"[3] Verified PostgreSQL 16 Kernel RLS (`NOBYPASSRLS`): fail-closed=0 rows, alpha_count={alpha_count}, beta_leak=0")
+
+    # 4c. Critical #3 & High #7: Even as Postgres SUPERUSER (`kg_admin`), Tenant Beta CANNOT overwrite Tenant Alpha's KB or chunk!
+    from enterprise_kg_fabric import KBSourceType, VectorChunkRecord, VectorKBRegistration
+
+    su_store = PostgresPgVectorStoreAdapter(dsn=admin_dsn, embedding_provider=emb, canonical_dim=256)
+    try:
+        alpha_chunks_live = await su_store.fetch_kb_chunks("kb_alpha_legal", tenant_id="tenant_alpha")
+        assert len(alpha_chunks_live) >= 1
+        kb_blocked = False
+        try:
+            await su_store.register_kb(
+                VectorKBRegistration(
+                    kb_id="kb_alpha_legal", tenant_id="tenant_beta", domain_tag="legal", table_name="hijack"
+                )
+            )
+        except PermissionError:
+            kb_blocked = True
+        assert kb_blocked, "Superuser KB takeover was NOT blocked!"
+
+        chunk_blocked = False
+        try:
+            await su_store.upsert_kb_chunks(
+                "kb_alpha_legal",
+                [
+                    VectorChunkRecord(
+                        chunk_id=alpha_chunks_live[0].chunk_id,
+                        kb_id="kb_alpha_legal",
+                        tenant_id="tenant_beta",
+                        doc_id="hijack",
+                        text="OVERWRITTEN",
+                        acl_groups=["public"],
+                    )
+                ],
+            )
+        except PermissionError:
+            chunk_blocked = True
+        assert chunk_blocked, "Superuser cross-tenant chunk overwrite was NOT blocked!"
+
+        # 4d. High #4: Registering a real legacy `pgvector` table auto-hydrates on `build_or_update_knowledge_graph`!
+        su_conn = await asyncpg.connect(admin_dsn)
+        try:
+            await su_conn.execute("DROP TABLE IF EXISTS legacy_finops_vectors;")
+            await su_conn.execute(
+                """
+                CREATE TABLE legacy_finops_vectors (
+                    id TEXT PRIMARY KEY,
+                    doc_id TEXT NOT NULL,
+                    chunk_text TEXT NOT NULL,
+                    embedding vector(384) NOT NULL,
+                    metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+                );
+                """
+            )
+            v384 = "[" + ",".join(f"{x:.5f}" for x in emb.embed_text("finops", dim=384)) + "]"
+            await su_conn.execute(
+                """
+                INSERT INTO legacy_finops_vectors (id, doc_id, chunk_text, embedding, metadata)
+                VALUES ('leg_1', 'fin_doc_1', 'Microservice payment-router-01 is allocated to cost center CC-505-Live.', $1::vector, '{}'::jsonb)
+                """,
+                v384,
+            )
+            await su_conn.execute(f"GRANT SELECT ON legacy_finops_vectors TO {APP_ROLE};")
+        finally:
+            await su_conn.close()
+
+        from enterprise_kg_fabric import VectorKBColumnMapping
+
+        await svc.register_vector_kb(
+            VectorKBRegistration(
+                kb_id="kb_legacy_auto_finops",
+                tenant_id="tenant_alpha",
+                domain_tag="finops",
+                source_type=KBSourceType.EXISTING_PGVECTOR_KB,
+                table_name="legacy_finops_vectors",
+                embedding_dim=384,
+                column_mapping=VectorKBColumnMapping(id_column="id", text_column="chunk_text"),
+            )
+        )
+        legacy_build = await svc.build_or_update_knowledge_graph(tenant_id="tenant_alpha", incremental=True)
+        assert legacy_build.delta_chunks_extracted >= 1, (
+            f"Expected registered legacy pgvector table to auto-hydrate on build, got {legacy_build}"
+        )
+    finally:
+        await su_store.close()
+    print(f"[3] Verified PostgreSQL 16 Kernel RLS (`NOBYPASSRLS`) + Superuser Overwrite Guard + Auto Legacy Table Hydration")
 
     # 5. Live PostgreSQL `pg_try_advisory_lock` Multi-Replica Sync Worker Proof
     lock_key = svc._sync_lock_key("tenant_alpha")
@@ -304,7 +388,8 @@ async def main() -> None:
             pub_hdr = {"Authorization": f"Bearer {pub_jwt}"}
             conf_hdr = {"Authorization": f"Bearer {conf_jwt}"}
 
-            # 6c. Cross-tenant smuggling, query-vs-body smuggling, reader write block, MCP cross-tenant resource -> 403
+            # 6c. Cross-tenant smuggling, query-vs-body smuggling, reader write block, raw Cypher block,
+            #     MCP plural write block, cross-tenant KB/chunk overwrite block, MCP cross-tenant resource -> 403
             r_cross = await client.get("/v1/telemetry", params={"tenant_id": "tenant_beta"}, headers=pub_hdr)
             assert r_cross.status_code == 403
             r_smuggle = await client.post(
@@ -316,6 +401,25 @@ async def main() -> None:
             assert r_smuggle.status_code == 403
             r_write = await client.post("/v1/graph/build", json={"tenant_id": "tenant_alpha"}, headers=pub_hdr)
             assert r_write.status_code == 403
+            r_cypher_rb = await client.post(
+                "/v1/search/cypher",
+                json={"tenant_id": "tenant_alpha", "cypher_query": "MATCH (n) RETURN n.canonical_name"},
+                headers=pub_hdr,
+            )
+            assert r_cypher_rb.status_code == 403
+            r_mcp_write = await client.post(
+                "/v1/mcp/call",
+                json={
+                    "tool_name": "ingest_raw_documents",
+                    "arguments": {
+                        "documents": [
+                            {"doc_id": "pwn", "kb_id": "kb_alpha_sre", "tenant_id": "tenant_beta", "title": "X", "content": "Evil"}
+                        ]
+                    },
+                },
+                headers=pub_hdr,
+            )
+            assert r_mcp_write.status_code == 403
             r_mcp_res = await client.post(
                 "/mcp",
                 json={"jsonrpc": "2.0", "id": 1, "method": "resources/read", "params": {"uri": "kg://ontology/tenant_beta/tbox"}},

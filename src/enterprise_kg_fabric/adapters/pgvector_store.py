@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import math
 import re
 from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
@@ -265,6 +264,15 @@ class PgVectorStorePort(ABC):
     async def release_advisory_lock(self, lock_key: int) -> None:
         return None
 
+    async def unregister_kb(self, tenant_id: str, kb_id: str) -> int:
+        return 0
+
+    async def delete_document(self, tenant_id: str, kb_id: str, doc_id: str) -> int:
+        return 0
+
+    async def purge_tenant(self, tenant_id: str) -> dict[str, int]:
+        return {}
+
     async def close(self) -> None:
         return None
 
@@ -286,6 +294,7 @@ class PgVectorStorePort(ABC):
         kb_id: str,
         only_unindexed_or_changed: bool = False,
         target_tbox_version: str | None = None,
+        tenant_id: str | None = None,
     ) -> list[VectorChunkRecord]:
         raise NotImplementedError
 
@@ -382,8 +391,63 @@ class InMemoryPgVectorStoreEmulator(PgVectorStorePort):
         return [r for r in self._dlq_records if r.tenant_id == tenant_id]
 
     async def register_kb(self, registration: VectorKBRegistration) -> None:
+        existing = self._kb_registry.get(registration.kb_id)
+        if existing is not None and existing.tenant_id != registration.tenant_id:
+            raise PermissionError(
+                f"KB '{registration.kb_id}' is owned by another tenant and cannot be overwritten."
+            )
         self._kb_registry[registration.kb_id] = registration
         self._kb_tables.setdefault(registration.kb_id, {})
+
+    async def unregister_kb(self, tenant_id: str, kb_id: str) -> int:
+        existing = self._kb_registry.get(kb_id)
+        if existing is None:
+            return 0
+        if existing.tenant_id != tenant_id:
+            raise PermissionError(f"KB '{kb_id}' belongs to another tenant.")
+        del self._kb_registry[kb_id]
+        removed_chunks = len(self._kb_tables.pop(kb_id, {}))
+        for key in [k for k in self._watermarks if k[0] == kb_id]:
+            del self._watermarks[key]
+        return removed_chunks
+
+    async def delete_document(self, tenant_id: str, kb_id: str, doc_id: str) -> int:
+        existing = self._kb_registry.get(kb_id)
+        if existing is not None and existing.tenant_id != tenant_id:
+            raise PermissionError(f"KB '{kb_id}' belongs to another tenant.")
+        table = self._kb_tables.get(kb_id, {})
+        to_delete = [
+            cid for cid, chk in table.items() if chk.tenant_id == tenant_id and chk.doc_id == doc_id
+        ]
+        for cid in to_delete:
+            del table[cid]
+            self._watermarks.pop((kb_id, cid), None)
+        return len(to_delete)
+
+    async def purge_tenant(self, tenant_id: str) -> dict[str, int]:
+        kb_ids = [kid for kid, reg in self._kb_registry.items() if reg.tenant_id == tenant_id]
+        chunks_removed = 0
+        for kid in kb_ids:
+            chunks_removed += await self.unregister_kb(tenant_id, kid)
+        ent_removed = 0
+        for eid in [k for k, v in self._entity_index.items() if v.tenant_id == tenant_id]:
+            del self._entity_index[eid]
+            ent_removed += 1
+        tbox_removed = 1 if self._tboxes.pop(tenant_id, None) is not None else 0
+        jobs_removed = 0
+        for jid in [k for k, v in self._sync_jobs.items() if v.tenant_id == tenant_id]:
+            del self._sync_jobs[jid]
+            jobs_removed += 1
+        before_dlq = len(self._dlq_records)
+        self._dlq_records = [r for r in self._dlq_records if r.tenant_id != tenant_id]
+        return {
+            "kbs_removed": len(kb_ids),
+            "chunks_removed": chunks_removed,
+            "entity_embeddings_removed": ent_removed,
+            "tboxes_removed": tbox_removed,
+            "sync_jobs_removed": jobs_removed,
+            "dlq_records_removed": before_dlq - len(self._dlq_records),
+        }
 
     async def list_registered_kbs(self, tenant_id: str | None = None) -> list[VectorKBRegistration]:
         all_kbs = list(self._kb_registry.values())
@@ -392,15 +456,13 @@ class InMemoryPgVectorStoreEmulator(PgVectorStorePort):
         return all_kbs
 
     async def upsert_kb_chunks(self, kb_id: str, chunks: Sequence[VectorChunkRecord]) -> int:
+        if not chunks:
+            return 0
         if kb_id not in self._kb_registry:
             # Auto-register default KB entry if needed
-            first_tenant = chunks[0].tenant_id if chunks else "enterprise_default"
-            first_domain = chunks[0].domain_tag if chunks else "general"
-            first_dim = (
-                chunks[0].native_embedding_dim
-                if (chunks and chunks[0].native_embedding_dim > 0)
-                else 768
-            )
+            first_tenant = chunks[0].tenant_id
+            first_domain = chunks[0].domain_tag
+            first_dim = chunks[0].native_embedding_dim if chunks[0].native_embedding_dim > 0 else 768
             await self.register_kb(
                 VectorKBRegistration(
                     kb_id=kb_id,
@@ -412,9 +474,20 @@ class InMemoryPgVectorStoreEmulator(PgVectorStorePort):
             )
 
         reg = self._kb_registry[kb_id]
+        for chk in chunks:
+            if chk.tenant_id != reg.tenant_id:
+                raise PermissionError(
+                    f"Cannot write chunk for tenant '{chk.tenant_id}' into KB '{kb_id}' owned by another tenant."
+                )
+
         table = self._kb_tables.setdefault(kb_id, {})
         count = 0
         for chk in chunks:
+            prev = table.get(chk.chunk_id)
+            if prev is not None and prev.tenant_id != chk.tenant_id:
+                raise PermissionError(
+                    f"Chunk '{chk.chunk_id}' belongs to another tenant and cannot be overwritten."
+                )
             if not chk.native_embedding:
                 chk.native_embedding = self.embedding_provider.embed_text(
                     chk.text, dim=reg.embedding_dim
@@ -433,14 +506,18 @@ class InMemoryPgVectorStoreEmulator(PgVectorStorePort):
         kb_id: str,
         only_unindexed_or_changed: bool = False,
         target_tbox_version: str | None = None,
+        tenant_id: str | None = None,
     ) -> list[VectorChunkRecord]:
         table = self._kb_tables.get(kb_id, {})
+        values = [
+            chk for chk in table.values() if tenant_id is None or chk.tenant_id == tenant_id
+        ]
         if not only_unindexed_or_changed:
-            return list(table.values())
+            return values
 
         delta_chunks: list[VectorChunkRecord] = []
-        for chunk_id, chk in table.items():
-            wm = self._watermarks.get((kb_id, chunk_id))
+        for chk in values:
+            wm = self._watermarks.get((kb_id, chk.chunk_id))
             if wm is None:
                 delta_chunks.append(chk)
             elif wm.content_sha256 != chk.content_sha256:
@@ -680,6 +757,15 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
                 await self._pool.release(conn)
 
     async def register_kb(self, registration: VectorKBRegistration) -> None:
+        async with self._scoped_conn("*") as conn:
+            existing_owner = await conn.fetchval(
+                "SELECT tenant_id FROM kb_federation_registry WHERE kb_id = $1",
+                registration.kb_id,
+            )
+            if existing_owner is not None and existing_owner != registration.tenant_id:
+                raise PermissionError(
+                    f"KB '{registration.kb_id}' is owned by another tenant and cannot be overwritten."
+                )
         async with self._scoped_conn(registration.tenant_id) as conn:
             await conn.execute(
                 """
@@ -692,6 +778,7 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
                     domain_tag = EXCLUDED.domain_tag,
                     table_name = EXCLUDED.table_name,
                     embedding_dim = EXCLUDED.embedding_dim
+                WHERE kb_federation_registry.tenant_id = EXCLUDED.tenant_id
                 """,
                 registration.kb_id,
                 registration.tenant_id,
@@ -706,6 +793,105 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
                 registration.owner_team,
                 registration.security_classification,
             )
+
+    async def unregister_kb(self, tenant_id: str, kb_id: str) -> int:
+        async with self._scoped_conn("*") as conn:
+            owner = await conn.fetchval(
+                "SELECT tenant_id FROM kb_federation_registry WHERE kb_id = $1", kb_id
+            )
+            if owner is not None and owner != tenant_id:
+                raise PermissionError(f"KB '{kb_id}' belongs to another tenant.")
+        async with self._scoped_conn(tenant_id) as conn:
+            deleted_chunks = await conn.fetchval(
+                "WITH d AS (DELETE FROM unified_rag_chunks WHERE tenant_id = $1 AND kb_id = $2 RETURNING 1) SELECT count(*) FROM d",
+                tenant_id,
+                kb_id,
+            )
+            await conn.execute("DELETE FROM kb_ingestion_watermarks WHERE kb_id = $1", kb_id)
+            await conn.execute(
+                "DELETE FROM kb_federation_registry WHERE tenant_id = $1 AND kb_id = $2",
+                tenant_id,
+                kb_id,
+            )
+            return int(deleted_chunks or 0)
+
+    async def delete_document(self, tenant_id: str, kb_id: str, doc_id: str) -> int:
+        async with self._scoped_conn(tenant_id) as conn:
+            rows = await conn.fetch(
+                "DELETE FROM unified_rag_chunks WHERE tenant_id = $1 AND kb_id = $2 AND doc_id = $3 RETURNING chunk_id",
+                tenant_id,
+                kb_id,
+                doc_id,
+            )
+            chunk_ids = [r["chunk_id"] for r in rows]
+            if chunk_ids:
+                await conn.execute(
+                    "DELETE FROM kb_ingestion_watermarks WHERE kb_id = $1 AND chunk_id = ANY($2::text[])",
+                    kb_id,
+                    chunk_ids,
+                )
+            return len(chunk_ids)
+
+    async def purge_tenant(self, tenant_id: str) -> dict[str, int]:
+        async with self._scoped_conn(tenant_id) as conn:
+            kbs = await conn.fetch(
+                "SELECT kb_id FROM kb_federation_registry WHERE tenant_id = $1", tenant_id
+            )
+            kb_ids = [r["kb_id"] for r in kbs]
+            chunks_removed = int(
+                await conn.fetchval(
+                    "WITH d AS (DELETE FROM unified_rag_chunks WHERE tenant_id = $1 RETURNING 1) SELECT count(*) FROM d",
+                    tenant_id,
+                )
+                or 0
+            )
+            if kb_ids:
+                await conn.execute(
+                    "DELETE FROM kb_ingestion_watermarks WHERE kb_id = ANY($1::text[])", kb_ids
+                )
+            kbs_removed = int(
+                await conn.fetchval(
+                    "WITH d AS (DELETE FROM kb_federation_registry WHERE tenant_id = $1 RETURNING 1) SELECT count(*) FROM d",
+                    tenant_id,
+                )
+                or 0
+            )
+            ents_removed = int(
+                await conn.fetchval(
+                    "WITH d AS (DELETE FROM canonical_entity_embeddings WHERE tenant_id = $1 RETURNING 1) SELECT count(*) FROM d",
+                    tenant_id,
+                )
+                or 0
+            )
+            tbox_removed = int(
+                await conn.fetchval(
+                    "WITH d AS (DELETE FROM enterprise_tbox_registry WHERE tenant_id = $1 RETURNING 1) SELECT count(*) FROM d",
+                    tenant_id,
+                )
+                or 0
+            )
+            jobs_removed = int(
+                await conn.fetchval(
+                    "WITH d AS (DELETE FROM kg_sync_jobs WHERE tenant_id = $1 RETURNING 1) SELECT count(*) FROM d",
+                    tenant_id,
+                )
+                or 0
+            )
+            dlq_removed = int(
+                await conn.fetchval(
+                    "WITH d AS (DELETE FROM kg_dlq_chunks WHERE tenant_id = $1 RETURNING 1) SELECT count(*) FROM d",
+                    tenant_id,
+                )
+                or 0
+            )
+            return {
+                "kbs_removed": kbs_removed,
+                "chunks_removed": chunks_removed,
+                "entity_embeddings_removed": ents_removed,
+                "tboxes_removed": tbox_removed,
+                "sync_jobs_removed": jobs_removed,
+                "dlq_records_removed": dlq_removed,
+            }
 
     async def list_registered_kbs(self, tenant_id: str | None = None) -> list[VectorKBRegistration]:
         async with self._scoped_conn(tenant_id or "*") as conn:
@@ -865,7 +1051,7 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
             canon_vec = self.embedding_provider.embed_text(text_val, dim=self.canonical_dim)
             hydrated.append(
                 VectorChunkRecord(
-                    chunk_id=str(r["cid"]),
+                    chunk_id=f"{registration.tenant_id}::{registration.kb_id}::{r['cid']}",
                     kb_id=registration.kb_id,
                     tenant_id=registration.tenant_id,
                     domain_tag=registration.domain_tag,
@@ -882,6 +1068,29 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
     async def upsert_kb_chunks(self, kb_id: str, chunks: Sequence[VectorChunkRecord]) -> int:
         if not chunks:
             return 0
+        # Enforce KB ownership & cross-tenant chunk_id collision protection (even under DB superuser)
+        incoming_tenants = {chk.tenant_id for chk in chunks}
+        incoming_cids = [chk.chunk_id for chk in chunks]
+        async with self._scoped_conn("*") as conn:
+            kb_owner = await conn.fetchval(
+                "SELECT tenant_id FROM kb_federation_registry WHERE kb_id = $1", kb_id
+            )
+            if kb_owner is not None and any(t != kb_owner for t in incoming_tenants):
+                raise PermissionError(
+                    f"Cannot write chunks into KB '{kb_id}' owned by another tenant."
+                )
+            existing_rows = await conn.fetch(
+                "SELECT chunk_id, tenant_id FROM unified_rag_chunks WHERE chunk_id = ANY($1::text[])",
+                incoming_cids,
+            )
+            existing_owners = {r["chunk_id"]: r["tenant_id"] for r in existing_rows}
+            for chk in chunks:
+                owner = existing_owners.get(chk.chunk_id)
+                if owner is not None and owner != chk.tenant_id:
+                    raise PermissionError(
+                        f"Chunk '{chk.chunk_id}' belongs to another tenant and cannot be overwritten."
+                    )
+
         # Group by tenant_id so each batch executes under its strict RLS tenant context
         by_tenant: dict[str, list[tuple[Any, ...]]] = {}
         for chk in chunks:
@@ -923,6 +1132,7 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
                         acl_groups = EXCLUDED.acl_groups,
                         metadata = EXCLUDED.metadata,
                         updated_at = NOW()
+                    WHERE unified_rag_chunks.tenant_id = EXCLUDED.tenant_id
                     """,
                     rows_to_insert,
                 )
@@ -933,8 +1143,9 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
         kb_id: str,
         only_unindexed_or_changed: bool = False,
         target_tbox_version: str | None = None,
+        tenant_id: str | None = None,
     ) -> list[VectorChunkRecord]:
-        async with self._scoped_conn("*") as conn:
+        async with self._scoped_conn(tenant_id or "*") as conn:
             if only_unindexed_or_changed:
                 rows = await conn.fetch(
                     """
@@ -945,11 +1156,13 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
                     LEFT JOIN kb_ingestion_watermarks w
                       ON c.kb_id = w.kb_id AND c.chunk_id = w.chunk_id
                     WHERE c.kb_id = $1
+                      AND ($3::text IS NULL OR c.tenant_id = $3)
                       AND (w.chunk_id IS NULL OR w.content_sha256 != c.content_sha256
                            OR ($2::text IS NOT NULL AND w.tbox_version != $2))
                     """,
                     kb_id,
                     target_tbox_version,
+                    tenant_id,
                 )
             else:
                 rows = await conn.fetch(
@@ -957,9 +1170,12 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
                     SELECT chunk_id, kb_id, tenant_id, domain_tag, doc_id,
                            text, content_sha256, canonical_embedding::text AS emb_txt,
                            section_path, acl_groups, metadata, updated_at
-                    FROM unified_rag_chunks WHERE kb_id = $1
+                    FROM unified_rag_chunks
+                    WHERE kb_id = $1
+                      AND ($2::text IS NULL OR tenant_id = $2)
                     """,
                     kb_id,
+                    tenant_id,
                 )
             out: list[VectorChunkRecord] = []
             for r in rows:

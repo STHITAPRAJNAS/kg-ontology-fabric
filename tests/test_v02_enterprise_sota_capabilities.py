@@ -10,7 +10,6 @@ from enterprise_kg_fabric import (
     PPRSearchRequest,
     QueryRouteDecision,
     RawDocumentInput,
-    StructuredLLMExtractorAdapter,
     SyncJobStatus,
     VectorChunkRecord,
     VectorKBRegistration,

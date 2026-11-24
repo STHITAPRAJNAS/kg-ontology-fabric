@@ -71,6 +71,9 @@ class PropertyGraphStorePort(ABC):
     ) -> list[dict[str, Any]]:
         raise NotImplementedError
 
+    async def purge_tenant(self, tenant_id: str) -> int:
+        return 0
+
     async def close(self) -> None:
         return None
 
@@ -93,6 +96,12 @@ class InMemoryOpenCypherGraphEmulator(PropertyGraphStorePort):
 
     async def persist_ontology_tbox(self, tbox: EnterpriseCompiledTBox) -> None:
         self._tboxes[tbox.tenant_id] = tbox
+
+    async def purge_tenant(self, tenant_id: str) -> int:
+        ent_count = len(self._entities.pop(tenant_id, {}))
+        self._edges.pop(tenant_id, None)
+        self._tboxes.pop(tenant_id, None)
+        return ent_count
 
     async def upsert_entities_and_bitemporal_edges(
         self,
@@ -766,17 +775,40 @@ class Neo4jOpenCypherGraphAdapter(PropertyGraphStorePort):
         params: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         driver = self._get_driver()
-        async with driver.session() as session:
+        try:
+            from neo4j import READ_ACCESS
+
+            session_kwargs: dict[str, Any] = {"default_access_mode": READ_ACCESS}
+        except ImportError:
+            session_kwargs = {}
+        async with driver.session(**session_kwargs) as session:
             result = await session.run(cypher_query, **(params or {}))
             records = await result.data()
             return records
+
+    async def purge_tenant(self, tenant_id: str) -> int:
+        driver = self._get_driver()
+        async with driver.session() as session:
+            res = await session.run(
+                """
+                MATCH (n {tenant_id: $tenant_id})
+                WITH count(n) AS cnt
+                MATCH (m {tenant_id: $tenant_id})
+                DETACH DELETE m
+                RETURN cnt
+                """,
+                tenant_id=tenant_id,
+            )
+            rec = await res.single()
+            return int(rec["cnt"]) if rec and rec["cnt"] is not None else 0
 
 
 class NeptuneOpenCypherGraphAdapter(PropertyGraphStorePort):
     """
     Production Amazon Neptune Database / Neptune Analytics OpenCypher Adapter.
     Uses `boto3` `neptunedata` client (`execute_open_cypher_query`) with AWS SigV4
-    authentication and 100% Neptune-compatible OpenCypher (zero Neo4j APOC dependency).
+    authentication and 100% live Neptune-compatible OpenCypher (zero Neo4j APOC or
+    in-memory mirror dependency).
     """
 
     def __init__(self, endpoint_url: str, region_name: str = "us-east-1"):
@@ -787,7 +819,6 @@ class NeptuneOpenCypherGraphAdapter(PropertyGraphStorePort):
         )
         self.region_name = region_name
         self._client: Any = None
-        self._mirror = InMemoryOpenCypherGraphEmulator()
 
     def _get_client(self) -> Any:
         if self._client is None:
@@ -813,18 +844,31 @@ class NeptuneOpenCypherGraphAdapter(PropertyGraphStorePort):
         return resp.get("results", [])
 
     async def persist_ontology_tbox(self, tbox: EnterpriseCompiledTBox) -> None:
-        await self._mirror.persist_ontology_tbox(tbox)
         class_rows = [c.model_dump() for c in tbox.classes.values()]
+        rel_rows = [r.model_dump() for r in tbox.relations.values()]
         if class_rows:
             await self._run_neptune_cypher(
                 """
                 UNWIND $classes AS c
-                MERGE (cls:OntologyClass {`~id`: c.class_name, tenant_id: $tenant_id})
+                MERGE (cls:OntologyClass {class_name: c.class_name, tenant_id: $tenant_id})
                 SET cls.upper_category = c.upper_category,
                     cls.description = c.description,
-                    cls.status = c.status
+                    cls.status = c.status,
+                    cls.tbox_version = $version
                 """,
-                {"classes": class_rows, "tenant_id": tbox.tenant_id},
+                {"classes": class_rows, "tenant_id": tbox.tenant_id, "version": tbox.version},
+            )
+        if rel_rows:
+            await self._run_neptune_cypher(
+                """
+                UNWIND $rels AS r
+                MERGE (rel:OntologyRelation {predicate: r.predicate, tenant_id: $tenant_id})
+                SET rel.is_functional = r.is_functional,
+                    rel.is_transitive = r.is_transitive,
+                    rel.status = r.status,
+                    rel.tbox_version = $version
+                """,
+                {"rels": rel_rows, "tenant_id": tbox.tenant_id, "version": tbox.version},
             )
 
     async def upsert_entities_and_bitemporal_edges(
@@ -833,28 +877,249 @@ class NeptuneOpenCypherGraphAdapter(PropertyGraphStorePort):
         entities: Sequence[KGEntityNode],
         edges: Sequence[KGRelationEdge],
     ) -> int:
-        superseded = await self._mirror.upsert_entities_and_bitemporal_edges(
-            tenant_id, entities, edges
-        )
-        ent_rows = [e.model_dump(exclude={"embedding"}) for e in entities]
+        ent_rows = []
+        for e in entities:
+            d = e.model_dump(exclude={"embedding"})
+            d["aliases_json"] = json.dumps(e.aliases)
+            d["source_kb_ids_json"] = json.dumps(e.source_kb_ids)
+            d["source_chunk_ids_json"] = json.dumps(e.source_chunk_ids)
+            d["acl_groups_json"] = json.dumps(e.acl_groups)
+            ent_rows.append(d)
         if ent_rows:
             await self._run_neptune_cypher(
                 """
                 UNWIND $entities AS e
-                MERGE (n:Entity {`~id`: e.entity_id, tenant_id: e.tenant_id})
+                MERGE (n:Entity {entity_id: e.entity_id, tenant_id: e.tenant_id})
                 SET n.canonical_name = e.canonical_name,
                     n.ontology_class = e.ontology_class,
-                    n.upper_category = e.upper_category
+                    n.upper_category = e.upper_category,
+                    n.aliases_json = e.aliases_json,
+                    n.summary = e.summary,
+                    n.source_kb_ids_json = e.source_kb_ids_json,
+                    n.source_chunk_ids_json = e.source_chunk_ids_json,
+                    n.acl_groups_json = e.acl_groups_json,
+                    n.mention_count = e.mention_count,
+                    n.confidence = e.confidence,
+                    n.governance_bucket = e.governance_bucket,
+                    n.updated_at = e.updated_at
                 """,
                 {"entities": ent_rows},
             )
-        return superseded
+
+        sorted_edges = sorted(edges, key=lambda e: e.t_valid)
+        superseded_closed = 0
+        non_func_rows: list[dict[str, Any]] = []
+        for edge in sorted_edges:
+            ed = edge.model_dump(exclude={"qualifiers"})
+            ed["source_kb_ids_json"] = json.dumps(edge.source_kb_ids)
+            ed["source_chunk_ids_json"] = json.dumps(edge.source_chunk_ids)
+            ed["evidence_snippets_json"] = json.dumps(edge.evidence_snippets)
+            ed["acl_groups_json"] = json.dumps(edge.acl_groups)
+            ed["qualifiers_json"] = json.dumps(edge.qualifiers)
+
+            if not edge.is_functional:
+                non_func_rows.append(ed)
+                continue
+
+            closed = await self._run_neptune_cypher(
+                """
+                MATCH (s:Entity {entity_id: $src_id, tenant_id: $tenant_id})
+                      -[old:KG_RELATION]->(other:Entity {tenant_id: $tenant_id})
+                WHERE old.predicate = $predicate
+                  AND old.t_invalid = 'ACTIVE'
+                  AND other.entity_id <> $tgt_id
+                  AND old.t_valid <= $t_valid
+                SET old.t_invalid = $t_valid
+                RETURN count(old) AS closed_cnt
+                """,
+                {
+                    "src_id": edge.source_entity_id,
+                    "tgt_id": edge.target_entity_id,
+                    "tenant_id": tenant_id,
+                    "predicate": edge.predicate,
+                    "t_valid": edge.t_valid,
+                },
+            )
+            if closed:
+                superseded_closed += int(closed[0].get("closed_cnt", 0))
+
+            newer = await self._run_neptune_cypher(
+                """
+                MATCH (s:Entity {entity_id: $src_id, tenant_id: $tenant_id})
+                      -[newer:KG_RELATION]->(other:Entity {tenant_id: $tenant_id})
+                WHERE newer.predicate = $predicate
+                  AND newer.t_invalid = 'ACTIVE'
+                  AND other.entity_id <> $tgt_id
+                  AND newer.t_valid > $t_valid
+                RETURN newer.t_valid AS newer_t_valid
+                ORDER BY newer.t_valid ASC
+                LIMIT 1
+                """,
+                {
+                    "src_id": edge.source_entity_id,
+                    "tgt_id": edge.target_entity_id,
+                    "tenant_id": tenant_id,
+                    "predicate": edge.predicate,
+                    "t_valid": edge.t_valid,
+                },
+            )
+            if newer and newer[0].get("newer_t_valid"):
+                ed["t_invalid"] = newer[0]["newer_t_valid"]
+                superseded_closed += 1
+
+            await self._run_neptune_cypher(
+                """
+                MATCH (s:Entity {entity_id: $r.source_entity_id, tenant_id: $r.tenant_id})
+                MATCH (t:Entity {entity_id: $r.target_entity_id, tenant_id: $r.tenant_id})
+                MERGE (s)-[rel:KG_RELATION {edge_id: $r.edge_id}]->(t)
+                SET rel.predicate = $r.predicate,
+                    rel.is_functional = $r.is_functional,
+                    rel.t_valid = $r.t_valid,
+                    rel.t_invalid = $r.t_invalid,
+                    rel.source_kb_ids_json = $r.source_kb_ids_json,
+                    rel.source_chunk_ids_json = $r.source_chunk_ids_json,
+                    rel.evidence_snippets_json = $r.evidence_snippets_json,
+                    rel.acl_groups_json = $r.acl_groups_json,
+                    rel.qualifiers_json = $r.qualifiers_json,
+                    rel.confidence = $r.confidence,
+                    rel.governance_bucket = $r.governance_bucket
+                """,
+                {"r": ed},
+            )
+
+        if non_func_rows:
+            await self._run_neptune_cypher(
+                """
+                UNWIND $edges AS r
+                MATCH (s:Entity {entity_id: r.source_entity_id, tenant_id: r.tenant_id})
+                MATCH (t:Entity {entity_id: r.target_entity_id, tenant_id: r.tenant_id})
+                MERGE (s)-[rel:KG_RELATION {edge_id: r.edge_id}]->(t)
+                SET rel.predicate = r.predicate,
+                    rel.is_functional = r.is_functional,
+                    rel.t_valid = r.t_valid,
+                    rel.t_invalid = r.t_invalid,
+                    rel.source_kb_ids_json = r.source_kb_ids_json,
+                    rel.source_chunk_ids_json = r.source_chunk_ids_json,
+                    rel.evidence_snippets_json = r.evidence_snippets_json,
+                    rel.acl_groups_json = r.acl_groups_json,
+                    rel.qualifiers_json = r.qualifiers_json,
+                    rel.confidence = r.confidence,
+                    rel.governance_bucket = r.governance_bucket
+                """,
+                {"edges": non_func_rows},
+            )
+        return superseded_closed
+
+    @staticmethod
+    def _loads_list(raw: Any, default: list[str] | None = None) -> list[str]:
+        if isinstance(raw, list):
+            return [str(x) for x in raw]
+        if isinstance(raw, str) and raw:
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    return [str(x) for x in parsed]
+            except Exception:
+                pass
+        return list(default or [])
+
+    @staticmethod
+    def _loads_dict(raw: Any) -> dict[str, Any]:
+        if isinstance(raw, dict):
+            return dict(raw)
+        if isinstance(raw, str) and raw:
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                pass
+        return {}
 
     async def get_all_entities(self, tenant_id: str) -> dict[str, KGEntityNode]:
-        return await self._mirror.get_all_entities(tenant_id)
+        from ..models import UpperOntologyCategory
+
+        rows = await self._run_neptune_cypher(
+            """
+            MATCH (n:Entity {tenant_id: $tenant_id})
+            RETURN n.entity_id AS entity_id,
+                   n.tenant_id AS tenant_id,
+                   n.canonical_name AS canonical_name,
+                   n.ontology_class AS ontology_class,
+                   n.upper_category AS upper_category,
+                   n.aliases_json AS aliases_json,
+                   coalesce(n.summary, '') AS summary,
+                   n.source_kb_ids_json AS source_kb_ids_json,
+                   n.source_chunk_ids_json AS source_chunk_ids_json,
+                   n.acl_groups_json AS acl_groups_json,
+                   coalesce(n.mention_count, 1) AS mention_count,
+                   coalesce(n.confidence, 0.9) AS confidence,
+                   coalesce(n.governance_bucket, 'APPROVED') AS governance_bucket
+            """,
+            {"tenant_id": tenant_id},
+        )
+        out: dict[str, KGEntityNode] = {}
+        for r in rows:
+            out[r["entity_id"]] = KGEntityNode(
+                entity_id=r["entity_id"],
+                tenant_id=r["tenant_id"],
+                canonical_name=r["canonical_name"],
+                ontology_class=r["ontology_class"],
+                upper_category=UpperOntologyCategory(r["upper_category"]),
+                aliases=self._loads_list(r.get("aliases_json")),
+                summary=r.get("summary", ""),
+                source_kb_ids=self._loads_list(r.get("source_kb_ids_json")),
+                source_chunk_ids=self._loads_list(r.get("source_chunk_ids_json")),
+                acl_groups=self._loads_list(r.get("acl_groups_json"), ["public"]),
+                mention_count=int(r.get("mention_count", 1)),
+                confidence=float(r.get("confidence", 0.9)),
+                governance_bucket=OntologyStatus(r.get("governance_bucket", "APPROVED")),
+            )
+        return out
 
     async def get_all_edges(self, tenant_id: str, active_only: bool = True) -> list[KGRelationEdge]:
-        return await self._mirror.get_all_edges(tenant_id, active_only=active_only)
+        where_clause = "WHERE rel.t_invalid = 'ACTIVE'" if active_only else ""
+        rows = await self._run_neptune_cypher(
+            f"""
+            MATCH (s:Entity {{tenant_id: $tenant_id}})-[rel:KG_RELATION]->(t:Entity {{tenant_id: $tenant_id}})
+            {where_clause}
+            RETURN rel.edge_id AS edge_id,
+                   s.entity_id AS source_entity_id,
+                   t.entity_id AS target_entity_id,
+                   rel.predicate AS predicate,
+                   coalesce(rel.is_functional, false) AS is_functional,
+                   coalesce(rel.confidence, 0.9) AS confidence,
+                   rel.t_valid AS t_valid,
+                   rel.t_invalid AS t_invalid,
+                   rel.source_kb_ids_json AS source_kb_ids_json,
+                   rel.source_chunk_ids_json AS source_chunk_ids_json,
+                   rel.evidence_snippets_json AS evidence_snippets_json,
+                   rel.acl_groups_json AS acl_groups_json,
+                   rel.qualifiers_json AS qualifiers_json,
+                   coalesce(rel.governance_bucket, 'APPROVED') AS governance_bucket
+            """,
+            {"tenant_id": tenant_id},
+        )
+        return [
+            KGRelationEdge(
+                edge_id=r["edge_id"],
+                tenant_id=tenant_id,
+                source_entity_id=r["source_entity_id"],
+                target_entity_id=r["target_entity_id"],
+                predicate=r["predicate"],
+                is_functional=bool(r.get("is_functional", False)),
+                confidence=float(r.get("confidence", 0.9)),
+                t_valid=r["t_valid"],
+                t_invalid=r["t_invalid"],
+                source_kb_ids=self._loads_list(r.get("source_kb_ids_json")),
+                source_chunk_ids=self._loads_list(r.get("source_chunk_ids_json")),
+                evidence_snippets=self._loads_list(r.get("evidence_snippets_json")),
+                acl_groups=self._loads_list(r.get("acl_groups_json"), ["public"]),
+                qualifiers=self._loads_dict(r.get("qualifiers_json")),
+                governance_bucket=OntologyStatus(r.get("governance_bucket", "APPROVED")),
+            )
+            for r in rows
+        ]
 
     async def expand_k_hop_subgraph(
         self,
@@ -865,7 +1130,14 @@ class NeptuneOpenCypherGraphAdapter(PropertyGraphStorePort):
         as_of_iso: str | None = None,
         caller_acl_groups: Sequence[str] | None = None,
     ) -> tuple[list[RetrievedGraphFact], list[str]]:
-        return await self._mirror.expand_k_hop_subgraph(
+        if not seed_entity_ids:
+            return [], []
+        all_entities = await self.get_all_entities(tenant_id)
+        all_edges = await self.get_all_edges(tenant_id, active_only=(as_of_iso is None))
+        tmp = InMemoryOpenCypherGraphEmulator()
+        tmp._entities[tenant_id] = all_entities
+        tmp._edges[tenant_id] = {e.edge_id: e for e in all_edges}
+        return await tmp.expand_k_hop_subgraph(
             tenant_id=tenant_id,
             seed_entity_ids=seed_entity_ids,
             max_hops=max_hops,
@@ -881,3 +1153,16 @@ class NeptuneOpenCypherGraphAdapter(PropertyGraphStorePort):
         params: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         return await self._run_neptune_cypher(cypher_query, params or {})
+
+    async def purge_tenant(self, tenant_id: str) -> int:
+        res = await self._run_neptune_cypher(
+            """
+            MATCH (n {tenant_id: $tenant_id})
+            WITH count(n) AS cnt
+            MATCH (m {tenant_id: $tenant_id})
+            DETACH DELETE m
+            RETURN cnt
+            """,
+            {"tenant_id": tenant_id},
+        )
+        return int(res[0].get("cnt", 0)) if res else 0

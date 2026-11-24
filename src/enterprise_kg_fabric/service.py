@@ -265,7 +265,7 @@ class EnterpriseKGOntologyService:
         if graph_backend == "neptune" and neptune_endpoint:
             graph_store: PropertyGraphStorePort = NeptuneOpenCypherGraphAdapter(
                 endpoint_url=neptune_endpoint,
-                aws_region=os.getenv("AWS_REGION", "us-east-1"),
+                region_name=os.getenv("AWS_REGION", "us-east-1"),
             )
         elif graph_backend == "neo4j" and neo4j_uri:
             graph_store = Neo4jOpenCypherGraphAdapter(
@@ -409,6 +409,10 @@ class EnterpriseKGOntologyService:
         }
 
     async def register_vector_kb(self, registration: VectorKBRegistration) -> VectorKBRegistration:
+        safe_tenant, _ = self._enforce_service_principal(
+            registration.tenant_id, required_role="writer"
+        )
+        registration.tenant_id = safe_tenant
         await self.vector_store.register_kb(registration)
         return registration
 
@@ -416,8 +420,40 @@ class EnterpriseKGOntologyService:
         self, registrations: Sequence[VectorKBRegistration]
     ) -> int:
         for reg in registrations:
-            await self.vector_store.register_kb(reg)
+            await self.register_vector_kb(reg)
         return len(registrations)
+
+    async def unregister_kb(self, tenant_id: str, kb_id: str) -> dict[str, Any]:
+        safe_tenant, _ = self._enforce_service_principal(tenant_id, required_role="admin")
+        removed_chunks = await self.vector_store.unregister_kb(safe_tenant, kb_id)
+        return {"tenant_id": safe_tenant, "kb_id": kb_id, "chunks_removed": removed_chunks}
+
+    async def delete_document(self, tenant_id: str, kb_id: str, doc_id: str) -> dict[str, Any]:
+        safe_tenant, _ = self._enforce_service_principal(tenant_id, required_role="writer")
+        removed_chunks = await self.vector_store.delete_document(safe_tenant, kb_id, doc_id)
+        return {
+            "tenant_id": safe_tenant,
+            "kb_id": kb_id,
+            "doc_id": doc_id,
+            "chunks_removed": removed_chunks,
+        }
+
+    async def purge_tenant(self, tenant_id: str) -> dict[str, Any]:
+        """Complete GDPR / tenant offboarding purge across PostgreSQL/pgvector and Neo4j/Neptune."""
+        safe_tenant, _ = self._enforce_service_principal(tenant_id, required_role="admin")
+        vec_stats = await self.vector_store.purge_tenant(safe_tenant)
+        graph_nodes_removed = await self.graph_store.purge_tenant(safe_tenant)
+        self._tboxes.pop(safe_tenant, None)
+        self._last_quality_scores.pop(safe_tenant, None)
+        self._sync_jobs = {
+            jid: j for jid, j in self._sync_jobs.items() if j.tenant_id != safe_tenant
+        }
+        self._dlq_records = [r for r in self._dlq_records if r.tenant_id != safe_tenant]
+        return {
+            "tenant_id": safe_tenant,
+            "graph_nodes_removed": graph_nodes_removed,
+            **vec_stats,
+        }
 
     async def hydrate_existing_kb_chunks(
         self,
@@ -426,6 +462,10 @@ class EnterpriseKGOntologyService:
     ) -> int:
         scrubbed_chunks: list[VectorChunkRecord] = []
         for chk in chunks:
+            safe_tenant, _ = self._enforce_service_principal(
+                chk.tenant_id, required_role="writer"
+            )
+            chk.tenant_id = safe_tenant
             res = self.pii_redactor.analyze_and_redact(chk.text)
             chk.text = res.scrubbed_text
             if "acl_groups" not in chk.metadata:
@@ -434,6 +474,35 @@ class EnterpriseKGOntologyService:
                 self._pii_redaction_audit_counts[k] = self._pii_redaction_audit_counts.get(k, 0) + v
             scrubbed_chunks.append(chk)
         return await self.vector_store.upsert_kb_chunks(kb_id, scrubbed_chunks)
+
+    async def hydrate_from_registered_legacy_kbs(
+        self,
+        tenant_id: str = "enterprise_default",
+        kb_ids: list[str] | None = None,
+    ) -> int:
+        """
+        Reads real legacy PostgreSQL `pgvector` tables registered as `EXISTING_PGVECTOR_KB`
+        via `PostgresPgVectorStoreAdapter.reverse_hydrate_from_legacy_pgvector_table`,
+        scrubs PII via Microsoft Presidio, and hydrates into `unified_rag_chunks`.
+        """
+        if not isinstance(self.vector_store, PostgresPgVectorStoreAdapter):
+            return 0
+        registered_kbs = await self.vector_store.list_registered_kbs(tenant_id=tenant_id)
+        target_ids = set(kb_ids) if kb_ids else None
+        hydrated_total = 0
+        for kb in registered_kbs:
+            if kb.source_type != KBSourceType.EXISTING_PGVECTOR_KB:
+                continue
+            if target_ids is not None and kb.kb_id not in target_ids:
+                continue
+            try:
+                legacy_chunks = await self.vector_store.reverse_hydrate_from_legacy_pgvector_table(kb)
+            except Exception:
+                # Table may be a virtual/pre-hydrated KB without a local physical legacy table
+                continue
+            if legacy_chunks:
+                hydrated_total += await self.hydrate_existing_kb_chunks(kb.kb_id, legacy_chunks)
+        return hydrated_total
 
     async def ingest_raw_documents(
         self,
@@ -444,6 +513,10 @@ class EnterpriseKGOntologyService:
         by_kb: dict[str, list[VectorChunkRecord]] = {}
 
         for doc in documents:
+            safe_tenant, _ = self._enforce_service_principal(
+                doc.tenant_id, required_role="writer"
+            )
+            doc.tenant_id = safe_tenant
             existing_kbs = {
                 kb.kb_id for kb in await self.vector_store.list_registered_kbs(doc.tenant_id)
             }
@@ -500,13 +573,16 @@ class EnterpriseKGOntologyService:
         return await self.ingest_raw_documents(docs, native_kb_dim=native_kb_dim)
 
     async def load_or_get_tbox(self, tenant_id: str = "enterprise_default") -> EnterpriseCompiledTBox:
-        """Multi-pod safe TBox lookup: hydrates from persistent Postgres `enterprise_tbox_registry` on cold start."""
-        if tenant_id in self._tboxes:
-            return self._tboxes[tenant_id]
+        """
+        Multi-pod safe TBox lookup: checks persistent `enterprise_tbox_registry` first so
+        promotions or inductions performed by another worker/replica are visible immediately.
+        """
         persisted = await self.vector_store.load_tbox(tenant_id)
         if persisted is not None:
             self._tboxes[tenant_id] = persisted
             return persisted
+        if tenant_id in self._tboxes:
+            return self._tboxes[tenant_id]
         return EnterpriseCompiledTBox(tenant_id=tenant_id)
 
     def get_tbox(self, tenant_id: str = "enterprise_default") -> EnterpriseCompiledTBox:
@@ -521,7 +597,9 @@ class EnterpriseKGOntologyService:
         kb_ids: list[str] | None = None,
     ) -> tuple[EnterpriseCompiledTBox, OntologyInductionReport]:
         with _otel_span("kg_fabric.induce_and_align_ontology"):
-            registered_kbs = await self.vector_store.list_registered_kbs(tenant_id=tenant_id)
+            safe_tenant, _ = self._enforce_service_principal(tenant_id, required_role="writer")
+            await self.hydrate_from_registered_legacy_kbs(tenant_id=safe_tenant, kb_ids=kb_ids)
+            registered_kbs = await self.vector_store.list_registered_kbs(tenant_id=safe_tenant)
             target_kb_ids = set(kb_ids) if kb_ids else {kb.kb_id for kb in registered_kbs}
 
             chunks_by_kb: dict[str, list[VectorChunkRecord]] = {}
@@ -529,17 +607,17 @@ class EnterpriseKGOntologyService:
                 if kb.kb_id not in target_kb_ids:
                     continue
                 chks = await self.vector_store.fetch_kb_chunks(
-                    kb.kb_id, only_unindexed_or_changed=False
+                    kb.kb_id, only_unindexed_or_changed=False, tenant_id=safe_tenant
                 )
                 if chks:
                     chunks_by_kb[kb.kb_id] = chks
 
             tbox, report = self.ontology_inducer.induce_enterprise_tbox(
                 chunks_by_kb=chunks_by_kb,
-                tenant_id=tenant_id,
+                tenant_id=safe_tenant,
                 tbox_version=tbox_version,
             )
-            self._tboxes[tenant_id] = tbox
+            self._tboxes[safe_tenant] = tbox
             await self.vector_store.save_tbox(tbox)
             await self.graph_store.persist_ontology_tbox(tbox)
             return tbox, report
@@ -552,17 +630,19 @@ class EnterpriseKGOntologyService:
         allow_dynamic_emergent: bool = True,
     ) -> KGGraphBuildReport:
         with _otel_span("kg_fabric.build_or_update_knowledge_graph"):
-            tbox = await self.load_or_get_tbox(tenant_id)
+            safe_tenant, _ = self._enforce_service_principal(tenant_id, required_role="writer")
+            await self.hydrate_from_registered_legacy_kbs(tenant_id=safe_tenant)
+            tbox = await self.load_or_get_tbox(safe_tenant)
             if not tbox.classes:
-                tbox, _ = await self.induce_and_align_ontology(tenant_id=tenant_id)
+                tbox, _ = await self.induce_and_align_ontology(tenant_id=safe_tenant)
 
-            registered_kbs = await self.vector_store.list_registered_kbs(tenant_id=tenant_id)
+            registered_kbs = await self.vector_store.list_registered_kbs(tenant_id=safe_tenant)
             total_chunks_inspected = 0
             delta_chunks_to_extract: list[VectorChunkRecord] = []
 
             for kb in registered_kbs:
                 all_kb_chunks = await self.vector_store.fetch_kb_chunks(
-                    kb.kb_id, only_unindexed_or_changed=False
+                    kb.kb_id, only_unindexed_or_changed=False, tenant_id=safe_tenant
                 )
                 total_chunks_inspected += len(all_kb_chunks)
                 if incremental:
@@ -570,6 +650,7 @@ class EnterpriseKGOntologyService:
                         kb.kb_id,
                         only_unindexed_or_changed=True,
                         target_tbox_version=tbox.version,
+                        tenant_id=safe_tenant,
                     )
                     delta_chunks_to_extract.extend(delta)
                 else:
@@ -592,7 +673,7 @@ class EnterpriseKGOntologyService:
                 except Exception as exc:
                     dlq_rec = DLQFailedChunkRecord(
                         dlq_id=f"dlq_{uuid.uuid4().hex[:10]}",
-                        tenant_id=tenant_id,
+                        tenant_id=safe_tenant,
                         kb_id=chk.kb_id,
                         chunk_id=chk.chunk_id,
                         error_message=str(exc),
@@ -600,7 +681,7 @@ class EnterpriseKGOntologyService:
                     self._dlq_records.append(dlq_rec)
                     await self.vector_store.append_dlq_record(dlq_rec)
 
-            existing_entities = await self.graph_store.get_all_entities(tenant_id)
+            existing_entities = await self.graph_store.get_all_entities(safe_tenant)
             (
                 canonical_entities,
                 resolved_edges,
@@ -612,8 +693,8 @@ class EnterpriseKGOntologyService:
                 existing_entities=existing_entities,
             )
 
-            self._cumulative_sibling_collisions_prevented[tenant_id] = (
-                self._cumulative_sibling_collisions_prevented.get(tenant_id, 0)
+            self._cumulative_sibling_collisions_prevented[safe_tenant] = (
+                self._cumulative_sibling_collisions_prevented.get(safe_tenant, 0)
                 + sibling_collisions_prevented
             )
 
@@ -626,7 +707,7 @@ class EnterpriseKGOntologyService:
                 )
 
             superseded_closed = await self.graph_store.upsert_entities_and_bitemporal_edges(
-                tenant_id=tenant_id,
+                tenant_id=safe_tenant,
                 entities=list(canonical_entities.values()),
                 edges=resolved_edges,
             )
@@ -646,10 +727,10 @@ class EnterpriseKGOntologyService:
             if watermarks:
                 await self.vector_store.mark_chunks_watermarked(watermarks)
 
-            active_edges = await self.graph_store.get_all_edges(tenant_id, active_only=True)
+            active_edges = await self.graph_store.get_all_edges(safe_tenant, active_only=True)
 
             return KGGraphBuildReport(
-                tenant_id=tenant_id,
+                tenant_id=safe_tenant,
                 tbox_version=tbox.version,
                 kbs_processed=len(registered_kbs),
                 total_chunks_inspected=total_chunks_inspected,
@@ -659,7 +740,7 @@ class EnterpriseKGOntologyService:
                 canonical_entities_after_er=len(canonical_entities),
                 cross_kb_merged_entities=cross_kb_merged_count,
                 sibling_collisions_prevented=self._cumulative_sibling_collisions_prevented.get(
-                    tenant_id, 0
+                    safe_tenant, 0
                 ),
                 active_edges_upserted=len(active_edges),
                 superseded_bitemporal_edges_closed=superseded_closed,
@@ -732,7 +813,8 @@ class EnterpriseKGOntologyService:
         tenant_id: str = "enterprise_default",
         min_confidence: float = 0.80,
     ) -> dict[str, Any]:
-        tbox = await self.load_or_get_tbox(tenant_id)
+        safe_tenant, _ = self._enforce_service_principal(tenant_id, required_role="admin")
+        tbox = await self.load_or_get_tbox(safe_tenant)
         promoted_classes: list[str] = []
         promoted_relations: list[str] = []
 
@@ -752,25 +834,25 @@ class EnterpriseKGOntologyService:
                 rel_def.status = OntologyStatus.APPROVED
                 promoted_relations.append(pred_name)
 
-        parts = tbox.version.split(".")
-        if len(parts) == 3 and parts[1].isdigit():
-            tbox.version = f"{parts[0]}.{int(parts[1]) + 1}.0"
+        if promoted_classes or promoted_relations:
+            parts = tbox.version.split(".")
+            if len(parts) == 3 and parts[1].isdigit():
+                tbox.version = f"{parts[0]}.{int(parts[1]) + 1}.0"
+            self._tboxes[safe_tenant] = tbox
+            await self.vector_store.save_tbox(tbox)
+            await self.graph_store.persist_ontology_tbox(tbox)
 
-        self._tboxes[tenant_id] = tbox
-        await self.vector_store.save_tbox(tbox)
-        await self.graph_store.persist_ontology_tbox(tbox)
-
-        entities = await self.graph_store.get_all_entities(tenant_id)
-        edges = await self.graph_store.get_all_edges(tenant_id, active_only=False)
-        promoted_entity_count = 0
-        promoted_edge_count = 0
+        entities = await self.graph_store.get_all_entities(safe_tenant)
+        edges = await self.graph_store.get_all_edges(safe_tenant, active_only=False)
+        promoted_entities_list = []
+        promoted_edges_list = []
 
         for ent in entities.values():
             cls_def = tbox.classes.get(ent.ontology_class)
             if cls_def and cls_def.status == OntologyStatus.APPROVED:
                 if ent.governance_bucket != OntologyStatus.APPROVED:
                     ent.governance_bucket = OntologyStatus.APPROVED
-                    promoted_entity_count += 1
+                    promoted_entities_list.append(ent)
 
         for edge in edges:
             rel_def = tbox.relations.get(edge.predicate)
@@ -786,15 +868,23 @@ class EnterpriseKGOntologyService:
             ):
                 if edge.governance_bucket != OntologyStatus.APPROVED:
                     edge.governance_bucket = OntologyStatus.APPROVED
-                    promoted_edge_count += 1
+                    promoted_edges_list.append(edge)
+
+        # Persist promoted entity/edge governance buckets back to Neo4j / Neptune!
+        if promoted_entities_list or promoted_edges_list:
+            await self.graph_store.upsert_entities_and_bitemporal_edges(
+                tenant_id=safe_tenant,
+                entities=promoted_entities_list,
+                edges=promoted_edges_list,
+            )
 
         return {
-            "tenant_id": tenant_id,
+            "tenant_id": safe_tenant,
             "new_tbox_version": tbox.version,
             "promoted_classes": promoted_classes,
             "promoted_relations": promoted_relations,
-            "promoted_entities": promoted_entity_count,
-            "promoted_edges": promoted_edge_count,
+            "promoted_entities": len(promoted_entities_list),
+            "promoted_edges": len(promoted_edges_list),
         }
 
     def export_ontology_turtle(self, tenant_id: str = "enterprise_default") -> str:
@@ -1177,8 +1267,17 @@ class EnterpriseKGOntologyService:
     async def execute_readonly_opencypher(
         self, request: ReadOnlyCypherSearchRequest
     ) -> ReadOnlyCypherSearchResponse:
-        safe_tenant, _ = self._enforce_service_principal(request.tenant_id)
+        # Critical #1: Arbitrary raw Cypher over a shared multi-tenant graph DB can omit
+        # `$tenant_id` or read restricted ACL fields. Require `admin` role when authenticated,
+        # reject literal tenant_id overrides, and execute inside Neo4j READ_ACCESS sessions.
+        safe_tenant, _ = self._enforce_service_principal(
+            request.tenant_id, required_role="admin"
+        )
         self.validate_readonly_opencypher(request.cypher_query)
+        if re.search(r"tenant_id\s*[:=]\s*['\"]", request.cypher_query, re.I):
+            raise ValueError(
+                "Hardcoded literal tenant_id is forbidden in OpenCypher; bind $tenant_id parameter instead."
+            )
         params = {**request.params, "tenant_id": safe_tenant}
         rows = await self.graph_store.execute_opencypher(
             tenant_id=safe_tenant,

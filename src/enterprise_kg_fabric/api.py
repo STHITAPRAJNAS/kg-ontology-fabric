@@ -215,6 +215,10 @@ def create_kg_fabric_app(
     app.state.mcp_server = mcp_server
     app.state.auth_enforcer = enforcer
 
+    @app.exception_handler(PermissionError)
+    async def _permission_error_handler(_request: Request, exc: PermissionError) -> JSONResponse:
+        return JSONResponse(status_code=403, content={"detail": str(exc)})
+
     _public_paths = {"/health", "/healthz", "/docs", "/openapi.json", "/redoc", "/ui"}
 
     class _AuthASGIMiddleware:
@@ -509,6 +513,7 @@ def create_kg_fabric_app(
         principal: AuthPrincipal | None = Depends(get_principal),
     ) -> ReadOnlyCypherSearchResponse:
         p = _unwrap_principal(principal)
+        enforcer.require_role(p, "admin")
         req.tenant_id = enforcer.enforce_tenant(p, req.tenant_id)
         try:
             return await svc.execute_readonly_opencypher(req)
@@ -597,6 +602,39 @@ def create_kg_fabric_app(
             use_llm_judge=use_llm_judge,
         )
 
+    @app.delete("/v1/kbs/{kb_id}")
+    async def delete_kb(
+        kb_id: str,
+        tenant_id: str = "enterprise_default",
+        principal: AuthPrincipal | None = Depends(get_principal),
+    ) -> dict[str, Any]:
+        p = _unwrap_principal(principal)
+        enforcer.require_role(p, "admin")
+        tenant = enforcer.enforce_tenant(p, tenant_id)
+        return await svc.unregister_kb(tenant_id=tenant, kb_id=kb_id)
+
+    @app.delete("/v1/documents/{kb_id}/{doc_id}")
+    async def delete_document_endpoint(
+        kb_id: str,
+        doc_id: str,
+        tenant_id: str = "enterprise_default",
+        principal: AuthPrincipal | None = Depends(get_principal),
+    ) -> dict[str, Any]:
+        p = _unwrap_principal(principal)
+        enforcer.require_role(p, "writer")
+        tenant = enforcer.enforce_tenant(p, tenant_id)
+        return await svc.delete_document(tenant_id=tenant, kb_id=kb_id, doc_id=doc_id)
+
+    @app.delete("/v1/tenants/{tenant_id}")
+    async def purge_tenant_endpoint(
+        tenant_id: str,
+        principal: AuthPrincipal | None = Depends(get_principal),
+    ) -> dict[str, Any]:
+        p = _unwrap_principal(principal)
+        enforcer.require_role(p, "admin")
+        tenant = enforcer.enforce_tenant(p, tenant_id)
+        return await svc.purge_tenant(tenant_id=tenant)
+
     @app.get("/v1/telemetry")
     async def get_telemetry(
         tenant_id: str = "enterprise_default",
@@ -614,9 +652,9 @@ def create_kg_fabric_app(
     @app.post("/mcp/http")
     async def mcp_jsonrpc_endpoint(
         payload: dict[str, Any],
-        mcp_protocol_version: str | None = Header(default="2026-07-28", alias="MCP-Protocol-Version"),
+        mcp_protocol_version: str | None = Header(default="2025-11-25", alias="MCP-Protocol-Version"),
     ) -> dict[str, Any]:
-        proto = mcp_protocol_version if isinstance(mcp_protocol_version, str) else "2026-07-28"
+        proto = mcp_protocol_version if isinstance(mcp_protocol_version, str) else "2025-11-25"
         return await mcp_server.handle_jsonrpc(payload, protocol_version_header=proto)
 
     @app.get("/v1/mcp/tools")

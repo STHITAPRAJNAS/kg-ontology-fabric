@@ -126,6 +126,14 @@ kg-fabric = "enterprise_kg_fabric.cli:main"
 [tool.hatch.build.targets.wheel]
 packages = ["src/enterprise_kg_fabric"]
 
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F"]
+ignore = ["E501"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 pythonpath = ["src", "."]

@@ -243,7 +243,7 @@ class KGQualityAuditor:
 
         all_chunk_ids: set[str] = set()
         for kb in registered_kbs:
-            kb_chunks = await service.vector_store.fetch_kb_chunks(kb.kb_id)
+            kb_chunks = await service.vector_store.fetch_kb_chunks(kb.kb_id, tenant_id=tenant_id)
             for chk in kb_chunks:
                 if chk.tenant_id == tenant_id:
                     all_chunk_ids.add(chk.chunk_id)

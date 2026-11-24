@@ -90,7 +90,6 @@ class SemanticFeatureHashEmbeddingProvider(EmbeddingProvider):
 
         tokens = self._tokenize(text)
         joined_alnum = "".join(tokens)
-        token_set = set(tokens)
 
         # 1. Semantic Concept Anchor Subspace (first min(32, target_dim // 4) slots)
         anchor_slots = min(len(_SEMANTIC_CONCEPT_CLUSTERS), max(8, target_dim // 4))

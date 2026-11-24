@@ -142,7 +142,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         from .service import EnterpriseKGOntologyService
 
         svc = EnterpriseKGOntologyService.from_env()
-        fastmcp = create_fastmcp_server(svc)
+        try:
+            fastmcp = create_fastmcp_server(svc)
+        except ImportError:
+            print(
+                "ERROR: The optional `mcp` package is required for `kg-fabric mcp`.\n"
+                'Install it with: pip install "enterprise-kg-ontology-fabric[mcp]"',
+                file=sys.stderr,
+            )
+            return 1
         fastmcp.run(transport=args.transport)
         return 0
 

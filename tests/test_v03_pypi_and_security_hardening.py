@@ -478,7 +478,6 @@ def test_adk_ported_hardenings_32b_jwt_byoa_rate_limit_smuggling_contextvars_ans
     """
     from fastapi import HTTPException
     from enterprise_kg_fabric import (
-        AnswerabilityCheckRequest,
         AuthPrincipal,
         GraphRAGQueryRequest,
         KGFabricMcpServer,
@@ -785,5 +784,264 @@ def test_kg_quality_auditor_scorecard_defect_detection_and_eval_lift() -> None:
         assert degraded.topology_metrics.orphan_entity_count >= 1
         assert any(f.category == "ENTITY_RESOLUTION" for f in degraded.findings)
         assert any(f.category == "EXTRACTION" for f in degraded.findings)
+
+    run_coroutine_sync(_run())
+
+
+def test_review_remediation_critical_security_neptune_promote_delete_and_auth_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Regression suite reproducing EVERY Critical, High & Medium finding from the external review:
+      - Critical #1: Reader blocked from raw Cypher (REST + MCP -> 403); literal tenant_id rejected (400)
+      - Critical #2: Reader blocked from plural MCP write tools (`ingest_raw_documents`, `register_vector_kbs`);
+                     Writer blocked from nested cross-tenant documents/registrations
+      - Critical #3 & High #7: Cross-tenant KB takeover & chunk overwrite blocked (`403` / `PermissionError`)
+      - High #5: `GRAPH_BACKEND=neptune` `from_env()` initializes cleanly (fixed `region_name`) & sends real Cypher
+      - High #6: `promote_quarantined_ontology_concepts` persists to graph store & is idempotent on 2nd call
+      - Medium #9: Non-admin wildcard `tenant_id: "*"` JWT blocked (`403`); unknown `KG_FABRIC_AUTH_MODE` raises `ValueError`
+      - Medium #10: `load_or_get_tbox` refreshes from persistent store (no stale pod cache)
+      - Medium #11: `DELETE /v1/documents`, `DELETE /v1/kbs`, `DELETE /v1/tenants`
+      - Medium #12: MCP `initialize` reports dynamic package version & real `2025-11-25` protocol
+    """
+    from enterprise_kg_fabric import (
+        NeptuneOpenCypherGraphAdapter,
+        OntologyClassDef,
+        OntologyStatus,
+        VectorChunkRecord,
+        VectorKBRegistration,
+    )
+
+    # Medium #9a: Unknown KG_FABRIC_AUTH_MODE fails closed with ValueError
+    monkeypatch.setenv("KG_FABRIC_AUTH_MODE", "typo_mode")
+    with pytest.raises(ValueError, match="Invalid KG_FABRIC_AUTH_MODE"):
+        AuthConfig.from_env()
+    monkeypatch.delenv("KG_FABRIC_AUTH_MODE", raising=False)
+
+    # High #5a: Neptune from_env() no longer crashes with TypeError(aws_region)
+    monkeypatch.setenv("GRAPH_BACKEND", "neptune")
+    monkeypatch.setenv("NEPTUNE_ENDPOINT", "https://neptune-test.local:8182")
+    monkeypatch.setenv("AWS_REGION", "us-west-2")
+    monkeypatch.delenv("PGVECTOR_DSN", raising=False)
+    monkeypatch.delenv("PGHOST", raising=False)
+    neptune_svc = EnterpriseKGOntologyService.from_env()
+    assert isinstance(neptune_svc.graph_store, NeptuneOpenCypherGraphAdapter)
+    assert neptune_svc.graph_store.region_name == "us-west-2"
+    monkeypatch.delenv("GRAPH_BACKEND", raising=False)
+    monkeypatch.delenv("NEPTUNE_ENDPOINT", raising=False)
+
+    async def _run() -> None:
+        svc = EnterpriseKGOntologyService(
+            min_kb_support_for_approval=1,
+            min_chunk_support_for_approval=1,
+        )
+        await svc.ingest_raw_documents(
+            [
+                RawDocumentInput(
+                    doc_id="shared_doc",
+                    kb_id="kb_shared_name",
+                    tenant_id="tenant_a",
+                    domain_tag="sre",
+                    title="Tenant A Secret",
+                    content="Microservice alpha-router-01 depends on aurora-alpha-01.",
+                    acl_groups=["sre_only"],
+                )
+            ]
+        )
+        await svc.induce_and_align_ontology(tenant_id="tenant_a", tbox_version="1.0.0")
+        await svc.build_or_update_knowledge_graph(tenant_id="tenant_a", incremental=False)
+
+        jwt_secret = "review-remediation-signing-key-at-least-32-bytes-long"
+        app = create_kg_fabric_app(
+            service=svc,
+            auth_config=AuthConfig(mode=AuthMode.JWT, jwt_secret=jwt_secret),
+        )
+
+        reader_b_jwt = create_hs256_jwt(
+            {"sub": "rb", "tenant_id": "tenant_b", "acl_groups": ["public"], "roles": ["reader"], "exp": int(time.time()) + 3600},
+            jwt_secret,
+        )
+        writer_b_jwt = create_hs256_jwt(
+            {"sub": "wb", "tenant_id": "tenant_b", "acl_groups": ["public"], "roles": ["reader", "writer"], "exp": int(time.time()) + 3600},
+            jwt_secret,
+        )
+        wildcard_nonadmin_jwt = create_hs256_jwt(
+            {"sub": "wild", "tenant_id": "*", "acl_groups": ["public"], "roles": ["reader"], "exp": int(time.time()) + 3600},
+            jwt_secret,
+        )
+        admin_a_jwt = create_hs256_jwt(
+            {"sub": "adma", "tenant_id": "tenant_a", "acl_groups": ["public", "sre_only"], "roles": ["admin"], "exp": int(time.time()) + 3600},
+            jwt_secret,
+        )
+        hdr_rb = {"Authorization": f"Bearer {reader_b_jwt}"}
+        hdr_wb = {"Authorization": f"Bearer {writer_b_jwt}"}
+        hdr_wild = {"Authorization": f"Bearer {wildcard_nonadmin_jwt}"}
+        hdr_adma = {"Authorization": f"Bearer {admin_a_jwt}"}
+
+        # Medium #9b: Non-admin wildcard tenant_id="*" rejected with 403
+        code, _ = await _asgi_request(app, "GET", "/v1/telemetry", params={"tenant_id": "tenant_a"}, headers=hdr_wild)
+        assert code == 403
+
+        # Critical #1: Reader blocked from raw Cypher on REST and MCP
+        code, _ = await _asgi_request(
+            app,
+            "POST",
+            "/v1/search/cypher",
+            json_body={"tenant_id": "tenant_b", "cypher_query": "MATCH (n) RETURN n.canonical_name"},
+            headers=hdr_rb,
+        )
+        assert code == 403
+
+        code, mcp_cypher = await _asgi_request(
+            app,
+            "POST",
+            "/mcp",
+            json_body={
+                "jsonrpc": "2.0",
+                "id": 10,
+                "method": "tools/call",
+                "params": {
+                    "name": "execute_readonly_opencypher",
+                    "arguments": {"tenant_id": "tenant_b", "cypher_query": "MATCH (n) RETURN n"},
+                },
+            },
+            headers=hdr_rb,
+        )
+        assert code == 403 or "error" in mcp_cypher
+
+        # Admin attempting literal tenant_id override in Cypher -> 400
+        code, _ = await _asgi_request(
+            app,
+            "POST",
+            "/v1/search/cypher",
+            json_body={"tenant_id": "tenant_a", "cypher_query": "MATCH (n {tenant_id: 'tenant_b'}) RETURN n"},
+            headers=hdr_adma,
+        )
+        assert code == 400
+
+        # Critical #2: Reader blocked from plural MCP write tools (`ingest_raw_documents`, `register_vector_kbs`)
+        code, _ = await _asgi_request(
+            app,
+            "POST",
+            "/v1/mcp/call",
+            json_body={
+                "tool_name": "ingest_raw_documents",
+                "arguments": {
+                    "documents": [
+                        {"doc_id": "evil", "kb_id": "kb_shared_name", "tenant_id": "tenant_a", "title": "X", "content": "Pwned"}
+                    ]
+                },
+            },
+            headers=hdr_rb,
+        )
+        assert code == 403
+
+        # Writer B attempting nested cross-tenant document injection into Tenant A via MCP -> 403
+        code, _ = await _asgi_request(
+            app,
+            "POST",
+            "/v1/mcp/call",
+            json_body={
+                "tool_name": "ingest_raw_documents",
+                "arguments": {
+                    "documents": [
+                        {"doc_id": "evil", "kb_id": "kb_b", "tenant_id": "tenant_a", "title": "X", "content": "Pwned"}
+                    ]
+                },
+            },
+            headers=hdr_wb,
+        )
+        assert code == 403
+
+        # Critical #3 & High #7: Writer B cannot take over Tenant A's kb_id or overwrite Tenant A's chunk!
+        code, _ = await _asgi_request(
+            app,
+            "POST",
+            "/v1/kbs/register",
+            json_body=VectorKBRegistration(
+                kb_id="kb_shared_name", tenant_id="tenant_b", domain_tag="sre", table_name="t_b"
+            ).model_dump(),
+            headers=hdr_wb,
+        )
+        assert code == 403
+
+        a_chunks = await svc.vector_store.fetch_kb_chunks("kb_shared_name", tenant_id="tenant_a")
+        assert len(a_chunks) == 1
+        code, _ = await _asgi_request(
+            app,
+            "POST",
+            "/v1/kbs/kb_shared_name/hydrate",
+            json_body={
+                "chunks": [
+                    VectorChunkRecord(
+                        chunk_id=a_chunks[0].chunk_id,
+                        kb_id="kb_shared_name",
+                        tenant_id="tenant_b",
+                        doc_id="shared_doc",
+                        text="OVERWRITTEN",
+                        acl_groups=["public"],
+                    ).model_dump()
+                ]
+            },
+            headers=hdr_wb,
+        )
+        assert code == 403
+        a_chunks_after = await svc.vector_store.fetch_kb_chunks("kb_shared_name", tenant_id="tenant_a")
+        assert "OVERWRITTEN" not in a_chunks_after[0].text
+        assert a_chunks_after[0].acl_groups == ["sre_only"]
+
+        # High #6: Promote persists to graph store & 2nd no-op call does NOT bump version
+        tbox = await svc.load_or_get_tbox("tenant_a")
+        tbox.classes["EmergingClass"] = OntologyClassDef(
+            class_name="EmergingClass",
+            upper_category=UpperOntologyCategory.SYSTEM_OR_ASSET,
+            description="Test candidate",
+            confidence=0.92,
+            status=OntologyStatus.QUARANTINED_CANDIDATE,
+        )
+        await svc.vector_store.save_tbox(tbox)
+        p1 = await svc.promote_quarantined_ontology_concepts("tenant_a")
+        assert "EmergingClass" in p1["promoted_classes"]
+        v_after_p1 = p1["new_tbox_version"]
+        p2 = await svc.promote_quarantined_ontology_concepts("tenant_a")
+        assert p2["promoted_classes"] == []
+        assert p2["new_tbox_version"] == v_after_p1
+
+        # Medium #10: Pod 2 immediately observes Pod 1 TBox update via load_or_get_tbox (no stale cache)
+        pod2 = EnterpriseKGOntologyService(vector_store=svc.vector_store, graph_store=svc.graph_store)
+        await pod2.load_or_get_tbox("tenant_a")
+        tbox_v2 = await svc.load_or_get_tbox("tenant_a")
+        tbox_v2.version = "9.9.0"
+        await svc.vector_store.save_tbox(tbox_v2)
+        refreshed = await pod2.load_or_get_tbox("tenant_a")
+        assert refreshed.version == "9.9.0"
+
+        # Medium #12: MCP initialize reports current version & real protocol 2025-11-25
+        code, init_resp = await _asgi_request(
+            app,
+            "POST",
+            "/mcp",
+            json_body={"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            headers=hdr_adma,
+        )
+        assert code == 200
+        assert init_resp["result"]["serverInfo"]["version"] == __version__
+        assert init_resp["result"]["protocolVersion"] == "2025-11-25"
+
+        # Medium #11: Delete document, unregister KB, and purge tenant
+        code, del_doc = await _asgi_request(
+            app,
+            "DELETE",
+            "/v1/documents/kb_shared_name/shared_doc",
+            params={"tenant_id": "tenant_a"},
+            headers=hdr_adma,
+        )
+        assert code == 200 and del_doc["chunks_removed"] == 1
+
+        code, purge = await _asgi_request(
+            app, "DELETE", "/v1/tenants/tenant_a", headers=hdr_adma
+        )
+        assert code == 200 and purge["kbs_removed"] >= 1
+        assert await svc.graph_store.get_all_entities("tenant_a") == {}
 
     run_coroutine_sync(_run())

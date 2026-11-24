@@ -4,7 +4,6 @@ from enterprise_kg_fabric import (
     ChunkSearchRequest,
     EnterpriseKGOntologyService,
     EntitySearchRequest,
-    FederatedEmbeddingModelRouter,
     GraphRAGQueryRequest,
     PIIRedactionMode,
     PIIRedactor,
@@ -390,12 +389,12 @@ def test_fastapi_rest_endpoints_e2e() -> None:
             blocked = "forbidden" in str(exc).lower()
         assert blocked is True
 
-        # 11. Co-Hosted Model Context Protocol (MCP 2026-07-28) JSON-RPC Surface (/mcp & /v1/mcp/call)
+        # 11. Co-Hosted Model Context Protocol (MCP 2025-11-25) JSON-RPC Surface (/mcp & /v1/mcp/call)
         init_rpc = await routes["/mcp"](
-            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2026-07-28"}},
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25"}},
             None,
         )
-        assert init_rpc["result"]["protocolVersion"] == "2026-07-28"
+        assert init_rpc["result"]["protocolVersion"] == "2025-11-25"
 
         tools_rpc = await routes["/mcp"]({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, None)
         tool_names = {t["name"] for t in tools_rpc["result"]["tools"]}

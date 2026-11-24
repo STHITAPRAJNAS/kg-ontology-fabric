@@ -136,8 +136,11 @@ class AuthConfig:
         raw_mode = os.getenv("KG_FABRIC_AUTH_MODE", "none").strip().lower()
         try:
             mode = AuthMode(raw_mode)
-        except ValueError:
-            mode = AuthMode.NONE
+        except ValueError as exc:
+            valid = ", ".join(m.value for m in AuthMode)
+            raise ValueError(
+                f"Invalid KG_FABRIC_AUTH_MODE='{raw_mode}'. Must be one of: {valid}"
+            ) from exc
 
         api_keys: dict[str, dict[str, Any]] = {}
         raw_keys = os.getenv("KG_FABRIC_API_KEYS", "").strip()
@@ -336,6 +339,11 @@ class AuthEnforcer:
             raw_roles = claims.get("roles", ["reader"])
             roles = set(str(r) for r in (raw_roles if isinstance(raw_roles, list) else [raw_roles]))
             is_admin = bool(claims.get("is_admin", False)) or ("admin" in roles)
+            if str(tenant_id) == "*" and not is_admin:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Wildcard tenant_id '*' is restricted to admin principals",
+                )
             raw_acls = claims.get("acl_groups", claims.get("groups", []))
             acl_groups = [str(g) for g in (raw_acls if isinstance(raw_acls, list) else [])]
             return AuthPrincipal(
@@ -365,8 +373,15 @@ class AuthEnforcer:
             )
 
     def enforce_tenant(self, principal: AuthPrincipal | None, requested_tenant: str) -> str:
-        if principal is None or principal.is_admin or not principal.tenant_id or principal.tenant_id == "*":
+        if principal is None:
             return requested_tenant
+        if principal.is_admin and (not principal.tenant_id or principal.tenant_id == "*"):
+            return requested_tenant
+        if not principal.tenant_id or principal.tenant_id == "*":
+            raise HTTPException(
+                status_code=403,
+                detail="Non-admin principal must be bound to an explicit tenant_id",
+            )
         if requested_tenant and requested_tenant != principal.tenant_id:
             raise HTTPException(
                 status_code=403,

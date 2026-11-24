@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-from typing import Any, Sequence
+from typing import Sequence
 
 from .models import (
     CommunitySummaryRecord,
@@ -306,7 +306,7 @@ class GraphAnalyticsEngine:
                             continue
                         counts = Counter(labels[nb] for nb in nbrs)
                         best_lbl = min(
-                            counts.keys(), key=lambda l: (-counts[l], l)
+                            counts.keys(), key=lambda lbl: (-counts[lbl], lbl)
                         )
                         if labels[nid] != best_lbl:
                             labels[nid] = best_lbl

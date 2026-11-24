@@ -1,16 +1,14 @@
 from __future__ import annotations
 
 import re
-import uuid
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import Any
 
 from .models import (
     ChunkExtractionResult,
     EnterpriseCompiledTBox,
     ExtractedEntityMention,
     ExtractedRelationTriple,
-    OntologyStatus,
     RawDocumentInput,
     UpperOntologyCategory,
     VectorChunkRecord,
@@ -18,10 +16,7 @@ from .models import (
     utc_now_iso,
 )
 from .pii_redaction import (
-    PIIRedactionMode,
-    PIIRedactionResult,
     PIIRedactor,
-    PresidioPIIRedactor,
 )
 from .vector_clustering import EmbeddingProvider
 
@@ -123,7 +118,7 @@ class LlamaIndexHierarchicalNodeParser:
                 sub_chunks.append(buffer)
 
             for sub_idx, chunk_text in enumerate(sub_chunks):
-                chunk_id = f"{doc.kb_id}::{doc.doc_id}::s{sec_idx}_c{sub_idx}"
+                chunk_id = f"{doc.tenant_id}::{doc.kb_id}::{doc.doc_id}::s{sec_idx}_c{sub_idx}"
                 contextual_text = (
                     f"[{section_path}] {chunk_text}"
                     if not chunk_text.startswith("#")

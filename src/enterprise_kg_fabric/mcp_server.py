@@ -4,6 +4,9 @@ import json
 import re
 from typing import Any
 
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _pkg_version
+
 from .auth import AuthEnforcer, get_current_principal
 from .models import (
     AnswerabilityCheckRequest,
@@ -19,23 +22,33 @@ from .models import (
 )
 from .service import EnterpriseKGOntologyService
 
+try:
+    _MCP_SERVER_VERSION = _pkg_version("enterprise-kg-ontology-fabric")
+except PackageNotFoundError:
+    _MCP_SERVER_VERSION = "0.3.0"
+
 
 class KGFabricMcpServer:
     """
-    Model Context Protocol (MCP `2026-07-28` Stateless Core & `2025-11-25` Streamable HTTP)
+    Model Context Protocol (MCP `2025-11-25` / `2025-03-26` Streamable HTTP & JSON-RPC)
     Engine for `enterprise-kg-ontology-fabric`.
     Co-hosted directly inside FastAPI (`/mcp`, `/mcp/http`, `/v1/mcp/call`) and exported via
-    `FastMCP` (`stdio` / `sse`) with 13 Tools, 4 Resources, and 2 Prompts.
+    `FastMCP` (`stdio` / `sse`) with 14 Tools, 4 Resources, and 2 Prompts.
     """
 
-    SUPPORTED_VERSIONS = ["2026-07-28", "2025-11-25", "2025-03-26", "2024-11-05"]
+    SUPPORTED_VERSIONS = ["2025-11-25", "2025-03-26", "2024-11-05"]
     _WRITER_TOOLS = {
+        "register_vector_kbs",
         "register_vector_kb",
+        "ingest_raw_documents",
         "ingest_raw_document",
         "induce_and_align_ontology",
         "build_or_update_knowledge_graph",
     }
-    _ADMIN_TOOLS = {"promote_quarantined_ontology"}
+    _ADMIN_TOOLS = {
+        "promote_quarantined_ontology",
+        "execute_readonly_opencypher",
+    }
 
     def __init__(self, service: EnterpriseKGOntologyService):
         self.service = service
@@ -367,6 +380,27 @@ class KGFabricMcpServer:
                 self._enforcer.require_role(principal, "writer")
             req_tenant = str(args.get("tenant_id") or principal.tenant_id or "enterprise_default")
             args["tenant_id"] = self._enforcer.enforce_tenant(principal, req_tenant)
+            # Enforce tenant isolation recursively on nested registrations & documents
+            if isinstance(args.get("registrations"), list):
+                sanitized_regs = []
+                for item in args["registrations"]:
+                    if isinstance(item, dict):
+                        it = dict(item)
+                        it["tenant_id"] = self._enforcer.enforce_tenant(
+                            principal, str(it.get("tenant_id") or args["tenant_id"])
+                        )
+                        sanitized_regs.append(it)
+                args["registrations"] = sanitized_regs
+            if isinstance(args.get("documents"), list):
+                sanitized_docs = []
+                for item in args["documents"]:
+                    if isinstance(item, dict):
+                        it = dict(item)
+                        it["tenant_id"] = self._enforcer.enforce_tenant(
+                            principal, str(it.get("tenant_id") or args["tenant_id"])
+                        )
+                        sanitized_docs.append(it)
+                args["documents"] = sanitized_docs
             if "caller_acl_groups" in args or tool_name in {
                 "query_hybrid_graph_rag",
                 "query_graph_rag",
@@ -571,7 +605,7 @@ class KGFabricMcpServer:
         negotiated_version = (
             protocol_version_header
             if protocol_version_header in self.SUPPORTED_VERSIONS
-            else "2026-07-28"
+            else "2025-11-25"
         )
 
         try:
@@ -580,7 +614,10 @@ class KGFabricMcpServer:
                 ver = client_ver if client_ver in self.SUPPORTED_VERSIONS else negotiated_version
                 result = {
                     "protocolVersion": ver,
-                    "serverInfo": {"name": "enterprise-kg-ontology-fabric", "version": "0.1.0"},
+                    "serverInfo": {
+                        "name": "enterprise-kg-ontology-fabric",
+                        "version": _MCP_SERVER_VERSION,
+                    },
                     "capabilities": {
                         "tools": {"listChanged": False},
                         "resources": {"subscribe": False, "listChanged": False},

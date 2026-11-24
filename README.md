@@ -1,36 +1,37 @@
 # Enterprise Multi-KB Automated Ontology & Knowledge Graph Fabric (`enterprise-kg-ontology-fabric` v0.3.0)
 
-An enterprise-grade **Python SDK, CLI (`kg-fabric`), and self-hostable FastAPI + MCP microservice** that automatically induces, aligns, and governs **formal domain ontologies (W3C OWL 2 / SHACL TBox)** and **bi-temporal, ABAC-trimmed knowledge graphs (ABox)** from **100s of heterogeneous PostgreSQL `pgvector` embedding stores** (`384d` / `768d` / `1024d` / `1536d`) and **multimodal/raw document streams**, powered by **LlamaIndex**, **Neo4j 5 / Amazon Neptune (`openCypher`)**, **PostgreSQL (`pgvector`)**, **Microsoft Presidio**, **HippoRAG 2 PPR**, **Leiden Global Search**, **IBM Docling**, and co-hosted **FastAPI + MCP (`2026-07-28`)**.
+An enterprise-grade **Python SDK, CLI (`kg-fabric`), and self-hostable FastAPI + MCP microservice** that automatically induces, aligns, and governs **formal domain ontologies (W3C OWL 2 / SHACL TBox)** and **bi-temporal, ABAC-trimmed knowledge graphs (ABox)** from **heterogeneous PostgreSQL `pgvector` embedding stores** (`384d` / `768d` / `1024d` / `1536d`) and **multimodal/raw document streams**, backed by **PostgreSQL 16 (`pgvector` + RLS)**, **Neo4j 5 / Amazon Neptune (`openCypher`)**, **HippoRAG 2 PPR**, **Leiden/Louvain Global Search**, **Microsoft Presidio PII**, **IBM Docling**, **Automated KG Quality Scorecard**, and co-hosted **FastAPI + MCP (`2025-11-25`)**.
 
-> **Dual-Mode Distribution**: Use it **as a PyPI library/CLI** embedded into your existing Python/ADK/LangGraph/FastAPI apps (`pip install enterprise-kg-ontology-fabric`) **OR clone & self-host** the full containerized service via `docker compose --profile app up -d --build` or Amazon EKS (`deploy/eks/`).
+> **Dual-Mode Distribution**: Use it **as a Python library/CLI** embedded into your existing Python/ADK/LangGraph/FastAPI apps **OR clone & self-host** the full containerized service via `docker compose --profile app up -d --build` or Amazon EKS (`deploy/eks/`).
 
 ---
 
 ## Documentation Hub
 
 * **[Architecture, Algorithms & Explainer Guide](./docs/architecture_and_explainer_guide.md)** — Deep dive into Sub-Linear Vector Centroid Sampling, Cross-KB Synonym Alignment, `SiblingCollisionGuard`, Bi-Temporal Functional Edges, W3C OWL/SHACL Validation, and Hybrid GraphRAG.
-* **[Usage, Multi-Model Vector Federation, Presidio PII & AWS EKS Deployment Guide](./docs/usage_and_eks_deployment_guide.md)** — End-to-end API/SDK usage, Zero-Re-Embedding Multi-Model Query Fan-Out, Microsoft Presidio PII configuration, Amazon EKS manifests (`deploy/eks/`), and Enterprise Maturity Roadmap.
-* **[Live Docker Messy Cross-KB Benchmark](./examples/live_docker_messy_enterprise_test.py)** & **[Observed Results JSON](./live_docker_observation_report.json)** — Head-to-head comparison against live Docker `pgvector` + Neo4j 5 (`9/9` recall vs. `3/9` Vector-Only RAG).
+* **[Usage, Multi-Model Vector Federation, Presidio PII & AWS EKS Deployment Guide](./docs/usage_and_eks_deployment_guide.md)** — End-to-end API/SDK usage, Multi-Model Vector Federation, Microsoft Presidio PII configuration, Amazon EKS manifests (`deploy/eks/`), and Enterprise Maturity Roadmap.
+* **[Live Docker v0.3.0 Adversarial & RLS Verification](./examples/live_docker_v03_full_verification.py)** — Full live-Docker verification against PostgreSQL 16 (`NOBYPASSRLS` role `kg_app_user`), Neo4j 5, and live Uvicorn HTTP (JWT, anti-smuggling, ABAC, legacy table auto-hydration, `pg_try_advisory_lock`, `KGQualityAuditor`, and cold-start hydration).
+* **[Live Docker Messy Cross-KB Benchmark](./examples/live_docker_messy_enterprise_test.py)** & **[Observed Results JSON](./live_docker_observation_report.json)** — Head-to-head synthetic cross-KB comparison against live Docker `pgvector` + Neo4j 5 (`9/9` recall vs. `3/9` Vector-Only RAG).
 * **[Live Internet Wikipedia 5-KB Benchmark](./examples/live_internet_wikipedia_kbs_e2e.py)** & **[Report JSON](./live_internet_kbs_report.json)** — 25 real Wikipedia articles across 5 heterogeneous KBs on live Docker `pgvector` + Neo4j 5.
 * **[120-KB Enterprise Scale Simulation](./examples/simulate_120_kbs_end_to_end.py)** & **[Benchmark Report JSON](./simulation_benchmark_report.json)**.
 
 ---
 
-## What's New in `v0.2.0` (2024–2026 SOTA GraphRAG & Enterprise Production Hardening)
+## Key Capabilities (`v0.3.0`)
 
-Designed to **reuse proven industry & workspace libraries** instead of reinventing the wheel (with deterministic zero-dependency fallbacks when optional extras are not installed):
+Designed to **reuse proven industry libraries** when installed while providing deterministic zero-dependency offline fallbacks for air-gapped CI & tests:
 
-| Capability | Module / Surface | Reused Library / Standard |
+| Capability | Module / Surface | Library / Standard |
 | :--- | :--- | :--- |
-| **Live Structured-Output LLM Extraction + Circuit Breaker** | `llm_extractor.py` | `google-genai` (Structured JSON), `boto3` Bedrock, `openai`, `agentic_memory_sdk.governance.AsyncCircuitBreaker` |
+| **Structured-Output LLM Extraction + Circuit Breaker** | `llm_extractor.py` | `google-genai` (Gemini), `openai`, `boto3` (AWS Bedrock Converse), `AsyncCircuitBreaker` (falls back to pluggable `DomainRulePack` regex extractor when `KG_FABRIC_USE_LIVE_LLM=false`) |
 | **HippoRAG 2 Personalized PageRank (PPR) + Hub Damping** | `graph_analytics.py`, `POST /v1/search/ppr`, MCP `search_ppr_subgraph` | `networkx.pagerank` + inverse-degree hub damping (`ppr / sqrt(deg)`) |
 | **Microsoft GraphRAG Leiden/Louvain Global Sensemaking** | `graph_analytics.py`, `POST /v1/search/global`, MCP `query_global_communities` | `leidenalg` + `python-igraph` / `networkx.community.louvain_communities` |
 | **Adaptive-RAG Query Router + Cross-Encoder Reranker** | `adaptive_router.py`, `rag_engine.py` | `sentence-transformers` (`CrossEncoder`) / Bedrock Rerank |
-| **Document/Entity/Edge ABAC Security Trimming + N-ary Qualifiers** | `adapters/pgvector_store.py`, `adapters/graph_stores.py`, `models.py` | End-to-end `caller_acl_groups` enforcement (zero-leakage verified) + `qualifiers` (`condition`, `scope`, `exception`) |
-| **Multimodal & Tabular Document Ingestion** | `multimodal_ingestor.py` | **IBM Docling** (`docling.document_converter.DocumentConverter`) + Markdown/CSV table-to-triples parser |
-| **Persistent Multi-Pod TBox Store** | `adapters/pgvector_store.py` (`enterprise_tbox_registry`) | PostgreSQL JSONB persistence for cold-start EKS HPA pods |
-| **Async Sync Jobs, DLQ, OpenTelemetry & Eval Harness** | `service.py`, `api.py`, `eval_harness.py` (`POST /v1/jobs/build`, `GET /v1/jobs/dlq`, `POST /v1/eval/run`) | `opentelemetry-api` / `opentelemetry-sdk`, `ragas`-compatible Continuous GraphRAG Eval |
-| **Co-Hosted FastAPI + MCP Server (`2026-07-28`)** | `mcp_server.py`, `POST /mcp`, `/mcp/http`, `/v1/mcp/call` | `mcp` FastMCP — **12 MCP Tools, 4 Resources, 2 Prompts** |
+| **Multi-Tenant Auth, Fail-Closed RLS & ABAC Trimming** | `auth.py`, `adapters/pgvector_store.py`, `adapters/graph_stores.py` | Pure-ASGI JWT (`>=32B` secret), API Key, BYOA hooks, bounded rate limiter (`429`), PostgreSQL `NOBYPASSRLS` RLS policies, cross-tenant KB/chunk overwrite guards, Neo4j `READ_ACCESS` sessions, end-to-end `caller_acl_groups` |
+| **4-Dimension Ontology & KG Quality Scorecard** | `quality_auditor.py`, `GET /v1/quality/report`, MCP `audit_kg_quality` | W3C `pyshacl`, schema utilization, domain/range compliance, sampled faithfulness (deterministic or LLM-as-a-Judge), ER duplicate/over-merge detection, orphan/GCC/modularity metrics + Vector-vs-GraphRAG lift in `POST /v1/eval/run` |
+| **Multimodal & Tabular Document Ingestion** | `multimodal_ingestor.py` | **IBM Docling** (`DocumentConverter`) + Markdown/CSV table-to-triples parser |
+| **Persistent Multi-Pod TBox, Durable Jobs/DLQ & Sync Worker** | `adapters/pgvector_store.py`, `service.py` | PostgreSQL `enterprise_tbox_registry`, `kg_sync_jobs`, `kg_dlq_chunks`, multi-replica `pg_try_advisory_lock` sync worker, `DELETE` purge APIs |
+| **Co-Hosted FastAPI + MCP Server (`2025-11-25`)** | `mcp_server.py`, `POST /mcp`, `/mcp/http`, `/v1/mcp/call` | `mcp` FastMCP — **14 MCP Tools, 4 Resources, 2 Prompts**, `GET /metrics` (Prometheus), `GET /ui` Governance Console |
 
 ---
 
@@ -163,8 +164,9 @@ docker compose --profile app up -d --build
 docker compose up -d --wait
 python examples/live_docker_messy_enterprise_test.py
 
-# Run full offline pytest suite (14 tests, no Docker required):
+# Run full offline pytest suite (17 tests, no Docker required) & ruff lint:
 pip install -e ".[dev,mcp,auth]"
+ruff check src tests
 pytest tests/ -v
 
 # Amazon EKS Deployment (see docs/usage_and_eks_deployment_guide.md)
@@ -173,10 +175,12 @@ kubectl apply -f deploy/eks/cronjob-incremental-sync.yaml
 ```
 Inspect the live induced ontology and knowledge graph in Neo4j Browser at `http://localhost:7475` (`bolt://localhost:7688`).
 
-### Security & Multi-Tenant Auth (`v0.3.0`)
-- **`KG_FABRIC_AUTH_MODE=jwt`** (strict `exp` + `tenant_id` + `acl_groups` enforcement via PyJWT or built-in HS256) or **`api_key`** (`X-API-Key` / Bearer).
-- **Non-loopback Guard**: `kg-fabric serve` refuses binding `0.0.0.0` when `KG_FABRIC_AUTH_MODE=none` unless `--allow-unauthenticated` / `KG_FABRIC_ALLOW_UNAUTHENTICATED=true` is explicitly passed.
-- **Anti-Spoofing ABAC**: Caller `caller_acl_groups` on both REST (`/v1/rag/query`, `/v1/search/*`) and MCP (`/mcp`, `/v1/mcp/call`) are intersected with verified token claims, and Path 4 OpenCypher rows are post-filtered for zero leakage.
+### Security, Multi-Tenant Isolation & Honest Implementation Scope
+- **Auth & Isolation**: Supports `KG_FABRIC_AUTH_MODE=jwt` (strict `exp`, `tenant_id`, minimum `32`-byte secret; wildcard `tenant_id: "*"` requires `admin`), `api_key`, and `custom` BYOA hooks. Unknown `KG_FABRIC_AUTH_MODE` values fail closed (`ValueError`).
+- **Tenant & ABAC Guards**: Enforces tenant boundaries across REST, MCP (including nested `documents`/`registrations` and MCP resources), PostgreSQL `NOBYPASSRLS` RLS policies (`kg-fabric migrate-db --app-role kg_app_user`), cross-tenant KB/chunk overwrite guards (even under DB superuser), and Path 4 OpenCypher post-filtering. Arbitrary raw Cypher (`POST /v1/search/cypher` & MCP `execute_readonly_opencypher`) requires the `admin` role in authenticated mode and runs inside Neo4j `READ_ACCESS` sessions.
+- **Deterministic Offline Defaults vs. Live AI Backends**: Out of the box (`KG_FABRIC_USE_LIVE_LLM=false`), extraction uses pluggable `DomainRulePack` regex rules (`cloud_sre` or domain-neutral `generic`) and deterministic feature-hash embeddings so CI/tests need zero API keys. For arbitrary enterprise prose, enable `KG_FABRIC_USE_LIVE_LLM=true` (`gemini`, `openai`, or AWS `bedrock`) and inject a real `EmbeddingProvider`.
+- **Storage Backend Notes**: PostgreSQL 16 (`pgvector`) + Neo4j 5 are live-Docker verified (including automatic reverse-hydration of registered `EXISTING_PGVECTOR_KB` legacy tables into `unified_rag_chunks` canonical HNSW + BM25 search). Native multi-dimension vector fan-out runs directly in the in-memory emulator. Amazon Neptune (`boto3` `neptunedata` `/openCypher`) is implemented for full read/write operations and unit-tested, but not tested against a live AWS Neptune cluster in this repo.
+- **Per-Worker State**: Compiled TBoxes refresh from PostgreSQL on `load_or_get_tbox`, while the built-in `BoundedApiRateLimiter` and Prometheus counters are per-worker (front multi-worker/EKS pods with API Gateway/Redis rate limiting and Prometheus scrape aggregation).
 - See [CHANGELOG.md](./CHANGELOG.md) for full release history and `.github/workflows/release.yml` for tag-triggered PyPI Trusted Publishing (`v*.*.*`).
 
 ---
