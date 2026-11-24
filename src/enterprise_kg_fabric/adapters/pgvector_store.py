@@ -6,6 +6,7 @@ import os
 import re
 from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Sequence
 
 from ..models import (
@@ -17,6 +18,7 @@ from ..models import (
     KGEntityNode,
     RetrievedChunkContext,
     SyncJobRecord,
+    SyncJobStatus,
     VectorChunkRecord,
     VectorKBRegistration,
     utc_now_iso,
@@ -40,6 +42,21 @@ _FORBIDDEN_LEGACY_TABLES = {
     "kg_dlq_chunks",
     "kg_community_summaries",
 }
+
+
+def is_job_heartbeat_stale(job: SyncJobRecord, stale_timeout_sec: float = 45.0) -> bool:
+    """Returns True only when a QUEUED/RUNNING job's last heartbeat (or created_at) exceeds `stale_timeout_sec`."""
+    ref_iso = job.heartbeat_at or job.created_at
+    if not ref_iso:
+        return False
+    try:
+        dt = datetime.fromisoformat(ref_iso.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - dt).total_seconds()
+        return age > stale_timeout_sec
+    except Exception:
+        return False
 
 
 def validate_legacy_table_access(
@@ -196,11 +213,19 @@ CREATE TABLE IF NOT EXISTS kg_sync_jobs (
     tenant_id TEXT NOT NULL,
     status TEXT NOT NULL,
     job_json JSONB NOT NULL,
+    heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+ALTER TABLE kg_sync_jobs
+    ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
 CREATE INDEX IF NOT EXISTS idx_kg_sync_jobs_tenant
     ON kg_sync_jobs (tenant_id, updated_at DESC);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_kg_sync_jobs_active_tenant
+    ON kg_sync_jobs (tenant_id)
+    WHERE status IN ('QUEUED', 'RUNNING');
 
 CREATE TABLE IF NOT EXISTS kg_dlq_chunks (
     dlq_id SERIAL PRIMARY KEY,
@@ -349,6 +374,12 @@ class PgVectorStorePort(ABC):
 
     async def save_sync_job(self, job: SyncJobRecord) -> None:
         return None
+
+    async def try_enqueue_sync_job(
+        self, job: SyncJobRecord, stale_timeout_sec: float = 45.0
+    ) -> bool:
+        await self.save_sync_job(job)
+        return True
 
     async def get_sync_job(self, job_id: str) -> SyncJobRecord | None:
         return None
@@ -523,10 +554,27 @@ class InMemoryPgVectorStoreEmulator(PgVectorStorePort):
         return self._tboxes.get(tenant_id)
 
     async def save_sync_job(self, job: SyncJobRecord) -> None:
-        self._sync_jobs[job.job_id] = job
+        self._sync_jobs[job.job_id] = job.model_copy(deep=True)
+
+    async def try_enqueue_sync_job(
+        self, job: SyncJobRecord, stale_timeout_sec: float = 45.0
+    ) -> bool:
+        for existing in self._sync_jobs.values():
+            if existing.tenant_id != job.tenant_id:
+                continue
+            if existing.status in (SyncJobStatus.QUEUED, SyncJobStatus.RUNNING):
+                if is_job_heartbeat_stale(existing, stale_timeout_sec):
+                    existing.status = SyncJobStatus.FAILED
+                    existing.error = "Worker heartbeat expired / interrupted by restart"
+                    existing.completed_at = utc_now_iso()
+                else:
+                    return False
+        self._sync_jobs[job.job_id] = job.model_copy(deep=True)
+        return True
 
     async def get_sync_job(self, job_id: str) -> SyncJobRecord | None:
-        return self._sync_jobs.get(job_id)
+        rec = self._sync_jobs.get(job_id)
+        return rec.model_copy(deep=True) if rec is not None else None
 
     async def append_dlq_record(self, record: DLQFailedChunkRecord) -> None:
         self._dlq_records.append(record)
@@ -1282,22 +1330,79 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
     async def initialize_schema(self) -> None:
         await self.migrate_schema_and_rls()
 
+    @staticmethod
+    def _parse_iso_dt(raw_iso: str | None) -> datetime:
+        if raw_iso:
+            try:
+                dt = datetime.fromisoformat(raw_iso.replace("Z", "+00:00"))
+                return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+            except Exception:
+                pass
+        return datetime.now(timezone.utc)
+
     async def save_sync_job(self, job: SyncJobRecord) -> None:
+        hb_dt = self._parse_iso_dt(job.heartbeat_at or job.created_at)
         async with self._scoped_conn(job.tenant_id) as conn:
             await conn.execute(
                 """
-                INSERT INTO kg_sync_jobs (job_id, tenant_id, status, job_json)
-                VALUES ($1, $2, $3, $4::jsonb)
+                INSERT INTO kg_sync_jobs (job_id, tenant_id, status, job_json, heartbeat_at, updated_at)
+                VALUES ($1, $2, $3, $4::jsonb, $5, NOW())
                 ON CONFLICT (job_id) DO UPDATE SET
                     status = EXCLUDED.status,
                     job_json = EXCLUDED.job_json,
+                    heartbeat_at = EXCLUDED.heartbeat_at,
                     updated_at = NOW()
                 """,
                 job.job_id,
                 job.tenant_id,
                 job.status.value,
                 job.model_dump_json(),
+                hb_dt,
             )
+
+    async def try_enqueue_sync_job(
+        self, job: SyncJobRecord, stale_timeout_sec: float = 45.0
+    ) -> bool:
+        """
+        Cross-replica & concurrent-request safe atomic enqueue:
+          1. Expires any genuinely dead QUEUED/RUNNING job for `tenant_id` whose `heartbeat_at`
+             exceeds `stale_timeout_sec`.
+          2. Atomically inserts `job` relying on `uq_kg_sync_jobs_active_tenant` partial unique
+             index (`WHERE status IN ('QUEUED', 'RUNNING')`) so concurrent requests across pods
+             cannot both enqueue an active job for the same tenant!
+        """
+        hb_dt = self._parse_iso_dt(job.heartbeat_at or job.created_at)
+        async with self._scoped_conn(job.tenant_id) as conn:
+            await conn.execute(
+                """
+                UPDATE kg_sync_jobs
+                SET status = 'FAILED',
+                    job_json = jsonb_set(
+                        jsonb_set(job_json, '{status}', '"FAILED"'),
+                        '{error}', '"Worker heartbeat expired / interrupted by restart"'
+                    ),
+                    updated_at = NOW()
+                WHERE tenant_id = $1
+                  AND status IN ('QUEUED', 'RUNNING')
+                  AND heartbeat_at < NOW() - ($2 * INTERVAL '1 second')
+                """,
+                job.tenant_id,
+                float(stale_timeout_sec),
+            )
+            inserted = await conn.fetchval(
+                """
+                INSERT INTO kg_sync_jobs (job_id, tenant_id, status, job_json, heartbeat_at, updated_at)
+                VALUES ($1, $2, $3, $4::jsonb, $5, NOW())
+                ON CONFLICT (tenant_id) WHERE status IN ('QUEUED', 'RUNNING') DO NOTHING
+                RETURNING job_id
+                """,
+                job.job_id,
+                job.tenant_id,
+                job.status.value,
+                job.model_dump_json(),
+                hb_dt,
+            )
+            return inserted is not None
 
     async def get_sync_job(self, job_id: str) -> SyncJobRecord | None:
         async with self._scoped_conn("*") as conn:
@@ -1492,25 +1597,36 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
         )
         schema_q = f'"{registration.schema_name}"'
         table_q = f'"{registration.table_name}"'
-        upd_select = (
-            f', "{cm.updated_at_column}"::text AS upd_ts' if cm.updated_at_column else ""
-        )
-        base_sql = (
+        core_sql = (
             f'SELECT "{cm.id_column}" AS cid, "{cm.doc_id_column}" AS did, '
             f'"{cm.text_column}" AS txt, "{cm.embedding_column}"::text AS emb, '
-            f'"{cm.metadata_column}" AS meta{upd_select} '
-            f"FROM {schema_q}.{table_q}"
+            f'"{cm.metadata_column}" AS meta'
         )
+        has_upd_col = False
         async with self._scoped_alias_conn(
             registration.postgres_dsn_alias, registration.tenant_id
         ) as conn:
-            if cm.updated_at_column and since_updated_at:
-                rows = await conn.fetch(
-                    f'{base_sql} WHERE "{cm.updated_at_column}"::text > $1 ORDER BY "{cm.updated_at_column}" ASC',
-                    since_updated_at,
+            if cm.updated_at_column:
+                has_upd_col = bool(
+                    await conn.fetchval(
+                        "SELECT 1 FROM information_schema.columns "
+                        "WHERE table_schema = $1 AND table_name = $2 AND column_name = $3",
+                        registration.schema_name,
+                        registration.table_name,
+                        cm.updated_at_column,
+                    )
                 )
+            if has_upd_col:
+                sql_with_ts = f'{core_sql}, "{cm.updated_at_column}"::text AS upd_ts FROM {schema_q}.{table_q}'
+                if since_updated_at:
+                    rows = await conn.fetch(
+                        f'{sql_with_ts} WHERE "{cm.updated_at_column}"::text > $1 ORDER BY "{cm.updated_at_column}" ASC',
+                        since_updated_at,
+                    )
+                else:
+                    rows = await conn.fetch(sql_with_ts)
             else:
-                rows = await conn.fetch(base_sql)
+                rows = await conn.fetch(f"{core_sql} FROM {schema_q}.{table_q}")
 
         hydrated: list[VectorChunkRecord] = []
         for r in rows:
@@ -1530,7 +1646,7 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
                     native_embedding_dim=len(native_vec) or registration.embedding_dim,
                     canonical_embedding=canon_vec,
                     metadata=meta if isinstance(meta, dict) else {},
-                    updated_at=str(r["upd_ts"]) if cm.updated_at_column and r.get("upd_ts") else utc_now_iso(),
+                    updated_at=str(r["upd_ts"]) if has_upd_col and r["upd_ts"] else utc_now_iso(),
                 )
             )
         return hydrated

@@ -2271,3 +2271,131 @@ def test_fourth_review_remediation_safe_cypher_plan_doc_acls_job_limit_restart_r
         await svc.close()
 
     asyncio.run(_run())
+
+
+def test_fifth_review_remediation_concurrent_job_burst_multi_replica_heartbeat_and_immediate_cancel() -> None:
+    """
+    Regression suite reproducing EVERY finding from the fifth external review:
+      1. Medium: 5 simultaneous (`asyncio.gather`) `POST /v1/jobs/build` requests for one tenant
+         return EXACTLY ONE `202` and FOUR `409`s (no race window before DB write!).
+      2. Medium: A second replica (`pod2`) started AFTER `pod1` began a build job:
+         - Does NOT mislabel `pod1`'s active `RUNNING` job as `FAILED` ("Interrupted by restart")!
+         - Rejects a competing build for the same tenant with `409`!
+         - Sees `COMPLETED` once `pod1` finishes!
+      3. Low: Cancelling a job IMMEDIATELY (`0ms`) after submitting it transitions status to
+         `CANCELLED` (never stuck at `QUEUED`!), persists `CANCELLED`, and frees the tenant slot!
+    """
+    import asyncio
+    from enterprise_kg_fabric import SyncJobStatus
+
+    async def _run() -> None:
+        pod1 = EnterpriseKGOntologyService(
+            min_kb_support_for_approval=1,
+            min_chunk_support_for_approval=1,
+            job_heartbeat_interval_sec=0.2,
+            job_stale_timeout_sec=10.0,
+        )
+        await pod1.ingest_raw_documents(
+            [
+                RawDocumentInput(
+                    doc_id="doc_r5",
+                    kb_id="kb_r5",
+                    tenant_id="tenant_r5",
+                    domain_tag="sre",
+                    title="Replica Job Test",
+                    content="Microservice r5-router-01 depends on aurora-r5-db.",
+                )
+            ]
+        )
+        await pod1.induce_and_align_ontology(tenant_id="tenant_r5")
+
+        orig_build = pod1.build_or_update_knowledge_graph
+
+        async def _slow_build(*args, **kwargs):
+            await asyncio.sleep(0.25)
+            return await orig_build(*args, **kwargs)
+
+        pod1.build_or_update_knowledge_graph = _slow_build  # type: ignore[method-assign]
+
+        jwt_secret = "fifth-review-remediation-signing-key-32-bytes-minimum!"
+        app1 = create_kg_fabric_app(
+            service=pod1,
+            auth_config=AuthConfig(mode=AuthMode.JWT, jwt_secret=jwt_secret),
+        )
+        writer_jwt = create_hs256_jwt(
+            {"sub": "w_r5", "tenant_id": "tenant_r5", "acl_groups": ["public"], "roles": ["reader", "writer"], "exp": int(time.time()) + 3600},
+            jwt_secret,
+        )
+        hdr = {"Authorization": f"Bearer {writer_jwt}"}
+
+        # 3. Immediate cancel right after submit (0ms, before _worker enters body) -> CANCELLED!
+        c_sub, sub_job = await _asgi_request(
+            app1, "POST", "/v1/jobs/build", json_body={"tenant_id": "tenant_r5"}, headers=hdr
+        )
+        assert c_sub == 202
+        c_can, can_job = await _asgi_request(
+            app1, "POST", f"/v1/jobs/{sub_job['job_id']}/cancel", headers=hdr
+        )
+        assert c_can == 200
+        assert can_job["status"] == SyncJobStatus.CANCELLED.value
+
+        c_get, after_can = await _asgi_request(
+            app1, "GET", f"/v1/jobs/{sub_job['job_id']}", headers=hdr
+        )
+        assert c_get == 200 and after_can["status"] == SyncJobStatus.CANCELLED.value
+
+        # 1. 5 simultaneous `POST /v1/jobs/build` requests -> 1x 202 + 4x 409!
+        burst_results = await asyncio.gather(
+            *[
+                _asgi_request(
+                    app1, "POST", "/v1/jobs/build", json_body={"tenant_id": "tenant_r5"}, headers=hdr
+                )
+                for _ in range(5)
+            ]
+        )
+        codes = sorted(code for code, _ in burst_results)
+        assert codes == [202, 409, 409, 409, 409], f"Expected [202, 409, 409, 409, 409], got {codes}"
+        winner_job = next(body for code, body in burst_results if code == 202)
+
+        # Let pod1's worker enter RUNNING state (~50ms) while still mid-build (250ms total)
+        await asyncio.sleep(0.05)
+
+        # 2. Boot a brand-new second replica (`pod2`) AFTER `pod1`'s job started!
+        pod2 = EnterpriseKGOntologyService(
+            vector_store=pod1.vector_store,
+            graph_store=pod1.graph_store,
+            job_heartbeat_interval_sec=0.2,
+            job_stale_timeout_sec=10.0,
+        )
+        app2 = create_kg_fabric_app(
+            service=pod2,
+            auth_config=AuthConfig(mode=AuthMode.JWT, jwt_secret=jwt_secret),
+        )
+
+        # pod2 MUST see RUNNING (or QUEUED), NEVER mislabel it FAILED!
+        c_p2_get, p2_view = await _asgi_request(
+            app2, "GET", f"/v1/jobs/{winner_job['job_id']}", headers=hdr
+        )
+        assert c_p2_get == 200
+        assert p2_view["status"] in (SyncJobStatus.QUEUED.value, SyncJobStatus.RUNNING.value), (
+            f"Replica 2 mislabeled active Replica 1 job: {p2_view}"
+        )
+
+        # pod2 MUST ALSO reject a competing build for the same tenant with 409!
+        c_p2_sub, _ = await _asgi_request(
+            app2, "POST", "/v1/jobs/build", json_body={"tenant_id": "tenant_r5"}, headers=hdr
+        )
+        assert c_p2_sub == 409
+
+        # Wait for pod1's job to finish -> pod2 now sees COMPLETED!
+        await asyncio.sleep(0.30)
+        c_p2_done, p2_done = await _asgi_request(
+            app2, "GET", f"/v1/jobs/{winner_job['job_id']}", headers=hdr
+        )
+        assert c_p2_done == 200 and p2_done["status"] == SyncJobStatus.COMPLETED.value
+
+        pod1.build_or_update_knowledge_graph = orig_build  # type: ignore[method-assign]
+        await pod2.close()
+        await pod1.close()
+
+    asyncio.run(_run())

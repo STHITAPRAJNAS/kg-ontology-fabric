@@ -558,6 +558,7 @@ class SyncJobRecord(BaseModel):
     dlq_count: int = 0
     error: str | None = None
     created_at: str = Field(default_factory=utc_now_iso)
+    heartbeat_at: str | None = None
     completed_at: str | None = None
 
 

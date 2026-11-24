@@ -621,7 +621,7 @@ async def main() -> None:
                 f"Super-hub SOC2-Type-II should be damped below direct target! {ppr_data['ranked_facts'][0]}"
             )
 
-            # 6f. Live Leiden/Louvain Global Sensemaking on Live Neo4j 5
+            # 6f. Live Leiden/Louvain Global Sensemaking on Live Neo4j 5 + Persisted Community ACL Stripping
             r_global = await client.post(
                 "/v1/search/global",
                 json={"tenant_id": "tenant_alpha", "query": "Summarize overall architecture and compliance clusters across the estate"},
@@ -630,7 +630,44 @@ async def main() -> None:
             assert r_global.status_code == 200
             global_data = r_global.json()
             assert len(global_data["communities_matched"]) >= 1
-            assert "aurora-helios-merger-db" not in json.dumps(global_data)
+            assert "aurora-helios-merger-db" not in json.dumps(global_data), "Persisted community leaked confidential entity!"
+
+            r_global_conf = await client.post(
+                "/v1/search/global",
+                json={"tenant_id": "tenant_alpha", "query": "Summarize overall architecture and compliance clusters across the estate"},
+                headers=conf_hdr,
+            )
+            assert r_global_conf.status_code == 200
+            assert "aurora-helios-merger-db" in json.dumps(r_global_conf.json())
+
+            # 6f-2. Fifth-Review Live Postgres Proofs: Immediate Cancel + 5x Concurrent Job Burst (`1x 202` + `4x 409`)
+            r_can_sub = await client.post(
+                "/v1/jobs/build", json={"tenant_id": "tenant_alpha", "incremental": True}, headers=wa_hdr
+            )
+            assert r_can_sub.status_code == 202
+            r_can_now = await client.post(
+                f"/v1/jobs/{r_can_sub.json()['job_id']}/cancel", headers=wa_hdr
+            )
+            assert r_can_now.status_code == 200 and r_can_now.json()["status"] == "CANCELLED"
+
+            burst_resps = await asyncio.gather(
+                *[
+                    client.post(
+                        "/v1/jobs/build",
+                        json={"tenant_id": "tenant_alpha", "incremental": True},
+                        headers=wa_hdr,
+                    )
+                    for _ in range(5)
+                ]
+            )
+            burst_codes = sorted(r.status_code for r in burst_resps)
+            assert burst_codes == [202, 409, 409, 409, 409], f"Live Postgres job burst race: {burst_codes}"
+            live_burst_job = next(r.json() for r in burst_resps if r.status_code == 202)
+            for _ in range(40):
+                r_poll = await client.get(f"/v1/jobs/{live_burst_job['job_id']}", headers=wa_hdr)
+                if r_poll.json()["status"] == "COMPLETED":
+                    break
+                await asyncio.sleep(0.05)
 
             # 6g. Live Pre-flight Answerability Check + Markdown Table Triples + Prometheus Metrics
             r_ans_ok = await client.post(

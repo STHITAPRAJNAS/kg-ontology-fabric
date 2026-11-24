@@ -19,6 +19,7 @@ from .adapters.pgvector_store import (
     InMemoryPgVectorStoreEmulator,
     PgVectorStorePort,
     PostgresPgVectorStoreAdapter,
+    is_job_heartbeat_stale,
     validate_legacy_table_access,
 )
 from .adaptive_router import PluggableCrossEncoderReranker
@@ -125,12 +126,17 @@ class EnterpriseKGOntologyService:
         llm_concurrency: int = 8,
         answer_synthesizer: Any | None = None,
         max_concurrent_jobs_per_tenant: int = 1,
+        job_heartbeat_interval_sec: float = 2.0,
+        job_stale_timeout_sec: float = 45.0,
     ):
         self.canonical_dim = canonical_embedding_dim
         self.domain_pack = resolve_domain_pack(domain_pack)
         self.llm_concurrency = max(1, int(llm_concurrency))
         self.max_concurrent_jobs_per_tenant = max(1, int(max_concurrent_jobs_per_tenant))
-        self._boot_iso = utc_now_iso()
+        self.job_heartbeat_interval_sec = max(0.2, float(job_heartbeat_interval_sec))
+        self.job_stale_timeout_sec = max(2.0, float(job_stale_timeout_sec))
+        self._job_submit_lock = asyncio.Lock()
+        self._cancelled_job_ids: set[str] = set()
         self.embedding_provider = embedding_provider or SemanticFeatureHashEmbeddingProvider(
             default_dim=canonical_embedding_dim
         )
@@ -943,76 +949,121 @@ class EnterpriseKGOntologyService:
         validate_shacl: bool = True,
     ) -> SyncJobRecord:
         """
-        Immediately queues a background graph build job (`QUEUED`), returns the `SyncJobRecord`
-        without blocking the HTTP request, and executes the build on an async worker task.
+        Atomically enqueues at most ONE active background graph build job per tenant
+        (across concurrent requests AND multiple replicas via PostgreSQL partial unique index
+        + heartbeat leases), returning `SyncJobRecord(status=QUEUED)` immediately.
         """
         from .auth import reset_current_principal, set_current_principal
 
         safe_tenant, _ = self._enforce_service_principal(tenant_id, required_role="writer")
-        active_for_tenant = [
-            jid
-            for jid, t in self._active_job_tasks.items()
-            if not t.done()
-            and self._sync_jobs.get(jid) is not None
-            and self._sync_jobs[jid].tenant_id == safe_tenant
-        ]
-        if len(active_for_tenant) >= self.max_concurrent_jobs_per_tenant:
-            raise RuntimeError(
-                f"Active build job limit ({self.max_concurrent_jobs_per_tenant}) reached for tenant '{safe_tenant}': {active_for_tenant[0]}"
-            )
         caller_principal = get_current_principal()
-        job_id = f"job_{uuid.uuid4().hex[:12]}"
-        job = SyncJobRecord(
-            job_id=job_id,
-            tenant_id=safe_tenant,
-            status=SyncJobStatus.QUEUED,
-            incremental=incremental,
-        )
-        self._sync_jobs[job_id] = job
-        await self.vector_store.save_sync_job(job)
 
-        async def _worker() -> None:
-            tok = set_current_principal(caller_principal)
-            dlq_before = len(self._dlq_records)
-            try:
-                job.status = SyncJobStatus.RUNNING
-                await self.vector_store.save_sync_job(job)
-                report = await self.build_or_update_knowledge_graph(
-                    tenant_id=safe_tenant,
-                    incremental=incremental,
-                    validate_shacl=validate_shacl,
+        async with self._job_submit_lock:
+            now_iso = utc_now_iso()
+            job_id = f"job_{uuid.uuid4().hex[:12]}"
+            job = SyncJobRecord(
+                job_id=job_id,
+                tenant_id=safe_tenant,
+                status=SyncJobStatus.QUEUED,
+                incremental=incremental,
+                created_at=now_iso,
+                heartbeat_at=now_iso,
+            )
+            enqueued = await self.vector_store.try_enqueue_sync_job(
+                job, stale_timeout_sec=self.job_stale_timeout_sec
+            )
+            if not enqueued:
+                raise RuntimeError(
+                    f"An active build job is already queued or running for tenant '{safe_tenant}'."
                 )
-                job.report = report
-                job.dlq_count = len(self._dlq_records) - dlq_before
-                job.status = SyncJobStatus.COMPLETED
-                job.completed_at = utc_now_iso()
-            except asyncio.CancelledError:
-                job.status = SyncJobStatus.CANCELLED
-                job.error = "Cancelled by user"
-                job.completed_at = utc_now_iso()
-                await self.vector_store.save_sync_job(job)
-                raise
-            except Exception as exc:
-                job.status = SyncJobStatus.FAILED
-                job.error = str(exc)
-                job.completed_at = utc_now_iso()
-            finally:
-                reset_current_principal(tok)
-                self._active_job_tasks.pop(job_id, None)
-            await self.vector_store.save_sync_job(job)
+            self._sync_jobs[job_id] = job
 
-        self._active_job_tasks[job_id] = asyncio.create_task(_worker())
-        return job
+            async def _worker() -> None:
+                if job_id in self._cancelled_job_ids or job.status == SyncJobStatus.CANCELLED:
+                    return
+                tok = set_current_principal(caller_principal)
+                dlq_before = len(self._dlq_records)
+                hb_stop = asyncio.Event()
+
+                async def _heartbeat_loop() -> None:
+                    while not hb_stop.is_set():
+                        try:
+                            await asyncio.wait_for(
+                                hb_stop.wait(), timeout=self.job_heartbeat_interval_sec
+                            )
+                            break
+                        except asyncio.TimeoutError:
+                            if job_id in self._cancelled_job_ids:
+                                break
+                            latest = await self.vector_store.get_sync_job(job_id)
+                            if latest is not None and latest.status == SyncJobStatus.CANCELLED:
+                                self._cancelled_job_ids.add(job_id)
+                                t_self = self._active_job_tasks.get(job_id)
+                                if t_self is not None and not t_self.done():
+                                    t_self.cancel()
+                                break
+                            job.heartbeat_at = utc_now_iso()
+                            await self.vector_store.save_sync_job(job)
+
+                hb_task = asyncio.create_task(_heartbeat_loop())
+                try:
+                    if job_id in self._cancelled_job_ids:
+                        return
+                    job.status = SyncJobStatus.RUNNING
+                    job.heartbeat_at = utc_now_iso()
+                    await self.vector_store.save_sync_job(job)
+                    report = await self.build_or_update_knowledge_graph(
+                        tenant_id=safe_tenant,
+                        incremental=incremental,
+                        validate_shacl=validate_shacl,
+                    )
+                    if job_id in self._cancelled_job_ids:
+                        job.status = SyncJobStatus.CANCELLED
+                        job.error = "Cancelled by user"
+                        job.completed_at = utc_now_iso()
+                    else:
+                        job.report = report
+                        job.dlq_count = len(self._dlq_records) - dlq_before
+                        job.status = SyncJobStatus.COMPLETED
+                        job.heartbeat_at = utc_now_iso()
+                        job.completed_at = job.heartbeat_at
+                except asyncio.CancelledError:
+                    job.status = SyncJobStatus.CANCELLED
+                    job.error = "Cancelled by user"
+                    job.completed_at = utc_now_iso()
+                    await self.vector_store.save_sync_job(job)
+                    raise
+                except Exception as exc:
+                    job.status = SyncJobStatus.FAILED
+                    job.error = str(exc)
+                    job.completed_at = utc_now_iso()
+                finally:
+                    hb_stop.set()
+                    hb_task.cancel()
+                    try:
+                        await hb_task
+                    except asyncio.CancelledError:
+                        pass
+                    reset_current_principal(tok)
+                    self._active_job_tasks.pop(job_id, None)
+                await self.vector_store.save_sync_job(job)
+
+            self._active_job_tasks[job_id] = asyncio.create_task(_worker())
+            return job
 
     async def _reconcile_orphaned_job(self, job: SyncJobRecord) -> SyncJobRecord:
-        """Marks stale QUEUED/RUNNING jobs left behind by a prior crashed/restarted process as FAILED."""
+        """
+        Multi-replica safe orphan recovery: ONLY marks a QUEUED/RUNNING job as FAILED when its
+        `heartbeat_at` lease has genuinely expired (`> job_stale_timeout_sec`), so a second
+        replica never mislabels a healthy job actively running on another replica!
+        """
         if (
             job.status in (SyncJobStatus.QUEUED, SyncJobStatus.RUNNING)
             and job.job_id not in self._active_job_tasks
-            and job.created_at < self._boot_iso
+            and is_job_heartbeat_stale(job, self.job_stale_timeout_sec)
         ):
             job.status = SyncJobStatus.FAILED
-            job.error = "Interrupted by process restart"
+            job.error = "Worker heartbeat expired / interrupted by process restart"
             job.completed_at = utc_now_iso()
             self._sync_jobs[job.job_id] = job
             await self.vector_store.save_sync_job(job)
@@ -1043,19 +1094,28 @@ class EnterpriseKGOntologyService:
         if job is None:
             return None
         self._enforce_service_principal(job.tenant_id, required_role="writer")
-        task = self._active_job_tasks.get(job_id)
+        if job.status in (SyncJobStatus.COMPLETED, SyncJobStatus.FAILED, SyncJobStatus.CANCELLED):
+            return job
+
+        self._cancelled_job_ids.add(job_id)
+        task = self._active_job_tasks.pop(job_id, None)
         if task is not None and not task.done():
             task.cancel()
             try:
                 await task
             except asyncio.CancelledError:
                 pass
-        elif job.status in (SyncJobStatus.QUEUED, SyncJobStatus.RUNNING):
-            job.status = SyncJobStatus.CANCELLED
-            job.error = "Cancelled by user"
-            job.completed_at = utc_now_iso()
-            await self.vector_store.save_sync_job(job)
-        return job
+
+        # Unconditionally transition QUEUED/RUNNING -> CANCELLED (even if task was cancelled
+        # before entering its coroutine body, or if cancellation arrived on another replica!)
+        latest = await self.vector_store.get_sync_job(job_id) or job
+        if latest.status not in (SyncJobStatus.COMPLETED, SyncJobStatus.FAILED):
+            latest.status = SyncJobStatus.CANCELLED
+            latest.error = "Cancelled by user"
+            latest.completed_at = utc_now_iso()
+            self._sync_jobs[job_id] = latest
+            await self.vector_store.save_sync_job(latest)
+        return latest
 
     async def list_registered_kbs_paginated(
         self, tenant_id: str = "enterprise_default", limit: int = 50, offset: int = 0
@@ -1126,13 +1186,14 @@ class EnterpriseKGOntologyService:
         return self._sync_jobs.get(job_id)
 
     async def get_sync_job_async(self, job_id: str) -> SyncJobRecord | None:
-        if job_id in self._sync_jobs:
-            return await self._reconcile_orphaned_job(self._sync_jobs[job_id])
         persisted = await self.vector_store.get_sync_job(job_id)
         if persisted is not None:
             persisted = await self._reconcile_orphaned_job(persisted)
             self._sync_jobs[job_id] = persisted
-        return persisted
+            return persisted
+        if job_id in self._sync_jobs:
+            return await self._reconcile_orphaned_job(self._sync_jobs[job_id])
+        return None
 
     def list_dlq_records(self, tenant_id: str | None = None) -> list[DLQFailedChunkRecord]:
         if tenant_id is None:
