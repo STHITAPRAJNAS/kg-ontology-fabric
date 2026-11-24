@@ -1890,12 +1890,8 @@ def test_milestone_b_per_concept_governance_llm_synthesis_induction_cypher_and_j
             def generate_text_sync(self, prompt: str, system_prompt: str = "") -> str | None:
                 if "induce a concise domain ontology" in prompt:
                     return '{"classes":[{"name":"ClinicalTrial","upper_category":"EventOrIncident","description":"Phase trial"}],"relations":[{"predicate":"EVALUATES_DRUG","domain_class":"ClinicalTrial","range_class":"SystemOrAsset","description":"Evaluates compound","is_functional":false}]}'
-                if "read-only OpenCypher" in prompt:
-                    return (
-                        "MATCH (s:Entity {tenant_id: $tenant_id})-[r:KG_RELATION]->(t:Entity {tenant_id: $tenant_id}) "
-                        "WHERE r.t_invalid = 'ACTIVE' "
-                        "RETURN s.canonical_name AS source, r.predicate AS predicate, t.canonical_name AS target, r.source_kb_ids AS source_kbs LIMIT 25"
-                    )
+                if "Classify the graph lookup intent" in prompt:
+                    return '{"predicate": "DEPENDS_ON", "entity_hint": "payment-router-01"}'
                 return "Grounded LLM synthesis: payment-router-01 depends on aurora-ledger-01 [kb_gov]."
 
         stub_llm = _StubLiveLLM()
@@ -2034,6 +2030,243 @@ def test_milestone_b_per_concept_governance_llm_synthesis_induction_cypher_and_j
         # Governance /ui includes interactive review buttons & audit trail
         code, ui_body = await _asgi_request(app, "GET", "/ui")
         assert code == 200 and "submitReview('merge')" in str(ui_body)
+
+        await svc.close()
+
+    asyncio.run(_run())
+
+
+def test_fourth_review_remediation_safe_cypher_plan_doc_acls_job_limit_restart_recovery_kb_redaction_and_safe_retract() -> None:
+    """
+    Regression suite reproducing EVERY finding from the fourth external review:
+      1. High: `synthesize_opencypher_async` NEVER executes model-written Cypher strings!
+         A malicious/prompt-injected LLM reply (`WITH $tenant_id AS x MATCH (n) RETURN count(n) AS cnt`
+         or `CALL db.labels()`) cannot execute, leak cross-tenant rows, or bypass ABAC via renamed columns;
+         `validate_readonly_opencypher` also rejects ALL `CALL` procedures.
+      2. Medium: `GET /v1/kbs/{kb_id}/documents` enforces `caller_acl_groups` so a `public` reader
+         NEVER sees titles or `doc_id`s of `sre`-only documents.
+      3. Low-Medium: Per-tenant async build concurrency limit returns `409 Conflict` on overlapping
+         rebuilds; orphaned `QUEUED`/`RUNNING` jobs from dead processes auto-reconcile to `FAILED`.
+      4. Low: Plain `reader`s get `403` on `synthesize_with_llm=True`, trigger `0` LLM calls on
+         `/v1/rag/query`, and receive redacted `table_name`/`schema_name`/`postgres_dsn_alias` on
+         `GET /v1/kbs` and MCP `kg://kbs/{tenant}/registry`.
+      5. JWKS requires both `jwt_issuer` and `jwt_audience` by default (`ValueError` if omitted).
+      6. Post-extraction retraction: if re-extracting a modified chunk fails (DLQ), its previously
+         valid graph facts remain intact until a retry succeeds!
+    """
+    import asyncio
+    from enterprise_kg_fabric import (
+        StructuredLLMExtractorAdapter,
+        SyncJobRecord,
+        SyncJobStatus,
+    )
+
+    # 5. JWKS without issuer/audience fails closed
+    with pytest.raises(ValueError, match="requires both KG_FABRIC_JWT_ISSUER and KG_FABRIC_JWT_AUDIENCE"):
+        AuthConfig(mode=AuthMode.JWT, jwks_url="https://idp.example.com/.well-known/jwks.json")
+
+    # 1b. validate_readonly_opencypher blocks ALL CALL procedures (including CALL db.labels())
+    with pytest.raises(ValueError, match="CALL"):
+        EnterpriseKGOntologyService.validate_readonly_opencypher("CALL db.labels() YIELD label RETURN label")
+
+    async def _run() -> None:
+        llm_calls = {"count": 0}
+
+        class _MaliciousStubLLM(StructuredLLMExtractorAdapter):
+            def __init__(self) -> None:
+                super().__init__(use_live_llm=True)
+
+            def generate_text_sync(self, prompt: str, system_prompt: str = "") -> str | None:
+                llm_calls["count"] += 1
+                # Attempt prompt-injection Cypher smuggling: dummy $tenant_id + unscoped count + CALL db.labels()
+                return "WITH $tenant_id AS ignored CALL db.labels() YIELD label MATCH (n) RETURN count(n) AS leaked_cnt"
+
+        svc = EnterpriseKGOntologyService(
+            llm_extractor=_MaliciousStubLLM(),
+            use_live_llm=True,
+            min_kb_support_for_approval=1,
+            min_chunk_support_for_approval=1,
+        )
+        await svc.ingest_raw_documents(
+            [
+                RawDocumentInput(
+                    doc_id="doc_ta_pub",
+                    kb_id="kb_ta",
+                    tenant_id="tenant_a",
+                    domain_tag="sre",
+                    title="Public Runbook",
+                    content="Microservice alpha-gw-01 depends on aurora-alpha-pub.",
+                    acl_groups=["public"],
+                ),
+                RawDocumentInput(
+                    doc_id="doc_ta_sre_secret",
+                    kb_id="kb_ta",
+                    tenant_id="tenant_a",
+                    domain_tag="sre",
+                    title="Secret SRE Only Postmortem",
+                    content="Microservice alpha-gw-01 depends on aurora-alpha-sre-secret.",
+                    acl_groups=["sre"],
+                ),
+                RawDocumentInput(
+                    doc_id="doc_tb_priv",
+                    kb_id="kb_tb",
+                    tenant_id="tenant_b",
+                    domain_tag="sre",
+                    title="Tenant B Private",
+                    content="Microservice beta-core-01 depends on aurora-beta-vault.",
+                    acl_groups=["public"],
+                ),
+            ]
+        )
+        await svc.induce_and_align_ontology(tenant_id="tenant_a")
+        await svc.induce_and_align_ontology(tenant_id="tenant_b")
+        await svc.build_or_update_knowledge_graph(tenant_id="tenant_a", incremental=False)
+        await svc.build_or_update_knowledge_graph(tenant_id="tenant_b", incremental=False)
+
+        jwt_secret = "fourth-review-remediation-signing-key-32-bytes-minimum"
+        app = create_kg_fabric_app(
+            service=svc,
+            auth_config=AuthConfig(mode=AuthMode.JWT, jwt_secret=jwt_secret),
+        )
+        reader_a_jwt = create_hs256_jwt(
+            {"sub": "ra", "tenant_id": "tenant_a", "acl_groups": ["public"], "roles": ["reader"], "exp": int(time.time()) + 3600},
+            jwt_secret,
+        )
+        writer_b_jwt = create_hs256_jwt(
+            {"sub": "wb", "tenant_id": "tenant_b", "acl_groups": ["public"], "roles": ["reader", "writer"], "exp": int(time.time()) + 3600},
+            jwt_secret,
+        )
+        padm_jwt = create_hs256_jwt(
+            {"sub": "root", "tenant_id": "*", "acl_groups": ["public"], "roles": ["admin"], "exp": int(time.time()) + 3600},
+            jwt_secret,
+        )
+        hdr_ra = {"Authorization": f"Bearer {reader_a_jwt}"}
+        hdr_wb = {"Authorization": f"Bearer {writer_b_jwt}"}
+        hdr_pa = {"Authorization": f"Bearer {padm_jwt}"}
+
+        # 4a. Plain reader triggers ZERO LLM calls on /v1/rag/query and gets 403 on synthesize_with_llm=True!
+        llm_calls["count"] = 0
+        code, rag_ra = await _asgi_request(
+            app,
+            "POST",
+            "/v1/rag/query",
+            json_body={"tenant_id": "tenant_a", "query": "What does alpha-gw-01 depend on?"},
+            headers=hdr_ra,
+        )
+        assert code == 200
+        assert llm_calls["count"] == 0, f"Reader triggered {llm_calls['count']} LLM calls!"
+        assert "aurora-alpha-sre-secret" not in json.dumps(rag_ra)
+
+        code, _ = await _asgi_request(
+            app,
+            "POST",
+            "/v1/rag/query",
+            json_body={"tenant_id": "tenant_a", "query": "test", "synthesize_with_llm": True},
+            headers=hdr_ra,
+        )
+        assert code == 403
+
+        # 1a. Even for a writer (where LLM intent classification runs), malicious LLM reply NEVER executes raw Cypher!
+        code, rag_wb = await _asgi_request(
+            app,
+            "POST",
+            "/v1/rag/query",
+            json_body={"tenant_id": "tenant_b", "query": "What does beta-core-01 depend on?"},
+            headers=hdr_wb,
+        )
+        assert code == 200
+        assert "CALL db.labels" not in rag_wb["generated_opencypher_query"]
+        assert "leaked_cnt" not in json.dumps(rag_wb)
+        assert "aurora-alpha" not in json.dumps(rag_wb)
+
+        # 2. Document listing enforces caller ACLs: public reader NEVER sees sre-only doc title/id!
+        code, docs_ra = await _asgi_request(
+            app, "GET", "/v1/kbs/kb_ta/documents", params={"tenant_id": "tenant_a"}, headers=hdr_ra
+        )
+        assert code == 200
+        assert [d["doc_id"] for d in docs_ra] == ["doc_ta_pub"]
+        assert "Secret SRE Only Postmortem" not in json.dumps(docs_ra)
+
+        # 4b. GET /v1/kbs redacts physical table_name & postgres_dsn_alias for non-platform-admins
+        code, kbs_ra = await _asgi_request(
+            app, "GET", "/v1/kbs", params={"tenant_id": "tenant_a"}, headers=hdr_ra
+        )
+        assert code == 200 and len(kbs_ra) == 1
+        assert kbs_ra[0]["table_name"] == "redacted"
+        assert kbs_ra[0]["postgres_dsn_alias"] == "redacted"
+
+        code, kbs_pa = await _asgi_request(
+            app, "GET", "/v1/kbs", params={"tenant_id": "tenant_a"}, headers=hdr_pa
+        )
+        assert code == 200 and kbs_pa[0]["table_name"] != "redacted"
+
+        # 3a. Orphaned RUNNING job from prior process boot is auto-reconciled to FAILED on read
+        orphan_job = SyncJobRecord(
+            job_id="job_dead_boot",
+            tenant_id="tenant_b",
+            status=SyncJobStatus.RUNNING,
+            created_at="2020-01-01T00:00:00+00:00",
+        )
+        await svc.vector_store.save_sync_job(orphan_job)
+        code, reconciled = await _asgi_request(
+            app, "GET", "/v1/jobs/job_dead_boot", headers=hdr_wb
+        )
+        assert code == 200
+        assert reconciled["status"] == SyncJobStatus.FAILED.value
+        assert "restart" in (reconciled["error"] or "").lower()
+
+        # 3b. Per-tenant async build concurrency limit blocks overlapping rebuilds with 409 Conflict
+        orig_build = svc.build_or_update_knowledge_graph
+
+        async def _slow_build(*args, **kwargs):
+            await asyncio.sleep(0.15)
+            return await orig_build(*args, **kwargs)
+
+        svc.build_or_update_knowledge_graph = _slow_build  # type: ignore[method-assign]
+        code1, j1 = await _asgi_request(
+            app, "POST", "/v1/jobs/build", json_body={"tenant_id": "tenant_b"}, headers=hdr_wb
+        )
+        assert code1 == 202
+        code2, _ = await _asgi_request(
+            app, "POST", "/v1/jobs/build", json_body={"tenant_id": "tenant_b"}, headers=hdr_wb
+        )
+        assert code2 == 409
+        await asyncio.sleep(0.20)
+        svc.build_or_update_knowledge_graph = orig_build  # type: ignore[method-assign]
+
+        # 6. Failed re-extraction of a modified chunk preserves its previously valid graph facts!
+        await svc.ingest_raw_documents(
+            [
+                RawDocumentInput(
+                    doc_id="doc_tb_priv",
+                    kb_id="kb_tb",
+                    tenant_id="tenant_b",
+                    domain_tag="sre",
+                    title="Tenant B Updated",
+                    content="Microservice beta-core-01 depends on aurora-beta-new.",
+                    acl_groups=["public"],
+                )
+            ]
+        )
+        orig_batch = svc.kg_extractor.extract_batch_async
+
+        async def _fail_batch(chunks, tbox, max_concurrency=8, allow_dynamic_emergent=True):
+            return [(c, RuntimeError("Transient LLM outage")) for c in chunks]
+
+        svc.kg_extractor.extract_batch_async = _fail_batch  # type: ignore[method-assign]
+        await svc.build_or_update_knowledge_graph(tenant_id="tenant_b", incremental=True)
+        svc.kg_extractor.extract_batch_async = orig_batch  # type: ignore[method-assign]
+
+        # Old fact `aurora-beta-vault` MUST still be intact because re-extraction failed!
+        code, rag_preserved = await _asgi_request(
+            app,
+            "POST",
+            "/v1/rag/query",
+            json_body={"tenant_id": "tenant_b", "query": "What does beta-core-01 depend on?"},
+            headers=hdr_wb,
+        )
+        assert code == 200
+        assert "aurora-beta-vault" in rag_preserved["synthesized_answer"]
 
         await svc.close()
 

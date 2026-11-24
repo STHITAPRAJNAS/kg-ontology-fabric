@@ -119,6 +119,7 @@ class AuthConfig:
     jwt_algorithms: list[str] = field(default_factory=lambda: ["HS256"])
     jwt_issuer: str | None = None
     jwt_audience: str | None = None
+    require_jwks_issuer_audience: bool = True
     require_exp: bool = True
     require_tenant_claim: bool = True
     api_rate_limit_rpm: int = 0
@@ -139,6 +140,15 @@ class AuthConfig:
             )
         if self.jwks_url and self.jwt_algorithms == ["HS256"]:
             self.jwt_algorithms = ["RS256", "ES256"]
+        if (
+            self.jwks_url
+            and self.require_jwks_issuer_audience
+            and (not self.jwt_issuer or not self.jwt_audience)
+        ):
+            raise ValueError(
+                "KG_FABRIC_JWKS_URL requires both KG_FABRIC_JWT_ISSUER and KG_FABRIC_JWT_AUDIENCE "
+                "to prevent cross-tenant/cross-app OIDC token confusion."
+            )
 
     @classmethod
     def from_env(cls) -> AuthConfig:
@@ -332,6 +342,14 @@ class AuthEnforcer:
         self.rate_limiter = BoundedApiRateLimiter(
             requests_per_minute=self.config.api_rate_limit_rpm
         )
+
+    async def authenticate_request_async(self, request: Request) -> AuthPrincipal | None:
+        """Non-blocking request authenticator: offloads JWKS HTTP key fetches to a worker thread."""
+        import asyncio
+
+        if self.config.mode == AuthMode.JWT and self.config.jwks_url:
+            return await asyncio.to_thread(self.authenticate_request, request)
+        return self.authenticate_request(request)
 
     def authenticate_request(self, request: Request) -> AuthPrincipal | None:
         # 1. Bring-Your-Own-Auth (BYOA) request-header hook (API Gateway / Envoy mTLS / Kong / IAP)

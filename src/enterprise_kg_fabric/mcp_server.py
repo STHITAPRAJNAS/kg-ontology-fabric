@@ -541,7 +541,7 @@ class KGFabricMcpServer:
         m_reg = re.match(r"^kg://kbs/([^/]+)/registry$", uri)
         if m_reg:
             tenant_id = self._enforcer.enforce_tenant(get_current_principal(), m_reg.group(1))
-            kbs = await self.service.vector_store.list_registered_kbs(tenant_id=tenant_id)
+            kbs = await self.service.list_registered_kbs_paginated(tenant_id=tenant_id, limit=500)
             return {
                 "uri": uri,
                 "mimeType": "application/json",

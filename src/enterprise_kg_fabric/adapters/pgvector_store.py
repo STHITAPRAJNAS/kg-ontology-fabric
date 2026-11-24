@@ -365,7 +365,12 @@ class PgVectorStorePort(ABC):
         return []
 
     async def list_kb_documents(
-        self, tenant_id: str, kb_id: str, limit: int = 50, offset: int = 0
+        self,
+        tenant_id: str,
+        kb_id: str,
+        limit: int = 50,
+        offset: int = 0,
+        caller_acl_groups: Sequence[str] | None = None,
     ) -> list[dict[str, Any]]:
         return []
 
@@ -541,13 +546,23 @@ class InMemoryPgVectorStoreEmulator(PgVectorStorePort):
         return jobs[offset : offset + limit]
 
     async def list_kb_documents(
-        self, tenant_id: str, kb_id: str, limit: int = 50, offset: int = 0
+        self,
+        tenant_id: str,
+        kb_id: str,
+        limit: int = 50,
+        offset: int = 0,
+        caller_acl_groups: Sequence[str] | None = None,
     ) -> list[dict[str, Any]]:
-        chunks = [
-            c
-            for c in self._kb_tables.get(kb_id, {}).values()
-            if c.tenant_id == tenant_id
-        ]
+        caller_set = {g.lower() for g in caller_acl_groups} if caller_acl_groups is not None else None
+        chunks = []
+        for c in self._kb_tables.get(kb_id, {}).values():
+            if c.tenant_id != tenant_id:
+                continue
+            if caller_set is not None:
+                c_acls = {g.lower() for g in (c.acl_groups or ["public"])}
+                if "public" not in c_acls and not caller_set.intersection(c_acls):
+                    continue
+            chunks.append(c)
         by_doc: dict[str, dict[str, Any]] = {}
         for c in chunks:
             entry = by_doc.setdefault(
@@ -1347,7 +1362,12 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
             ]
 
     async def list_kb_documents(
-        self, tenant_id: str, kb_id: str, limit: int = 50, offset: int = 0
+        self,
+        tenant_id: str,
+        kb_id: str,
+        limit: int = 50,
+        offset: int = 0,
+        caller_acl_groups: Sequence[str] | None = None,
     ) -> list[dict[str, Any]]:
         async with self._scoped_conn(tenant_id) as conn:
             rows = await conn.fetch(
@@ -1357,7 +1377,9 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
                        MAX(updated_at) AS last_updated,
                        MIN(metadata->>'title') AS title
                 FROM unified_rag_chunks
-                WHERE tenant_id = $1 AND kb_id = $2
+                WHERE tenant_id = $1
+                  AND kb_id = $2
+                  AND ($5::text[] IS NULL OR acl_groups ? 'public' OR acl_groups ?| $5::text[])
                 GROUP BY doc_id
                 ORDER BY doc_id ASC
                 LIMIT $3 OFFSET $4
@@ -1366,6 +1388,7 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
                 kb_id,
                 limit,
                 offset,
+                list(caller_acl_groups) if caller_acl_groups is not None else None,
             )
             return [
                 {

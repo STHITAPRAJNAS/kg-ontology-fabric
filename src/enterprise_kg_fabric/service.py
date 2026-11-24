@@ -124,10 +124,13 @@ class EnterpriseKGOntologyService:
         domain_pack: DomainRulePack | str | None = None,
         llm_concurrency: int = 8,
         answer_synthesizer: Any | None = None,
+        max_concurrent_jobs_per_tenant: int = 1,
     ):
         self.canonical_dim = canonical_embedding_dim
         self.domain_pack = resolve_domain_pack(domain_pack)
         self.llm_concurrency = max(1, int(llm_concurrency))
+        self.max_concurrent_jobs_per_tenant = max(1, int(max_concurrent_jobs_per_tenant))
+        self._boot_iso = utc_now_iso()
         self.embedding_provider = embedding_provider or SemanticFeatureHashEmbeddingProvider(
             default_dim=canonical_embedding_dim
         )
@@ -773,23 +776,9 @@ class EnterpriseKGOntologyService:
 
             skipped_chunks = total_chunks_inspected - len(delta_chunks_to_extract)
 
-            # Retract stale graph facts produced by modified/re-extracted chunks BEFORE re-extracting
-            # so editing a document ("A depends on B" -> "A depends on C") does not leave zombie facts!
-            if modified_chunk_ids:
-                remaining_acls = await self.vector_store.fetch_tenant_chunk_acl_map(safe_tenant)
-                for mid in modified_chunk_ids:
-                    remaining_acls.pop(mid, None)
-                retracted_ent_ids, _ = await self.graph_store.delete_chunks_provenance(
-                    tenant_id=safe_tenant,
-                    chunk_ids=modified_chunk_ids,
-                    remaining_chunk_acls=remaining_acls,
-                )
-                if retracted_ent_ids:
-                    await self.vector_store.delete_canonical_entity_embeddings(
-                        safe_tenant, retracted_ent_ids
-                    )
-
-            # Extract entities and relation triples concurrently (bounded semaphore) with per-chunk DLQ fault isolation
+            # Extract entities and relation triples concurrently FIRST (bounded semaphore) with per-chunk DLQ isolation.
+            # Only chunks whose extraction SUCCEEDS have their prior graph provenance retracted below — so a transient
+            # extraction failure NEVER drops previously valid facts from the graph while sitting in DLQ!
             extractions: list[ChunkExtractionResult] = []
             succeeded_chunks: list[VectorChunkRecord] = []
             raw_entity_mentions = 0
@@ -814,6 +803,23 @@ class EnterpriseKGOntologyService:
                     raw_entity_mentions += len(outcome.entities) + (2 * len(outcome.triples))
                     extractions.append(outcome)
                     succeeded_chunks.append(chk)
+
+            succeeded_retract_ids = [
+                chk.chunk_id for chk in succeeded_chunks if chk.chunk_id in set(modified_chunk_ids)
+            ]
+            if succeeded_retract_ids:
+                remaining_acls = await self.vector_store.fetch_tenant_chunk_acl_map(safe_tenant)
+                for mid in succeeded_retract_ids:
+                    remaining_acls.pop(mid, None)
+                retracted_ent_ids, _ = await self.graph_store.delete_chunks_provenance(
+                    tenant_id=safe_tenant,
+                    chunk_ids=succeeded_retract_ids,
+                    remaining_chunk_acls=remaining_acls,
+                )
+                if retracted_ent_ids:
+                    await self.vector_store.delete_canonical_entity_embeddings(
+                        safe_tenant, retracted_ent_ids
+                    )
 
             existing_entities = await self.graph_store.get_all_entities(safe_tenant)
             (
@@ -943,6 +949,17 @@ class EnterpriseKGOntologyService:
         from .auth import reset_current_principal, set_current_principal
 
         safe_tenant, _ = self._enforce_service_principal(tenant_id, required_role="writer")
+        active_for_tenant = [
+            jid
+            for jid, t in self._active_job_tasks.items()
+            if not t.done()
+            and self._sync_jobs.get(jid) is not None
+            and self._sync_jobs[jid].tenant_id == safe_tenant
+        ]
+        if len(active_for_tenant) >= self.max_concurrent_jobs_per_tenant:
+            raise RuntimeError(
+                f"Active build job limit ({self.max_concurrent_jobs_per_tenant}) reached for tenant '{safe_tenant}': {active_for_tenant[0]}"
+            )
         caller_principal = get_current_principal()
         job_id = f"job_{uuid.uuid4().hex[:12]}"
         job = SyncJobRecord(
@@ -987,6 +1004,20 @@ class EnterpriseKGOntologyService:
         self._active_job_tasks[job_id] = asyncio.create_task(_worker())
         return job
 
+    async def _reconcile_orphaned_job(self, job: SyncJobRecord) -> SyncJobRecord:
+        """Marks stale QUEUED/RUNNING jobs left behind by a prior crashed/restarted process as FAILED."""
+        if (
+            job.status in (SyncJobStatus.QUEUED, SyncJobStatus.RUNNING)
+            and job.job_id not in self._active_job_tasks
+            and job.created_at < self._boot_iso
+        ):
+            job.status = SyncJobStatus.FAILED
+            job.error = "Interrupted by process restart"
+            job.completed_at = utc_now_iso()
+            self._sync_jobs[job.job_id] = job
+            await self.vector_store.save_sync_job(job)
+        return job
+
     async def list_sync_jobs_async(
         self,
         tenant_id: str | None = None,
@@ -1000,12 +1031,12 @@ class EnterpriseKGOntologyService:
             tenant_id=tenant_id, limit=limit, offset=offset
         )
         if persisted:
-            return persisted
+            return [await self._reconcile_orphaned_job(j) for j in persisted]
         jobs = list(self._sync_jobs.values())
         if tenant_id is not None:
             jobs = [j for j in jobs if j.tenant_id == tenant_id]
         jobs.sort(key=lambda j: j.created_at, reverse=True)
-        return jobs[offset : offset + limit]
+        return [await self._reconcile_orphaned_job(j) for j in jobs[offset : offset + limit]]
 
     async def cancel_sync_job(self, job_id: str) -> SyncJobRecord | None:
         job = await self.get_sync_job_async(job_id)
@@ -1031,14 +1062,38 @@ class EnterpriseKGOntologyService:
     ) -> list[VectorKBRegistration]:
         safe_tenant, _ = self._enforce_service_principal(tenant_id, required_role="reader")
         kbs = await self.vector_store.list_registered_kbs(tenant_id=safe_tenant)
-        return kbs[offset : offset + limit]
+        sliced = kbs[offset : offset + limit]
+        p = get_current_principal()
+        if p is not None and not p.is_platform_admin:
+            return [
+                kb.model_copy(
+                    update={
+                        "postgres_dsn_alias": "redacted",
+                        "schema_name": "redacted",
+                        "table_name": "redacted",
+                    }
+                )
+                for kb in sliced
+            ]
+        return sliced
 
     async def list_kb_documents(
-        self, tenant_id: str, kb_id: str, limit: int = 50, offset: int = 0
+        self,
+        tenant_id: str,
+        kb_id: str,
+        limit: int = 50,
+        offset: int = 0,
+        caller_acl_groups: list[str] | None = None,
     ) -> list[dict[str, Any]]:
-        safe_tenant, _ = self._enforce_service_principal(tenant_id, required_role="reader")
+        safe_tenant, safe_acls = self._enforce_service_principal(
+            tenant_id, caller_acl_groups, required_role="reader"
+        )
         return await self.vector_store.list_kb_documents(
-            tenant_id=safe_tenant, kb_id=kb_id, limit=limit, offset=offset
+            tenant_id=safe_tenant,
+            kb_id=kb_id,
+            limit=limit,
+            offset=offset,
+            caller_acl_groups=safe_acls,
         )
 
     async def get_entity_details(
@@ -1072,9 +1127,10 @@ class EnterpriseKGOntologyService:
 
     async def get_sync_job_async(self, job_id: str) -> SyncJobRecord | None:
         if job_id in self._sync_jobs:
-            return self._sync_jobs[job_id]
+            return await self._reconcile_orphaned_job(self._sync_jobs[job_id])
         persisted = await self.vector_store.get_sync_job(job_id)
         if persisted is not None:
+            persisted = await self._reconcile_orphaned_job(persisted)
             self._sync_jobs[job_id] = persisted
         return persisted
 
@@ -1325,15 +1381,20 @@ class EnterpriseKGOntologyService:
 
     async def query_graph_rag(self, request: GraphRAGQueryRequest) -> GraphRAGQueryResponse:
         with _otel_span("kg_fabric.query_graph_rag"):
+            req_role = "writer" if request.synthesize_with_llm else "reader"
             safe_tenant, safe_acls = self._enforce_service_principal(
-                request.tenant_id, request.caller_acl_groups
+                request.tenant_id, request.caller_acl_groups, required_role=req_role
             )
+            p = get_current_principal()
+            allow_llm_calls = (p is None) or p.is_admin or ("writer" in p.roles)
             scoped_req = request.model_copy(
                 update={"tenant_id": safe_tenant, "caller_acl_groups": safe_acls}
             )
             self._metrics["queries_total"] += 1
             tbox = await self.load_or_get_tbox(safe_tenant)
-            return await self.rag_engine.query(request=scoped_req, tbox=tbox)
+            return await self.rag_engine.query(
+                request=scoped_req, tbox=tbox, allow_llm_calls=allow_llm_calls
+            )
 
     async def check_answerable(
         self, request: AnswerabilityCheckRequest
@@ -1728,7 +1789,7 @@ class EnterpriseKGOntologyService:
         import re
 
         forbidden = re.compile(
-            r"\b(CREATE|MERGE|DELETE|DETACH|SET|REMOVE|DROP|LOAD\s+CSV|CALL\s+dbms)\b",
+            r"\b(CREATE|MERGE|DELETE|DETACH|SET|REMOVE|DROP|LOAD\s+CSV|CALL)\b",
             re.I,
         )
         m = forbidden.search(cypher_query)

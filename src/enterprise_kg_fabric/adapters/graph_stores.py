@@ -608,6 +608,9 @@ class Neo4jOpenCypherGraphAdapter(PropertyGraphStorePort):
         class_rows = [c.model_dump() for c in tbox.classes.values()]
         rel_rows = [r.model_dump() for r in tbox.relations.values()]
         async with driver.session() as session:
+            await session.run(
+                "CREATE TEXT INDEX idx_entity_canonical_name IF NOT EXISTS FOR (n:Entity) ON (n.canonical_name)"
+            )
             if class_rows:
                 await session.run(
                     """
@@ -1194,17 +1197,29 @@ class Neo4jOpenCypherGraphAdapter(PropertyGraphStorePort):
         include_quarantined: bool = False,
         caller_acl_groups: Sequence[str] | None = None,
     ) -> list[KGEntityNode]:
-        q_low = query.strip().lower()
+        raw_q = query.strip()
+        q_low = raw_q.lower()
         q_tokens = [t for t in re.findall(r"[A-Za-z0-9][A-Za-z0-9._-]{1,}", q_low) if len(t) >= 2]
+        acl_low = [g.lower() for g in caller_acl_groups] if caller_acl_groups is not None else None
         driver = self._get_driver()
         async with driver.session() as session:
+            # ABAC filter is pushed directly into Cypher BEFORE `LIMIT` so restricted nodes
+            # can never crowd out accessible nodes! Uses Neo4j TEXT INDEX on canonical_name
+            # for exact/STARTS WITH/CONTAINS predicates.
             res = await session.run(
                 """
                 MATCH (n:Entity {tenant_id: $tenant_id})
                 WHERE ($include_q OR coalesce(n.governance_bucket, 'APPROVED') = 'APPROVED')
                   AND ($cls IS NULL OR toLower(n.ontology_class) = toLower($cls))
                   AND (
+                        $acls IS NULL
+                        OR ANY(g IN coalesce(n.acl_groups, ['public']) WHERE toLower(g) = 'public' OR toLower(g) IN $acls)
+                  )
+                  AND (
                         $q = ''
+                        OR n.canonical_name = $raw_q
+                        OR n.canonical_name STARTS WITH $raw_q
+                        OR n.canonical_name CONTAINS $raw_q
                         OR toLower(n.canonical_name) CONTAINS $q
                         OR $q CONTAINS toLower(n.canonical_name)
                         OR ANY(tok IN $tokens WHERE toLower(n.canonical_name) CONTAINS tok)
@@ -1228,9 +1243,11 @@ class Neo4jOpenCypherGraphAdapter(PropertyGraphStorePort):
                 tenant_id=tenant_id,
                 include_q=include_quarantined,
                 cls=ontology_class,
+                acls=acl_low,
+                raw_q=raw_q,
                 q=q_low,
                 tokens=q_tokens[:12],
-                lim=max(limit * 3, 25),
+                lim=limit,
             )
             rows = await res.data()
         out: list[KGEntityNode] = []

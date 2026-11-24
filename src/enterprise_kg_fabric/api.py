@@ -285,7 +285,7 @@ def create_kg_fabric_app(
 
             request = Request(scope, receive=receive)
             try:
-                principal = enforcer.authenticate_request(request)
+                principal = await enforcer.authenticate_request_async(request)
                 enforcer.check_rate_limit(request, principal)
             except HTTPException as exc:
                 response = JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
@@ -516,6 +516,8 @@ def create_kg_fabric_app(
         principal: AuthPrincipal | None = Depends(get_principal),
     ) -> GraphRAGQueryResponse:
         p = _unwrap_principal(principal)
+        if req.synthesize_with_llm:
+            enforcer.require_role(p, "writer")
         req.tenant_id = enforcer.enforce_tenant(p, req.tenant_id)
         req.caller_acl_groups = enforcer.enforce_acl_groups(p, req.caller_acl_groups)
         return await svc.query_graph_rag(req)
@@ -607,11 +609,14 @@ def create_kg_fabric_app(
                 incremental=req.incremental,
                 validate_shacl=req.validate_shacl,
             )
-        return await svc.submit_async_build_job(
-            tenant_id=tenant,
-            incremental=req.incremental,
-            validate_shacl=req.validate_shacl,
-        )
+        try:
+            return await svc.submit_async_build_job(
+                tenant_id=tenant,
+                incremental=req.incremental,
+                validate_shacl=req.validate_shacl,
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.get("/v1/jobs", response_model=list[SyncJobRecord])
     async def list_jobs(
@@ -687,8 +692,13 @@ def create_kg_fabric_app(
     ) -> list[dict[str, Any]]:
         p = _unwrap_principal(principal)
         tenant = enforcer.enforce_tenant(p, tenant_id)
+        acls = enforcer.enforce_acl_groups(p, None)
         return await svc.list_kb_documents(
-            tenant_id=tenant, kb_id=kb_id, limit=max(1, min(limit, 200)), offset=max(0, offset)
+            tenant_id=tenant,
+            kb_id=kb_id,
+            limit=max(1, min(limit, 200)),
+            offset=max(0, offset),
+            caller_acl_groups=acls,
         )
 
     @app.get("/v1/entities/{entity_id}")

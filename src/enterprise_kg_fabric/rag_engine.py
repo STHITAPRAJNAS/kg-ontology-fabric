@@ -57,43 +57,97 @@ class EnterpriseHybridGraphRAGEngine:
         query: str,
         tbox: EnterpriseCompiledTBox,
         seed_entities: list[KGEntityNode],
+        allow_llm_plan: bool = False,
     ) -> tuple[str, dict[str, Any]]:
         """
-        Optional LLM-assisted Text-to-OpenCypher when `llm_extractor.use_live_llm=True`
-        (strictly validated read-only + parameterized `$tenant_id`), falling back to
-        the deterministic ontology-grounded templates.
+        Optional LLM-assisted structured intent planning when `llm_extractor.use_live_llm=True`
+        and `allow_llm_plan=True`.
+
+        Security invariant: NEVER executes raw model-written Cypher strings on the shared graph!
+        The LLM may ONLY propose a JSON `{predicate, entity_hint}` grounded in `tbox`, which is
+        validated and compiled strictly into hardcoded `{tenant_id: $tenant_id}` templates.
         """
-        if self.llm_extractor is not None and getattr(self.llm_extractor, "use_live_llm", False):
+        matched_predicate: str | None = None
+        primary_seed = seed_entities[0].canonical_name if seed_entities else ""
+
+        if (
+            allow_llm_plan
+            and self.llm_extractor is not None
+            and getattr(self.llm_extractor, "use_live_llm", False)
+        ):
             gen_async = getattr(self.llm_extractor, "generate_text_async", None)
             if gen_async is not None:
-                classes = list(tbox.classes.keys())[:25]
-                preds = list(tbox.relations.keys())[:25]
+                preds = list(tbox.relations.keys())[:30]
                 seeds = [e.canonical_name for e in seed_entities[:5]]
                 prompt = (
-                    "Write ONE read-only OpenCypher query for Neo4j/Neptune.\n"
-                    "Schema: (:Entity {tenant_id, canonical_name, ontology_class})-[r:KG_RELATION {predicate, t_invalid, source_kb_ids}]->(:Entity).\n"
-                    "Rules: MUST bind $tenant_id (never hardcode tenant_id), MUST filter r.t_invalid = 'ACTIVE', "
-                    "MUST return source, predicate, target, source_kbs, LIMIT 25. Return ONLY raw Cypher.\n"
-                    f"Classes: {classes}\nPredicates: {preds}\nSeed Entities: {seeds}\nQuestion: {query}"
+                    "Classify the graph lookup intent as strict JSON: "
+                    '{"predicate": "UPPER_SNAKE_OR_EMPTY", "entity_hint": "entity_or_empty"}.\n'
+                    f"Allowed Predicates: {preds}\nCandidate Entities: {seeds}\nQuestion: {query}"
                 )
-                raw = await gen_async(prompt, "You are a strict read-only OpenCypher generator.")
+                raw = await gen_async(
+                    prompt, "Return ONLY valid JSON with keys predicate and entity_hint."
+                )
                 if raw:
-                    cand = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", raw.strip()).strip()
-                    forbidden = re.compile(
-                        r"\b(CREATE|MERGE|DELETE|DETACH|SET|REMOVE|DROP|LOAD\s+CSV|CALL\s+dbms)\b",
-                        re.I,
-                    )
-                    if (
-                        cand
-                        and "$tenant_id" in cand
-                        and not forbidden.search(cand)
-                        and not re.search(r"tenant_id\s*[:=]\s*['\"]", cand, re.I)
-                    ):
-                        return cand, {
-                            "tenant_id": tbox.tenant_id,
-                            "entity_name": seeds[0] if seeds else "",
-                        }
+                    try:
+                        import json as _json
+
+                        m = re.search(r"\{.*\}", raw, re.S)
+                        plan = _json.loads(m.group(0) if m else raw)
+                        cand_pred = str(plan.get("predicate", "")).strip()
+                        if cand_pred:
+                            resolved_p = tbox.resolve_predicate(cand_pred)
+                            if resolved_p in tbox.relations:
+                                matched_predicate = resolved_p
+                        cand_ent = str(plan.get("entity_hint", "")).strip()
+                        if cand_ent and not primary_seed:
+                            primary_seed = cand_ent[:120]
+                    except Exception:
+                        pass
+
+        if matched_predicate:
+            return self._compile_safe_opencypher_template(
+                tenant_id=tbox.tenant_id,
+                matched_predicate=matched_predicate,
+                primary_seed=primary_seed,
+            )
         return self.synthesize_opencypher_from_query(query, tbox, seed_entities)
+
+    @staticmethod
+    def _compile_safe_opencypher_template(
+        tenant_id: str,
+        matched_predicate: str | None,
+        primary_seed: str,
+    ) -> tuple[str, dict[str, Any]]:
+        if matched_predicate and primary_seed:
+            cypher = (
+                "MATCH (seed:Entity {tenant_id: $tenant_id})-[:KG_RELATION*0..3]-(s:Entity {tenant_id: $tenant_id})"
+                "-[r:KG_RELATION]->(t:Entity {tenant_id: $tenant_id}) "
+                "WHERE r.predicate = $predicate AND r.t_invalid = 'ACTIVE' "
+                "AND toLower(seed.canonical_name) CONTAINS toLower($entity_name) "
+                "RETURN DISTINCT s.canonical_name AS source, r.predicate AS predicate, "
+                "t.canonical_name AS target, r.source_kb_ids AS source_kbs "
+                "LIMIT 25"
+            )
+            return cypher, {
+                "tenant_id": tenant_id,
+                "predicate": matched_predicate,
+                "entity_name": primary_seed,
+            }
+        if matched_predicate:
+            cypher = (
+                "MATCH (s:Entity {tenant_id: $tenant_id})-[r:KG_RELATION]->(t:Entity {tenant_id: $tenant_id}) "
+                "WHERE r.predicate = $predicate AND r.t_invalid = 'ACTIVE' "
+                "RETURN s.canonical_name AS source, r.predicate AS predicate, t.canonical_name AS target, r.source_kb_ids AS source_kbs "
+                "LIMIT 25"
+            )
+            return cypher, {"tenant_id": tenant_id, "predicate": matched_predicate}
+        cypher = (
+            "MATCH (s:Entity {tenant_id: $tenant_id})-[r:KG_RELATION]->(t:Entity {tenant_id: $tenant_id}) "
+            "WHERE r.t_invalid = 'ACTIVE' "
+            "RETURN s.canonical_name AS source, r.predicate AS predicate, t.canonical_name AS target "
+            "LIMIT 25"
+        )
+        return cypher, {"tenant_id": tenant_id, "entity_name": primary_seed}
 
     async def _synthesize_grounded_llm_answer(
         self,
@@ -195,6 +249,7 @@ class EnterpriseHybridGraphRAGEngine:
         self,
         request: GraphRAGQueryRequest,
         tbox: EnterpriseCompiledTBox,
+        allow_llm_calls: bool = True,
     ) -> GraphRAGQueryResponse:
         t0 = time.perf_counter()
         route = (
@@ -361,9 +416,9 @@ class EnterpriseHybridGraphRAGEngine:
                 gf.ppr_score = ppr_by_edge.get(gf.edge_id, 0.0)
             graph_facts.sort(key=lambda f: (f.hop_distance, -f.ppr_score, -f.confidence))
 
-        # Path 4: Text-to-OpenCypher Structured Query Execution (with ABAC post-filtering)
+        # Path 4: Text-to-OpenCypher Structured Query Execution (with strict fail-closed ABAC post-filtering)
         cypher_query, cypher_params = await self.synthesize_opencypher_async(
-            request.query, tbox, seed_entities
+            request.query, tbox, seed_entities, allow_llm_plan=allow_llm_calls
         )
         raw_opencypher_rows = await self.graph_store.execute_opencypher(
             tenant_id=request.tenant_id,
@@ -387,17 +442,13 @@ class EnterpriseHybridGraphRAGEngine:
                 src_val = row.get("source")
                 tgt_val = row.get("target")
                 pred_val = row.get("predicate")
-                if src_val is not None and src_val not in allowed_entity_names:
+                # Fail closed: every row returned to an ABAC-scoped caller MUST carry explicit
+                # verified (source, predicate, target) columns matching permitted subgraph facts!
+                if not isinstance(src_val, str) or not isinstance(tgt_val, str) or not isinstance(pred_val, str):
                     continue
-                if tgt_val is not None and tgt_val not in allowed_entity_names:
+                if src_val not in allowed_entity_names or tgt_val not in allowed_entity_names:
                     continue
-                if (
-                    src_val is not None
-                    and tgt_val is not None
-                    and pred_val is not None
-                    and allowed_fact_pairs
-                    and (src_val, pred_val, tgt_val) not in allowed_fact_pairs
-                ):
+                if (src_val, pred_val, tgt_val) not in allowed_fact_pairs:
                     continue
                 opencypher_rows.append(row)
         else:
@@ -437,7 +488,7 @@ class EnterpriseHybridGraphRAGEngine:
             await self._synthesize_grounded_llm_answer(
                 request.query, graph_facts, chunk_contexts, deterministic_answer
             )
-            if request.synthesize_with_llm and (graph_facts or chunk_contexts)
+            if (request.synthesize_with_llm and allow_llm_calls and (graph_facts or chunk_contexts))
             else deterministic_answer
         )
 
