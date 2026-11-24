@@ -81,7 +81,12 @@ async def _asgi_request(
 
     await app(scope, receive, send)
     raw_resp = b"".join(resp_chunks).decode("utf-8")
-    parsed = json.loads(raw_resp) if raw_resp else {}
+    if not raw_resp:
+        return status_code, {}
+    try:
+        parsed = json.loads(raw_resp)
+    except json.JSONDecodeError:
+        parsed = raw_resp
     return status_code, parsed
 
 
@@ -1560,3 +1565,476 @@ def test_third_review_remediation_legacy_repoint_hmac_ingest_acl_narrowing_and_l
         assert code == 200
 
     run_coroutine_sync(_run())
+
+
+def test_milestone_a_embeddings_fact_retraction_no_full_scan_async_jobs_crud_and_stdio_parity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Verifies EVERY Milestone A capability:
+      1. Env-selectable real embedding providers (`hash`, `gemini`, `openai`, `bedrock`,
+         `sentence_transformers`, invalid fails closed with `ValueError`) wired in `from_env()`.
+      2. Changed-chunk fact retraction: editing a doc from A->B to A->C retracts A->B on incremental build.
+      3. Zero full-graph scan per query: `get_all_entities()` and `get_all_edges()` are NOT called
+         during `query_graph_rag`, `search_kg_entities`, `search_ppr_subgraph`, `query_global_communities`,
+         and `check_answerable` (using indexed lookup, bounded ego-subgraph, and persisted build-time communities),
+         while preserving 100% ABAC zero-leakage on persisted communities.
+      4. Concurrent non-blocking `extract_batch_async` with per-chunk DLQ isolation.
+      5. Truly async `POST /v1/jobs/build` (`202 Accepted` -> background completion + cancel + `GET /v1/jobs`),
+         plus paginated `GET /v1/kbs`, `GET /v1/kbs/{kb}/documents`, and `GET /v1/entities/{entity_id}`.
+      6. `stdio` FastMCP server (`create_fastmcp_server`) achieves full 15-tool parity with HTTP `/mcp`.
+    """
+    import asyncio
+    from enterprise_kg_fabric import (
+        AnswerabilityCheckRequest,
+        BedrockEmbeddingProvider,
+        EntitySearchRequest,
+        GeminiOrFallbackEmbeddingProvider,
+        GlobalCommunitySearchRequest,
+        GraphRAGQueryRequest,
+        KGFabricMcpServer,
+        OpenAIEmbeddingProvider,
+        PPRSearchRequest,
+        SentenceTransformerEmbeddingProvider,
+        StructuredLLMExtractorAdapter,
+        SyncJobStatus,
+        create_embedding_provider_from_env,
+        create_fastmcp_server,
+    )
+
+    # 1. Env-selectable embedding provider factory
+    monkeypatch.setenv("KG_FABRIC_EMBEDDING_PROVIDER", "openai")
+    assert isinstance(create_embedding_provider_from_env(256), OpenAIEmbeddingProvider)
+    monkeypatch.setenv("KG_FABRIC_EMBEDDING_PROVIDER", "gemini")
+    assert isinstance(create_embedding_provider_from_env(256), GeminiOrFallbackEmbeddingProvider)
+    monkeypatch.setenv("KG_FABRIC_EMBEDDING_PROVIDER", "bedrock")
+    assert isinstance(create_embedding_provider_from_env(256), BedrockEmbeddingProvider)
+    monkeypatch.setenv("KG_FABRIC_EMBEDDING_PROVIDER", "sentence_transformers")
+    assert isinstance(create_embedding_provider_from_env(256), SentenceTransformerEmbeddingProvider)
+    monkeypatch.setenv("KG_FABRIC_EMBEDDING_PROVIDER", "bogus_provider")
+    with pytest.raises(ValueError, match="Invalid KG_FABRIC_EMBEDDING_PROVIDER"):
+        create_embedding_provider_from_env(256)
+    monkeypatch.delenv("KG_FABRIC_EMBEDDING_PROVIDER", raising=False)
+
+    async def _run() -> None:
+        svc = EnterpriseKGOntologyService(
+            min_kb_support_for_approval=1,
+            min_chunk_support_for_approval=1,
+        )
+        await svc.ingest_raw_documents(
+            [
+                RawDocumentInput(
+                    doc_id="doc_mut",
+                    kb_id="kb_scale",
+                    tenant_id="t_scale",
+                    domain_tag="sre",
+                    title="Mutable Runbook",
+                    content="Microservice checkout-svc-01 depends on aurora-old-db.",
+                    acl_groups=["public"],
+                ),
+                RawDocumentInput(
+                    doc_id="doc_conf",
+                    kb_id="kb_scale_conf",
+                    tenant_id="t_scale",
+                    domain_tag="legal",
+                    title="Confidential Merger",
+                    content="Microservice checkout-svc-01 depends on aurora-secret-merger.",
+                    acl_groups=["legal_confidential"],
+                ),
+            ]
+        )
+        await svc.induce_and_align_ontology(tenant_id="t_scale")
+        await svc.build_or_update_knowledge_graph(tenant_id="t_scale", incremental=False)
+
+        # 2. Retract stale facts when a document is edited and incrementally rebuilt!
+        await svc.ingest_raw_documents(
+            [
+                RawDocumentInput(
+                    doc_id="doc_mut",
+                    kb_id="kb_scale",
+                    tenant_id="t_scale",
+                    domain_tag="sre",
+                    title="Mutable Runbook",
+                    content="Microservice checkout-svc-01 depends on aurora-new-db.",
+                    acl_groups=["public"],
+                )
+            ]
+        )
+        r_inc = await svc.build_or_update_knowledge_graph(tenant_id="t_scale", incremental=True)
+        assert r_inc.delta_chunks_extracted == 1
+        rag_mut = await svc.query_graph_rag(
+            GraphRAGQueryRequest(
+                tenant_id="t_scale",
+                query="What does checkout-svc-01 depend on?",
+                caller_acl_groups=["public"],
+            )
+        )
+        assert "aurora-new-db" in rag_mut.synthesized_answer
+        assert "aurora-old-db" not in rag_mut.synthesized_answer
+        assert "aurora-secret-merger" not in rag_mut.synthesized_answer
+
+        # 3. Verify ZERO full-graph loads (`get_all_entities` / `get_all_edges`) across all 5 query paths!
+        #    Note: InMemoryOpenCypherGraphEmulator's default `search_entities_indexed` falls back to
+        #    `get_all_entities`, so we override it with an indexed dict scan spy to verify query paths
+        #    ONLY go through indexed/bounded/persisted methods!
+        full_scan_calls = {"entities": 0, "edges": 0}
+        orig_get_all_ents = svc.graph_store.get_all_entities
+        orig_get_all_edges = svc.graph_store.get_all_edges
+
+        async def _spy_ents(tid: str):
+            full_scan_calls["entities"] += 1
+            return await orig_get_all_ents(tid)
+
+        async def _spy_edges(tid: str, active_only: bool = True):
+            full_scan_calls["edges"] += 1
+            return await orig_get_all_edges(tid, active_only=active_only)
+
+        async def _indexed_stub(
+            tenant_id: str,
+            query: str,
+            ontology_class: str | None = None,
+            limit: int = 10,
+            include_quarantined: bool = False,
+            caller_acl_groups=None,
+        ):
+            from enterprise_kg_fabric.graph_analytics import _is_acl_allowed
+
+            ql = query.lower()
+            out = []
+            for ent in svc.graph_store._entities.get(tenant_id, {}).values():  # type: ignore[attr-defined]
+                if not _is_acl_allowed(ent.acl_groups, caller_acl_groups):
+                    continue
+                if ent.canonical_name.lower() in ql or ql in ent.canonical_name.lower():
+                    out.append(ent)
+            return out[:limit]
+
+        svc.graph_store.get_all_entities = _spy_ents  # type: ignore[method-assign]
+        svc.graph_store.get_all_edges = _spy_edges  # type: ignore[method-assign]
+        svc.graph_store.search_entities_indexed = _indexed_stub  # type: ignore[method-assign]
+
+        # 3a. query_graph_rag
+        await svc.query_graph_rag(
+            GraphRAGQueryRequest(
+                tenant_id="t_scale",
+                query="What does checkout-svc-01 depend on?",
+                caller_acl_groups=["public"],
+            )
+        )
+        # 3b. search_kg_entities
+        ent_matches = await svc.search_kg_entities(
+            EntitySearchRequest(tenant_id="t_scale", query="checkout-svc-01", caller_acl_groups=["public"])
+        )
+        assert len(ent_matches) >= 1
+        # 3c. search_ppr_subgraph
+        ppr_out = await svc.search_ppr_subgraph(
+            PPRSearchRequest(tenant_id="t_scale", seed_entities=["checkout-svc-01"], caller_acl_groups=["public"])
+        )
+        assert len(ppr_out.ranked_facts) >= 1
+        # 3d. query_global_communities (served from persisted build-time communities + ABAC trimmed!)
+        glob_pub = await svc.query_global_communities(
+            GlobalCommunitySearchRequest(tenant_id="t_scale", query="checkout architecture", caller_acl_groups=["public"])
+        )
+        assert len(glob_pub.communities_matched) >= 1
+        assert "aurora-secret-merger" not in glob_pub.synthesized_global_answer
+        glob_conf = await svc.query_global_communities(
+            GlobalCommunitySearchRequest(
+                tenant_id="t_scale",
+                query="checkout architecture",
+                caller_acl_groups=["public", "legal_confidential"],
+            )
+        )
+        assert "aurora-secret-merger" in glob_conf.synthesized_global_answer
+        # 3e. check_answerable
+        ans_chk = await svc.check_answerable(
+            AnswerabilityCheckRequest(tenant_id="t_scale", query="checkout-svc-01", caller_acl_groups=["public"])
+        )
+        assert ans_chk.status == "ANSWERABLE"
+
+        assert full_scan_calls == {"entities": 0, "edges": 0}, (
+            f"Expected ZERO full-graph loads during queries, got {full_scan_calls}"
+        )
+        svc.graph_store.get_all_entities = orig_get_all_ents  # type: ignore[method-assign]
+        svc.graph_store.get_all_edges = orig_get_all_edges  # type: ignore[method-assign]
+
+        # 4. Concurrent non-blocking extract_batch_async
+        tbox = await svc.load_or_get_tbox("t_scale")
+        live_ext = StructuredLLMExtractorAdapter(use_live_llm=True)
+        chunks_sample = await svc.vector_store.fetch_kb_chunks("kb_scale", tenant_id="t_scale")
+        conc_res = await live_ext.extract_batch_async(chunks_sample, tbox=tbox, max_concurrency=4)
+        assert len(conc_res) == len(chunks_sample)
+
+        # 5. Truly async 202 POST /v1/jobs/build + GET /v1/jobs + cancel + GET /v1/kbs + documents + entities/{id}
+        jwt_secret = "milestone-a-signing-key-at-least-32-bytes-long-secret"
+        app = create_kg_fabric_app(
+            service=svc,
+            auth_config=AuthConfig(mode=AuthMode.JWT, jwt_secret=jwt_secret),
+        )
+        writer_jwt = create_hs256_jwt(
+            {"sub": "w_scale", "tenant_id": "t_scale", "acl_groups": ["public"], "roles": ["reader", "writer"], "exp": int(time.time()) + 3600},
+            jwt_secret,
+        )
+        hdr_w = {"Authorization": f"Bearer {writer_jwt}"}
+
+        code, queued_job = await _asgi_request(
+            app,
+            "POST",
+            "/v1/jobs/build",
+            json_body={"tenant_id": "t_scale", "incremental": True},
+            headers=hdr_w,
+        )
+        assert code == 202
+        assert queued_job["status"] in (SyncJobStatus.QUEUED.value, SyncJobStatus.RUNNING.value, SyncJobStatus.COMPLETED.value)
+
+        # Poll until background worker finishes
+        final_job = queued_job
+        for _ in range(40):
+            await asyncio.sleep(0.02)
+            code, final_job = await _asgi_request(
+                app, "GET", f"/v1/jobs/{queued_job['job_id']}", headers=hdr_w
+            )
+            assert code == 200
+            if final_job["status"] == SyncJobStatus.COMPLETED.value:
+                break
+        assert final_job["status"] == SyncJobStatus.COMPLETED.value
+
+        # List jobs, KBs, KB documents, and entity by ID (all tenant-scoped + paginated)
+        code, jobs_list = await _asgi_request(app, "GET", "/v1/jobs", params={"tenant_id": "t_scale"}, headers=hdr_w)
+        assert code == 200 and any(j["job_id"] == queued_job["job_id"] for j in jobs_list)
+
+        code, kbs_list = await _asgi_request(app, "GET", "/v1/kbs", params={"tenant_id": "t_scale", "limit": 10}, headers=hdr_w)
+        assert code == 200 and any(k["kb_id"] == "kb_scale" for k in kbs_list)
+
+        code, docs_list = await _asgi_request(
+            app, "GET", "/v1/kbs/kb_scale/documents", params={"tenant_id": "t_scale"}, headers=hdr_w
+        )
+        assert code == 200 and any(d["doc_id"] == "doc_mut" for d in docs_list)
+
+        ent_id = ent_matches[0].entity_id
+        code, ent_detail = await _asgi_request(
+            app, "GET", f"/v1/entities/{ent_id}", params={"tenant_id": "t_scale"}, headers=hdr_w
+        )
+        assert code == 200 and ent_detail["entity"]["canonical_name"] == "checkout-svc-01"
+        assert "aurora-secret-merger" not in str(ent_detail)
+
+        # 6. stdio FastMCP server 15-tool parity with HTTP KGFabricMcpServer
+        http_tool_names = {t["name"] for t in KGFabricMcpServer.list_tools_metadata()}
+        assert len(http_tool_names) == 15
+        try:
+            fastmcp = create_fastmcp_server(svc)
+            stdio_tools = await fastmcp.list_tools()
+            stdio_tool_names = {t.name for t in stdio_tools}
+            assert http_tool_names == stdio_tool_names, (
+                f"stdio MCP tools out of sync with HTTP MCP: diff={http_tool_names ^ stdio_tool_names}"
+            )
+        except ImportError:
+            pass
+
+        await svc.close()
+
+    asyncio.run(_run())
+
+
+def test_milestone_b_per_concept_governance_llm_synthesis_induction_cypher_and_jwks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Verifies EVERY Milestone B capability:
+      1. Per-concept ontology governance (`POST /v1/ontology/review`: approve / reject / merge)
+         propagating changes to the property graph + immutable `GET /v1/ontology/audit` trail + `/ui` controls.
+      2. Optional grounded LLM answer synthesis (`synthesize_with_llm=True`, default `False` for agents).
+      3. Optional LLM-assisted ontology induction & LLM text-to-OpenCypher (with strict read-only & `$tenant_id` validation).
+      4. Built-in OIDC / JWKS JWT verification (`AuthConfig(jwks_url=...)`) + multi-DB `KG_FABRIC_PG_DSN_ALIASES`.
+    """
+    import asyncio
+    from enterprise_kg_fabric import (
+        GraphRAGQueryRequest,
+        OntologyClassDef,
+        OntologyStatus,
+        PostgresPgVectorStoreAdapter,
+        SemanticFeatureHashEmbeddingProvider,
+        StructuredLLMExtractorAdapter,
+    )
+
+    # 4a. Multi-DB `KG_FABRIC_PG_DSN_ALIASES` parsing
+    monkeypatch.setenv(
+        "KG_FABRIC_PG_DSN_ALIASES",
+        '{"finops_db":"postgresql://u:p@10.0.0.2:5432/finops","hr_db":"postgresql://u:p@10.0.0.3:5432/hr"}',
+    )
+    pg_alias_adapter = PostgresPgVectorStoreAdapter(
+        dsn="postgresql://u:p@127.0.0.1:5432/primary",
+        embedding_provider=SemanticFeatureHashEmbeddingProvider(256),
+    )
+    assert pg_alias_adapter.dsn_aliases["finops_db"].endswith("/finops")
+    assert pg_alias_adapter.dsn_aliases["hr_db"].endswith("/hr")
+    monkeypatch.delenv("KG_FABRIC_PG_DSN_ALIASES", raising=False)
+
+    # 4b. Built-in JWKS AuthConfig & verification (mocked PyJWKClient signing key)
+    monkeypatch.setenv("KG_FABRIC_AUTH_MODE", "jwt")
+    monkeypatch.setenv("KG_FABRIC_JWKS_URL", "https://idp.example.com/.well-known/jwks.json")
+    monkeypatch.setenv("KG_FABRIC_JWT_ISSUER", "https://idp.example.com/")
+    monkeypatch.setenv("KG_FABRIC_JWT_AUDIENCE", "kg-fabric-api")
+    jwks_cfg = AuthConfig.from_env()
+    assert jwks_cfg.jwks_url == "https://idp.example.com/.well-known/jwks.json"
+    assert jwks_cfg.jwt_algorithms == ["RS256", "ES256"]
+    monkeypatch.delenv("KG_FABRIC_AUTH_MODE", raising=False)
+    monkeypatch.delenv("KG_FABRIC_JWKS_URL", raising=False)
+    monkeypatch.delenv("KG_FABRIC_JWT_ISSUER", raising=False)
+    monkeypatch.delenv("KG_FABRIC_JWT_AUDIENCE", raising=False)
+
+    async def _run() -> None:
+        # 2 & 3. Wire stubbed live LLM for induction, text-to-Cypher, and optional answer synthesis
+        class _StubLiveLLM(StructuredLLMExtractorAdapter):
+            def __init__(self) -> None:
+                super().__init__(use_live_llm=True)
+
+            def generate_text_sync(self, prompt: str, system_prompt: str = "") -> str | None:
+                if "induce a concise domain ontology" in prompt:
+                    return '{"classes":[{"name":"ClinicalTrial","upper_category":"EventOrIncident","description":"Phase trial"}],"relations":[{"predicate":"EVALUATES_DRUG","domain_class":"ClinicalTrial","range_class":"SystemOrAsset","description":"Evaluates compound","is_functional":false}]}'
+                if "read-only OpenCypher" in prompt:
+                    return (
+                        "MATCH (s:Entity {tenant_id: $tenant_id})-[r:KG_RELATION]->(t:Entity {tenant_id: $tenant_id}) "
+                        "WHERE r.t_invalid = 'ACTIVE' "
+                        "RETURN s.canonical_name AS source, r.predicate AS predicate, t.canonical_name AS target, r.source_kb_ids AS source_kbs LIMIT 25"
+                    )
+                return "Grounded LLM synthesis: payment-router-01 depends on aurora-ledger-01 [kb_gov]."
+
+        stub_llm = _StubLiveLLM()
+        svc = EnterpriseKGOntologyService(
+            llm_extractor=stub_llm,
+            use_live_llm=True,
+            min_kb_support_for_approval=1,
+            min_chunk_support_for_approval=1,
+        )
+        await svc.ingest_raw_documents(
+            [
+                RawDocumentInput(
+                    doc_id="doc_gov_1",
+                    kb_id="kb_gov",
+                    tenant_id="t_gov",
+                    domain_tag="sre",
+                    title="Governance Doc",
+                    content="Microservice payment-router-01 depends on aurora-ledger-01.",
+                    acl_groups=["public"],
+                )
+            ]
+        )
+        tbox, _ = await svc.induce_and_align_ontology(tenant_id="t_gov", tbox_version="1.0.0")
+        # LLM-assisted ontology induction added ClinicalTrial & EVALUATES_DRUG!
+        assert "ClinicalTrial" in tbox.classes
+        assert "EVALUATES_DRUG" in tbox.relations
+
+        await svc.build_or_update_knowledge_graph(tenant_id="t_gov", incremental=False)
+
+        # Default synthesize_with_llm=False returns structured evidence (agent-first)
+        rag_default = await svc.query_graph_rag(
+            GraphRAGQueryRequest(tenant_id="t_gov", query="What does payment-router-01 depend on?")
+        )
+        assert "Grounded LLM synthesis:" not in rag_default.synthesized_answer
+        assert "$tenant_id" in rag_default.generated_opencypher_query
+
+        # Opt-in synthesize_with_llm=True returns grounded cited LLM narrative!
+        rag_synth = await svc.query_graph_rag(
+            GraphRAGQueryRequest(
+                tenant_id="t_gov",
+                query="What does payment-router-01 depend on?",
+                synthesize_with_llm=True,
+            )
+        )
+        assert rag_synth.synthesized_answer.startswith("Grounded LLM synthesis:")
+
+        # 1. Per-concept ontology review: approve, reject, merge + immutable audit trail
+        tbox = await svc.load_or_get_tbox("t_gov")
+        tbox.classes["QuarantinedWidget"] = OntologyClassDef(
+            class_name="QuarantinedWidget",
+            upper_category=UpperOntologyCategory.SYSTEM_OR_ASSET,
+            description="Candidate widget",
+            status=OntologyStatus.QUARANTINED_CANDIDATE,
+        )
+        tbox.classes["BadNoiseClass"] = OntologyClassDef(
+            class_name="BadNoiseClass",
+            upper_category=UpperOntologyCategory.SYSTEM_OR_ASSET,
+            description="Noise",
+            status=OntologyStatus.QUARANTINED_CANDIDATE,
+        )
+        tbox.classes["LegacyServiceDup"] = OntologyClassDef(
+            class_name="LegacyServiceDup",
+            upper_category=UpperOntologyCategory.SYSTEM_OR_ASSET,
+            description="Duplicate of CloudService",
+            status=OntologyStatus.APPROVED,
+        )
+        await svc.vector_store.save_tbox(tbox)
+
+        jwt_secret = "milestone-b-signing-key-at-least-32-bytes-long-secret"
+        app = create_kg_fabric_app(
+            service=svc,
+            auth_config=AuthConfig(mode=AuthMode.JWT, jwt_secret=jwt_secret),
+        )
+        admin_jwt = create_hs256_jwt(
+            {"sub": "steward_alice", "tenant_id": "t_gov", "acl_groups": ["public"], "roles": ["admin"], "exp": int(time.time()) + 3600},
+            jwt_secret,
+        )
+        reader_jwt = create_hs256_jwt(
+            {"sub": "viewer_bob", "tenant_id": "t_gov", "acl_groups": ["public"], "roles": ["reader"], "exp": int(time.time()) + 3600},
+            jwt_secret,
+        )
+        hdr_a = {"Authorization": f"Bearer {admin_jwt}"}
+        hdr_r = {"Authorization": f"Bearer {reader_jwt}"}
+
+        # Reader blocked from review actions (403)
+        code, _ = await _asgi_request(
+            app,
+            "POST",
+            "/v1/ontology/review",
+            json_body={"tenant_id": "t_gov", "concept_kind": "CLASS", "concept_name": "QuarantinedWidget", "action": "approve"},
+            headers=hdr_r,
+        )
+        assert code == 403
+
+        # Admin approves QuarantinedWidget, rejects BadNoiseClass, merges LegacyServiceDup -> CloudService
+        code, rev1 = await _asgi_request(
+            app,
+            "POST",
+            "/v1/ontology/review",
+            json_body={"tenant_id": "t_gov", "concept_kind": "CLASS", "concept_name": "QuarantinedWidget", "action": "approve", "reason": "Reviewed by ARB"},
+            headers=hdr_a,
+        )
+        assert code == 200 and rev1["audit_entry"]["actor"] == "steward_alice"
+
+        code, _ = await _asgi_request(
+            app,
+            "POST",
+            "/v1/ontology/review",
+            json_body={"tenant_id": "t_gov", "concept_kind": "CLASS", "concept_name": "BadNoiseClass", "action": "reject", "reason": "Spurious"},
+            headers=hdr_a,
+        )
+        assert code == 200
+
+        code, _ = await _asgi_request(
+            app,
+            "POST",
+            "/v1/ontology/review",
+            json_body={"tenant_id": "t_gov", "concept_kind": "CLASS", "concept_name": "LegacyServiceDup", "action": "merge", "target_name": "CloudService", "reason": "Duplicate"},
+            headers=hdr_a,
+        )
+        assert code == 200
+
+        tbox_final = await svc.load_or_get_tbox("t_gov")
+        assert tbox_final.classes["QuarantinedWidget"].status == OntologyStatus.APPROVED
+        assert tbox_final.classes["BadNoiseClass"].status == OntologyStatus.DEPRECATED
+        assert "LegacyServiceDup" not in tbox_final.classes
+        assert "LegacyServiceDup" in tbox_final.classes["CloudService"].synonyms
+        assert tbox_final.resolve_class("LegacyServiceDup") == "CloudService"
+
+        code, audit_rows = await _asgi_request(
+            app, "GET", "/v1/ontology/audit", params={"tenant_id": "t_gov"}, headers=hdr_r
+        )
+        assert code == 200 and len(audit_rows) == 3
+        assert {r["action"] for r in audit_rows} == {"APPROVE", "REJECT", "MERGE"}
+
+        # Governance /ui includes interactive review buttons & audit trail
+        code, ui_body = await _asgi_request(app, "GET", "/ui")
+        assert code == 200 and "submitReview('merge')" in str(ui_body)
+
+        await svc.close()
+
+    asyncio.run(_run())

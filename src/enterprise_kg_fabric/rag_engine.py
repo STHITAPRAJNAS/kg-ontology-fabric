@@ -38,6 +38,8 @@ class EnterpriseHybridGraphRAGEngine:
         graph_analytics: GraphAnalyticsEngine | None = None,
         reranker: PluggableCrossEncoderReranker | None = None,
         canonical_dim: int = 256,
+        llm_extractor: Any | None = None,
+        answer_synthesizer: Any | None = None,
     ):
         self.vector_store = vector_store
         self.graph_store = graph_store
@@ -47,6 +49,86 @@ class EnterpriseHybridGraphRAGEngine:
             embedding_provider=embedding_provider, canonical_dim=canonical_dim
         )
         self.reranker = reranker or PluggableCrossEncoderReranker()
+        self.llm_extractor = llm_extractor
+        self.answer_synthesizer = answer_synthesizer
+
+    async def synthesize_opencypher_async(
+        self,
+        query: str,
+        tbox: EnterpriseCompiledTBox,
+        seed_entities: list[KGEntityNode],
+    ) -> tuple[str, dict[str, Any]]:
+        """
+        Optional LLM-assisted Text-to-OpenCypher when `llm_extractor.use_live_llm=True`
+        (strictly validated read-only + parameterized `$tenant_id`), falling back to
+        the deterministic ontology-grounded templates.
+        """
+        if self.llm_extractor is not None and getattr(self.llm_extractor, "use_live_llm", False):
+            gen_async = getattr(self.llm_extractor, "generate_text_async", None)
+            if gen_async is not None:
+                classes = list(tbox.classes.keys())[:25]
+                preds = list(tbox.relations.keys())[:25]
+                seeds = [e.canonical_name for e in seed_entities[:5]]
+                prompt = (
+                    "Write ONE read-only OpenCypher query for Neo4j/Neptune.\n"
+                    "Schema: (:Entity {tenant_id, canonical_name, ontology_class})-[r:KG_RELATION {predicate, t_invalid, source_kb_ids}]->(:Entity).\n"
+                    "Rules: MUST bind $tenant_id (never hardcode tenant_id), MUST filter r.t_invalid = 'ACTIVE', "
+                    "MUST return source, predicate, target, source_kbs, LIMIT 25. Return ONLY raw Cypher.\n"
+                    f"Classes: {classes}\nPredicates: {preds}\nSeed Entities: {seeds}\nQuestion: {query}"
+                )
+                raw = await gen_async(prompt, "You are a strict read-only OpenCypher generator.")
+                if raw:
+                    cand = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", raw.strip()).strip()
+                    forbidden = re.compile(
+                        r"\b(CREATE|MERGE|DELETE|DETACH|SET|REMOVE|DROP|LOAD\s+CSV|CALL\s+dbms)\b",
+                        re.I,
+                    )
+                    if (
+                        cand
+                        and "$tenant_id" in cand
+                        and not forbidden.search(cand)
+                        and not re.search(r"tenant_id\s*[:=]\s*['\"]", cand, re.I)
+                    ):
+                        return cand, {
+                            "tenant_id": tbox.tenant_id,
+                            "entity_name": seeds[0] if seeds else "",
+                        }
+        return self.synthesize_opencypher_from_query(query, tbox, seed_entities)
+
+    async def _synthesize_grounded_llm_answer(
+        self,
+        query: str,
+        graph_facts: list[Any],
+        chunk_contexts: list[Any],
+        deterministic_fallback: str,
+    ) -> str:
+        """
+        Optional grounded LLM answer synthesis with citations (`request.synthesize_with_llm=True`).
+        Uses an injected `answer_synthesizer(query, graph_facts, chunk_contexts)` callback or
+        `llm_extractor.generate_text_async(...)`, falling back cleanly to structured evidence.
+        """
+        if self.answer_synthesizer is not None:
+            res = self.answer_synthesizer(query, graph_facts, chunk_contexts)
+            if hasattr(res, "__await__"):
+                res = await res
+            if res:
+                return str(res)
+        if self.llm_extractor is not None and getattr(self.llm_extractor, "use_live_llm", False):
+            gen_async = getattr(self.llm_extractor, "generate_text_async", None)
+            if gen_async is not None:
+                prompt = (
+                    f"Answer the user question strictly using ONLY the verified Knowledge Graph facts "
+                    f"and Vector KB evidence below. Cite exact KB IDs and entity names inline. "
+                    f"Do not invent facts not present in the evidence.\n\n"
+                    f"Question: {query}\n\nEvidence:\n{deterministic_fallback}"
+                )
+                out = await gen_async(
+                    prompt,
+                    "You are a grounded enterprise GraphRAG synthesizer. Every claim must cite provided evidence.",
+                )
+                if out:
+                    return out
+        return deterministic_fallback
 
     def synthesize_opencypher_from_query(
         self,
@@ -121,18 +203,36 @@ class EnterpriseHybridGraphRAGEngine:
             else QueryRouteDecision.LOCAL_MULTIHOP_PPR
         )
 
-        # Route A: Microsoft GraphRAG Global Sensemaking via Leiden/Louvain Communities
+        # Route A: Microsoft GraphRAG Global Sensemaking via Persisted Build-Time Communities
         if route == QueryRouteDecision.GLOBAL_SENSEMAKING:
-            all_entities = await self.graph_store.get_all_entities(request.tenant_id)
-            all_edges = await self.graph_store.get_all_edges(request.tenant_id, active_only=True)
-            global_res = self.graph_analytics.query_global_communities(
-                tenant_id=request.tenant_id,
-                query=request.query,
-                entities=all_entities,
-                edges=all_edges,
-                top_k_communities=4,
-                caller_acl_groups=request.caller_acl_groups,
-            )
+            persisted = await self.vector_store.load_community_summaries(request.tenant_id)
+            if persisted:
+                global_res = self.graph_analytics.query_persisted_communities(
+                    tenant_id=request.tenant_id,
+                    query=request.query,
+                    persisted_communities=persisted,
+                    top_k_communities=4,
+                    caller_acl_groups=request.caller_acl_groups,
+                )
+            else:
+                all_entities = await self.graph_store.get_all_entities(request.tenant_id)
+                all_edges = await self.graph_store.get_all_edges(request.tenant_id, active_only=True)
+                built_comms, eng = self.graph_analytics.detect_communities_and_summarize(
+                    tenant_id=request.tenant_id,
+                    entities=all_entities,
+                    edges=all_edges,
+                    caller_acl_groups=None,
+                )
+                if built_comms:
+                    await self.vector_store.save_community_summaries(request.tenant_id, built_comms)
+                global_res = self.graph_analytics.query_persisted_communities(
+                    tenant_id=request.tenant_id,
+                    query=request.query,
+                    persisted_communities=built_comms,
+                    top_k_communities=4,
+                    caller_acl_groups=request.caller_acl_groups,
+                    engine_used=eng,
+                )
             contributing_kbs = sorted(
                 {kb for comm in global_res.communities_matched for kb in comm.contributing_kb_ids}
             )
@@ -142,7 +242,7 @@ class EnterpriseHybridGraphRAGEngine:
                 tbox_version=tbox.version,
                 route_taken=route,
                 synthesized_answer=global_res.synthesized_global_answer,
-                generated_opencypher_query="-- Routed to Leiden Community Global Sensemaking",
+                generated_opencypher_query="-- Routed to Persisted Leiden Community Global Sensemaking",
                 community_summaries_used=[
                     c.model_dump(exclude={"embedding"}) for c in global_res.communities_matched
                 ],
@@ -184,50 +284,37 @@ class EnterpriseHybridGraphRAGEngine:
                 retrieval_latency_ms=round((time.perf_counter() - t0) * 1000.0, 2),
             )
 
-        # Path 3: Seed Entity Discovery (ABAC-trimmed)
-        all_entities = await self.graph_store.get_all_entities(request.tenant_id)
+        # Path 3: Indexed Seed Entity Discovery (zero full-tenant graph scan!)
         q_lower = request.query.lower()
         q_tokens = set(re.findall(r"[a-z0-9_\-\.]+", q_lower))
-        retrieved_chunk_ids = {c.chunk_id for c in chunk_contexts}
-
         seed_entity_ids: list[str] = []
         seed_entities: list[KGEntityNode] = []
 
-        # 3a. Exact or alias match in query text
-        for eid, ent in all_entities.items():
-            if not request.include_quarantined_overflow and ent.governance_bucket != OntologyStatus.APPROVED:
-                continue
-            if not _is_acl_allowed(ent.acl_groups, request.caller_acl_groups):
-                continue
+        # 3a. Indexed lexical / alias lookup in graph store (Neo4j index / InMemory)
+        indexed_matches = await self.graph_store.search_entities_indexed(
+            tenant_id=request.tenant_id,
+            query=request.query,
+            limit=12,
+            include_quarantined=request.include_quarantined_overflow,
+            caller_acl_groups=request.caller_acl_groups,
+        )
+        for ent in indexed_matches:
             names_to_check = [ent.canonical_name] + list(ent.aliases)
             if any(n.lower() in q_lower or n.lower() in q_tokens for n in names_to_check if len(n) >= 3):
-                if eid not in seed_entity_ids:
-                    seed_entity_ids.append(eid)
+                if ent.entity_id not in seed_entity_ids:
+                    seed_entity_ids.append(ent.entity_id)
                     seed_entities.append(ent)
 
-        # 3b. Entities directly extracted from top retrieved chunks (only if query named no explicit entities)
-        if not seed_entity_ids:
-            for eid, ent in all_entities.items():
-                if eid in seed_entity_ids:
-                    continue
-                if not request.include_quarantined_overflow and ent.governance_bucket != OntologyStatus.APPROVED:
-                    continue
-                if not _is_acl_allowed(ent.acl_groups, request.caller_acl_groups):
-                    continue
-                if retrieved_chunk_ids.intersection(ent.source_chunk_ids):
-                    seed_entity_ids.append(eid)
-                    seed_entities.append(ent)
-                    if len(seed_entity_ids) >= 6:
-                        break
-
-        # 3c. Canonical Entity Embedding Similarity fallback
+        # 3b. Canonical Entity Embedding HNSW Similarity fallback in pgvector
         if not seed_entity_ids:
             sim_entities = await self.vector_store.search_similar_entities(
                 tenant_id=request.tenant_id,
                 query_embedding=q_vec,
-                top_k=4,
+                top_k=6,
             )
-            for ent, _ in sim_entities:
+            for sim_ent, _ in sim_entities:
+                full_ent = await self.graph_store.get_entity_by_id(request.tenant_id, sim_ent.entity_id)
+                ent = full_ent or sim_ent
                 if not request.include_quarantined_overflow and ent.governance_bucket != OntologyStatus.APPROVED:
                     continue
                 if not _is_acl_allowed(ent.acl_groups, request.caller_acl_groups):
@@ -235,6 +322,8 @@ class EnterpriseHybridGraphRAGEngine:
                 if ent.entity_id not in seed_entity_ids:
                     seed_entity_ids.append(ent.entity_id)
                     seed_entities.append(ent)
+                    if len(seed_entity_ids) >= 4:
+                        break
 
         # Expand K-Hop Subgraph in Neo4j / Neptune (with ABAC security trimming!)
         graph_facts, bridge_entities = await self.graph_store.expand_k_hop_subgraph(
@@ -246,13 +335,21 @@ class EnterpriseHybridGraphRAGEngine:
             caller_acl_groups=request.caller_acl_groups,
         )
 
-        # HippoRAG 2 PPR Hub-Damped Re-Scoring on retrieved subgraph facts
+        # HippoRAG 2 PPR Hub-Damped Re-Scoring on BOUNDED ego-subgraph (zero full-graph scan!)
+        ego_entities: dict[str, KGEntityNode] = {e.entity_id: e for e in seed_entities}
         if request.use_ppr_ranking and seed_entity_ids and graph_facts:
-            all_edges = await self.graph_store.get_all_edges(request.tenant_id, active_only=(request.as_of_iso is None))
+            ego_entities, ego_edges = await self.graph_store.fetch_ego_subgraph(
+                tenant_id=request.tenant_id,
+                seed_entity_ids=seed_entity_ids,
+                max_hops=max(2, request.max_graph_hops),
+                include_quarantined=request.include_quarantined_overflow,
+                as_of_iso=request.as_of_iso,
+                caller_acl_groups=request.caller_acl_groups,
+            )
             ppr_res = self.graph_analytics.search_ppr_subgraph(
                 tenant_id=request.tenant_id,
-                entities=all_entities,
-                edges=all_edges,
+                entities=ego_entities,
+                edges=ego_edges,
                 seed_entity_ids=seed_entity_ids,
                 top_k_facts=max(len(graph_facts), 25),
                 as_of_iso=request.as_of_iso,
@@ -265,7 +362,7 @@ class EnterpriseHybridGraphRAGEngine:
             graph_facts.sort(key=lambda f: (f.hop_distance, -f.ppr_score, -f.confidence))
 
         # Path 4: Text-to-OpenCypher Structured Query Execution (with ABAC post-filtering)
-        cypher_query, cypher_params = self.synthesize_opencypher_from_query(
+        cypher_query, cypher_params = await self.synthesize_opencypher_async(
             request.query, tbox, seed_entities
         )
         raw_opencypher_rows = await self.graph_store.execute_opencypher(
@@ -276,9 +373,12 @@ class EnterpriseHybridGraphRAGEngine:
         if request.caller_acl_groups is not None:
             allowed_entity_names = {
                 ent.canonical_name
-                for ent in all_entities.values()
+                for ent in ego_entities.values()
                 if _is_acl_allowed(ent.acl_groups, request.caller_acl_groups)
             }
+            for gf in graph_facts:
+                allowed_entity_names.add(gf.source_name)
+                allowed_entity_names.add(gf.target_name)
             allowed_fact_pairs = {
                 (gf.source_name, gf.predicate, gf.target_name) for gf in graph_facts
             }
@@ -332,12 +432,21 @@ class EnterpriseHybridGraphRAGEngine:
         if not answer_lines:
             answer_lines.append("No matching knowledge graph facts or vector chunks found for the tenant / ACL scope.")
 
+        deterministic_answer = "\n".join(answer_lines)
+        final_answer = (
+            await self._synthesize_grounded_llm_answer(
+                request.query, graph_facts, chunk_contexts, deterministic_answer
+            )
+            if request.synthesize_with_llm and (graph_facts or chunk_contexts)
+            else deterministic_answer
+        )
+
         return GraphRAGQueryResponse(
             query=request.query,
             tenant_id=request.tenant_id,
             tbox_version=tbox.version,
             route_taken=route,
-            synthesized_answer="\n".join(answer_lines),
+            synthesized_answer=final_answer,
             generated_opencypher_query=cypher_query,
             opencypher_results=opencypher_rows,
             seed_entities_matched=[e.canonical_name for e in seed_entities],

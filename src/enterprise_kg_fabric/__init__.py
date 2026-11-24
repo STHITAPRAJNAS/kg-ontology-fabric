@@ -69,7 +69,9 @@ from .models import (
     KGGraphBuildReport,
     KGQualityScorecardReport,
     KGRelationEdge,
+    OntologyAuditEntry,
     OntologyClassDef,
+    OntologyConceptReviewRequest,
     OntologyInductionReport,
     OntologyRelationDef,
     OntologyStatus,
@@ -104,12 +106,16 @@ from .quality_auditor import KGQualityAuditor
 from .rag_engine import EnterpriseHybridGraphRAGEngine
 from .service import EnterpriseKGOntologyService
 from .vector_clustering import (
+    BedrockEmbeddingProvider,
     EmbeddingProvider,
     FederatedEmbeddingModelRouter,
     GeminiOrFallbackEmbeddingProvider,
+    OpenAIEmbeddingProvider,
     SemanticFeatureHashEmbeddingProvider,
+    SentenceTransformerEmbeddingProvider,
     SubLinearVectorCentroidSampler,
     cosine_similarity,
+    create_embedding_provider_from_env,
 )
 
 __all__ = [
@@ -148,6 +154,8 @@ __all__ = [
     "RawDocumentInput",
     "VectorChunkRecord",
     "OntologyClassDef",
+    "OntologyAuditEntry",
+    "OntologyConceptReviewRequest",
     "OntologyRelationDef",
     "EnterpriseCompiledTBox",
     "ExtractedEntityMention",
@@ -183,6 +191,10 @@ __all__ = [
     "FederatedEmbeddingModelRouter",
     "SemanticFeatureHashEmbeddingProvider",
     "GeminiOrFallbackEmbeddingProvider",
+    "OpenAIEmbeddingProvider",
+    "BedrockEmbeddingProvider",
+    "SentenceTransformerEmbeddingProvider",
+    "create_embedding_provider_from_env",
     "SubLinearVectorCentroidSampler",
     "cosine_similarity",
     "AutomatedOntologyInducer",

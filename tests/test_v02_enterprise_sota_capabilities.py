@@ -273,7 +273,7 @@ def test_persistent_tbox_async_jobs_dlq_and_v02_api_mcp_endpoints() -> None:
 
         svc.kg_extractor.extract_from_chunk = flaky_extract  # type: ignore[method-assign]
         job_rec = await routes["/v1/jobs/build"](
-            BuildGraphRequest(tenant_id="t_jobs", incremental=True)
+            BuildGraphRequest(tenant_id="t_jobs", incremental=True, wait=True)
         )
         assert job_rec.status == SyncJobStatus.COMPLETED
         assert job_rec.dlq_count == 1
@@ -285,7 +285,7 @@ def test_persistent_tbox_async_jobs_dlq_and_v02_api_mcp_endpoints() -> None:
         # Restore extractor and re-run job -> previously failed chunk wasn't watermarked so it succeeds now!
         svc.kg_extractor.extract_from_chunk = original_extract  # type: ignore[method-assign]
         job_rec_2 = await routes["/v1/jobs/build"](
-            BuildGraphRequest(tenant_id="t_jobs", incremental=True)
+            BuildGraphRequest(tenant_id="t_jobs", incremental=True, wait=True)
         )
         assert job_rec_2.report is not None
         assert job_rec_2.report.delta_chunks_extracted == 1

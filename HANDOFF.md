@@ -1,19 +1,20 @@
 # Session Handoff — `enterprise-kg-ontology-fabric`
 
-1. **Last Updated**: 2026-11-24 13:16 EST (`Windows`)
+1. **Last Updated**: 2026-11-24 14:01 EST (`Windows`)
 2. **Current Goal & Status**:
-   - Remediated **ALL findings across External Red-Team Reviews #1 (12 findings), #2 (7 findings), and #3 (4 findings)** on `v0.3.0` (no PyPI tag pushed yet).
+   - Completed **ALL 3 External Red-Team Security Reviews (23 findings)** AND **BOTH Feature Milestones (Milestone A: Core Pipeline & Scale + Milestone B: Governance, Federation, Live AI & OIDC/JWKS)** on `v0.3.0` (no PyPI tag pushed yet).
    - **`ruff check src tests` — 0 errors** (`All checks passed!`).
-   - **`19 / 19` pytest tests pass (`6.13s`)**, including all 3 adversarial security regression suites:
-     - `test_review_remediation_critical_security_neptune_promote_delete_and_auth_fail_closed`
-     - `test_second_review_remediation_legacy_exfil_platform_admin_entity_pk_delete_dlq_and_metrics`
-     - `test_third_review_remediation_legacy_repoint_hmac_ingest_acl_narrowing_and_llm_judge_rbac`
-   - Note: Live Docker verification (`examples/live_docker_v03_full_verification.py`) passed on Review #2 (`96.71 / 100 A+`), and was extended with Review #3 live checks (legacy re-point `403`, `use_llm_judge=true` `403`, Neo4j 5 entity ACL narrowing); Docker Desktop was stopped on the host during the Review #3 check so re-run `examples/live_docker_v03_full_verification.py` once Docker Desktop is started.
-3. **Recent Changes (Review #3)**:
-   - `enterprise-kg-ontology-fabric/src/enterprise_kg_fabric/service.py` & `adapters/pgvector_store.py`: Blocked tenant writers from re-pointing an existing `EXISTING_PGVECTOR_KB` to another table via `source_type=MANAGED_RAW_DOC_KB` (`403`, requires `platform_admin`), and synced `source_type`/`schema_name`/`column_mapping`/`embedding_model_id` on `ON CONFLICT (kb_id) DO UPDATE`.
-   - `enterprise-kg-ontology-fabric/src/enterprise_kg_fabric/llama_index_bridge.py` & `service.py`: Wired `service.pii_redactor` into `LlamaIndexHierarchicalNodeParser` so `ingest_raw_documents` honors `PIIRedactionMode.HMAC_PSEUDONYMIZE` (and updates `_pii_redaction_audit_counts`) identically to `hydrate_existing_kb_chunks`.
-   - `enterprise-kg-ontology-fabric/src/enterprise_kg_fabric/adapters/pgvector_store.py`, `adapters/graph_stores.py`, & `service.py`: Added `fetch_tenant_chunk_acl_map` and narrowed surviving entity/edge `acl_groups` inside `delete_chunks_provenance` across In-Memory, Neo4j 5, and Neptune adapters.
-   - `enterprise-kg-ontology-fabric/src/enterprise_kg_fabric/service.py` & `api.py`: Gated `use_llm_judge=true` on `GET /v1/quality/report` and MCP `audit_kg_quality` to `writer`/`admin` (`reader` gets `403`).
+   - **`21 / 21` pytest tests pass (`10.91s`)**, including:
+     - `test_milestone_a_embeddings_fact_retraction_no_full_scan_async_jobs_crud_and_stdio_parity` (verifies zero full-graph loads across all 5 query paths, changed-chunk fact retraction, env-selectable embedding providers, concurrent `extract_batch_async`, `202` async jobs + cancel + CRUD list APIs, and 15/15 `stdio` FastMCP parity)
+     - `test_milestone_b_per_concept_governance_llm_synthesis_induction_cypher_and_jwks` (verifies per-concept approve/reject/merge + audit trail + writable `/ui`, opt-in grounded LLM answer synthesis, LLM-assisted ontology induction + text-to-Cypher, multi-DB `KG_FABRIC_PG_DSN_ALIASES`, and built-in OIDC/JWKS config)
+     - All 3 security regression suites (`test_review_remediation...`, `test_second_review_remediation...`, `test_third_review_remediation...`).
+   - Note: Docker Desktop was stopped on this host during this session; start Docker Desktop and run `python examples/live_docker_v03_full_verification.py` to execute the updated 15-tool + Review #3 + Milestone A/B live Docker verification.
+3. **Recent Changes (Milestones A & B)**:
+   - `enterprise-kg-ontology-fabric/src/enterprise_kg_fabric/vector_clustering.py`: Added `OpenAIEmbeddingProvider`, `BedrockEmbeddingProvider`, `SentenceTransformerEmbeddingProvider`, and `create_embedding_provider_from_env()`.
+   - `enterprise-kg-ontology-fabric/src/enterprise_kg_fabric/llm_extractor.py`: Added `generate_text_sync`/`generate_text_async`, `extract_from_chunk_async`, and bounded-concurrency `extract_batch_async`.
+   - `enterprise-kg-ontology-fabric/src/enterprise_kg_fabric/adapters/pgvector_store.py`: Added RLS-protected `kg_community_summaries`, `list_sync_jobs`, `list_kb_documents`, `get_legacy_sync_cursor`/`set_legacy_sync_cursor`, `updated_at_column` incremental legacy sync, multi-DB `dsn_aliases` (`KG_FABRIC_PG_DSN_ALIASES`), and Postgres native-vector RRF fan-out over allowlisted legacy tables.
+   - `enterprise-kg-ontology-fabric/src/enterprise_kg_fabric/adapters/graph_stores.py`: Added indexed `get_entity_by_id`, `search_entities_indexed`, bounded `fetch_ego_subgraph`, `rename_concept_in_graph`, and `update_concept_governance_bucket` across In-Memory, Neo4j 5, and Neptune.
+   - `enterprise-kg-ontology-fabric/src/enterprise_kg_fabric/graph_analytics.py`, `ontology_inducer.py`, `rag_engine.py`, `service.py`, `api.py`, `mcp_server.py`, `auth.py`, `models.py`: Wired persisted ABAC-filtered communities, changed-chunk fact retraction, `202` async jobs + cancel + CRUD list APIs, per-concept `POST /v1/ontology/review` + `GET /v1/ontology/audit` + writable `/ui`, 15-tool `stdio` FastMCP parity, opt-in LLM synthesis/induction/text-to-Cypher, and built-in `KG_FABRIC_JWKS_URL` OIDC verification.
 4. **Next Steps / Blockers**:
-   - No PyPI release pushed yet (`v0.3.0` tag intentionally NOT pushed). Whenever ready to publish to PyPI, link Trusted Publishing on PyPI for `STHITAPRAJNAS/kg-ontology-fabric` and push `git tag v0.3.0 && git push origin v0.3.0`.
-   - When Docker Desktop is running, optionally re-run `python examples/live_docker_v03_full_verification.py` to exercise the 3 newly added Review #3 assertions against live Postgres 16 + Neo4j 5.
+   - Start Docker Desktop and re-run `python examples/live_docker_v03_full_verification.py` to live-verify the new `kg_community_summaries` table, bounded Neo4j ego-subgraph queries, and Review #3 live checks.
+   - Whenever ready for PyPI release (explicitly held by user so far), link Trusted Publishing for `STHITAPRAJNAS/kg-ontology-fabric` and push `git tag v0.3.0 && git push origin v0.3.0`.

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Sequence
+from typing import Any, Sequence
 
 from rdflib import OWL, RDF, RDFS, SH, XSD, BNode, Graph, Literal, Namespace, URIRef
 
@@ -398,9 +398,11 @@ class AutomatedOntologyInducer:
         min_chunk_support_for_approval: int = 2,
         alignment_cosine_threshold: float = 0.80,
         domain_pack: DomainRulePack | str | None = None,
+        llm_extractor: Any | None = None,
     ):
         self.embedding_provider = embedding_provider
         self.domain_pack = resolve_domain_pack(domain_pack)
+        self.llm_extractor = llm_extractor
         self.sampler = SubLinearVectorCentroidSampler(
             centroids_per_kb=centroids_per_kb,
             boundary_outliers_per_kb=boundary_outliers_per_kb,
@@ -408,6 +410,80 @@ class AutomatedOntologyInducer:
         self.min_kb_support = max(1, min_kb_support_for_approval)
         self.min_chunk_support = max(1, min_chunk_support_for_approval)
         self.alignment_cosine_threshold = alignment_cosine_threshold
+
+    def _propose_llm_ontology_candidates(
+        self, sampled_chunks: Sequence[VectorChunkRecord]
+    ) -> tuple[list[RawCandidateClass], list[RawCandidateRelation]]:
+        """
+        Optional LLM-assisted ontology induction when `llm_extractor.use_live_llm=True`.
+        Proposes domain classes & relations directly from centroid samples in strict JSON
+        so arbitrary enterprise domains are not limited to regex domain packs.
+        """
+        if self.llm_extractor is None or not getattr(self.llm_extractor, "use_live_llm", False):
+            return [], []
+        gen = getattr(self.llm_extractor, "generate_text_sync", None)
+        if gen is None or not sampled_chunks:
+            return [], []
+
+        excerpts = "\n".join(
+            f"- [kb={c.kb_id}] {c.text[:240]}" for c in sampled_chunks[:12]
+        )
+        prompt = (
+            "Given these representative enterprise knowledge-base excerpts, induce a concise "
+            "domain ontology as strict JSON with keys 'classes' and 'relations'.\n"
+            "Each class item: {\"name\": \"PascalCase\", \"upper_category\": \"SystemOrAsset|ActorOrOrg|PolicyOrStandard|MetricOrFinancial|LocationOrRegion|EventOrIncident|DataOrArtifact\", \"description\": \"...\"}\n"
+            "Each relation item: {\"predicate\": \"UPPER_SNAKE\", \"domain_class\": \"...\", \"range_class\": \"...\", \"description\": \"...\", \"is_functional\": false}\n\n"
+            f"Excerpts:\n{excerpts}"
+        )
+        raw = gen(prompt, "You are an enterprise ontology engineer. Return ONLY valid JSON.")
+        if not raw:
+            return [], []
+        try:
+            import json as _json
+
+            m = re.search(r"\{.*\}", raw, re.S)
+            payload = _json.loads(m.group(0) if m else raw)
+            out_cls: list[RawCandidateClass] = []
+            out_rel: list[RawCandidateRelation] = []
+            first_kb = sampled_chunks[0].kb_id
+            first_cid = sampled_chunks[0].chunk_id
+            for item in payload.get("classes", []) or []:
+                name = str(item.get("name", "")).strip()
+                if not name:
+                    continue
+                try:
+                    ucat = UpperOntologyCategory(str(item.get("upper_category", "SystemOrAsset")))
+                except ValueError:
+                    ucat = UpperOntologyCategory.SYSTEM_OR_ASSET
+                out_cls.append(
+                    RawCandidateClass(
+                        raw_name=name,
+                        upper_category=ucat,
+                        description=str(item.get("description", f"LLM-induced class {name}")),
+                        kb_id=first_kb,
+                        chunk_id=first_cid,
+                        confidence=0.88,
+                    )
+                )
+            for item in payload.get("relations", []) or []:
+                pred = str(item.get("predicate", "")).strip().upper().replace(" ", "_")
+                if not pred:
+                    continue
+                out_rel.append(
+                    RawCandidateRelation(
+                        raw_predicate=pred,
+                        domain_class=str(item.get("domain_class", "SystemOrAsset")),
+                        range_class=str(item.get("range_class", "SystemOrAsset")),
+                        description=str(item.get("description", f"LLM-induced relation {pred}")),
+                        kb_id=first_kb,
+                        chunk_id=first_cid,
+                        is_functional=bool(item.get("is_functional", False)),
+                        confidence=0.86,
+                    )
+                )
+            return out_cls, out_rel
+        except Exception:
+            return [], []
 
     def discover_candidates_from_chunk(
         self, chunk: VectorChunkRecord
@@ -723,6 +799,10 @@ class AutomatedOntologyInducer:
             c_list, r_list = self.discover_candidates_from_chunk(chk)
             raw_classes.extend(c_list)
             raw_relations.extend(r_list)
+        if self.llm_extractor is not None and getattr(self.llm_extractor, "use_live_llm", False):
+            llm_c, llm_r = self._propose_llm_ontology_candidates(sampled_chunks)
+            raw_classes.extend(llm_c)
+            raw_relations.extend(llm_r)
 
         # Align candidate classes across KBs
         compiled_classes: dict[str, OntologyClassDef] = {}

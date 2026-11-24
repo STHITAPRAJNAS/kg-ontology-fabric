@@ -273,3 +273,127 @@ class StructuredLLMExtractorAdapter:
                     tr.qualifiers = {**nary_qualifiers, **tr.qualifiers}
 
         return base_result
+
+    def generate_text_sync(self, prompt: str, system_prompt: str = "") -> str | None:
+        """
+        Shared live LLM text-generation primitive (Gemini / OpenAI / AWS Bedrock)
+        used for optional grounded answer synthesis, LLM-assisted ontology induction,
+        and LLM text-to-OpenCypher. Returns None when offline or circuit is open.
+        """
+        if not self.use_live_llm or self.circuit_breaker.state == "OPEN":
+            return None
+        try:
+            if self.provider in ("gemini", "auto") and self.api_key:
+                from google import genai
+
+                client = genai.Client(api_key=self.api_key)
+                full_prompt = f"{system_prompt}\n\n{prompt}".strip() if system_prompt else prompt
+                resp = client.models.generate_content(
+                    model=self.model_name,
+                    contents=full_prompt,
+                    config={"temperature": 0.0},
+                )
+                self.circuit_breaker.record_success()
+                return (getattr(resp, "text", None) or "").strip() or None
+            if self.provider in ("openai", "auto") and self.openai_key:
+                from openai import OpenAI
+
+                client = OpenAI(api_key=self.openai_key)
+                msgs = []
+                if system_prompt:
+                    msgs.append({"role": "system", "content": system_prompt})
+                msgs.append({"role": "user", "content": prompt})
+                resp = client.chat.completions.create(
+                    model=self.model_name,
+                    temperature=0.0,
+                    messages=msgs,
+                )
+                self.circuit_breaker.record_success()
+                return (resp.choices[0].message.content or "").strip() or None
+            if self.provider == "bedrock":
+                import boto3
+
+                client = boto3.client(
+                    "bedrock-runtime",
+                    region_name=os.environ.get("AWS_REGION", "us-east-1"),
+                )
+                full_prompt = f"{system_prompt}\n\n{prompt}".strip() if system_prompt else prompt
+                resp = client.converse(
+                    modelId=self.model_name,
+                    inferenceConfig={"temperature": 0.0, "maxTokens": 1024},
+                    messages=[{"role": "user", "content": [{"text": full_prompt}]}],
+                )
+                blocks = resp.get("output", {}).get("message", {}).get("content", [])
+                self.circuit_breaker.record_success()
+                return "".join(b.get("text", "") for b in blocks if isinstance(b, dict)).strip() or None
+        except Exception:
+            self.circuit_breaker.record_failure()
+        return None
+
+    async def generate_text_async(self, prompt: str, system_prompt: str = "") -> str | None:
+        """Non-blocking wrapper around `generate_text_sync` so FastAPI/Uvicorn never stalls."""
+        import asyncio
+
+        if not self.use_live_llm:
+            return None
+        return await asyncio.to_thread(self.generate_text_sync, prompt, system_prompt)
+
+    async def extract_from_chunk_async(
+        self,
+        chunk: VectorChunkRecord,
+        tbox: EnterpriseCompiledTBox,
+        allow_dynamic_emergent: bool = True,
+    ) -> ChunkExtractionResult:
+        import asyncio
+
+        if self.use_live_llm:
+            return await asyncio.to_thread(
+                self.extract_from_chunk, chunk, tbox, allow_dynamic_emergent
+            )
+        return self.extract_from_chunk(
+            chunk, tbox=tbox, allow_dynamic_emergent=allow_dynamic_emergent
+        )
+
+    async def extract_batch_async(
+        self,
+        chunks: list[VectorChunkRecord],
+        tbox: EnterpriseCompiledTBox,
+        max_concurrency: int = 8,
+        allow_dynamic_emergent: bool = True,
+    ) -> list[tuple[VectorChunkRecord, ChunkExtractionResult | Exception]]:
+        """
+        Bounded-concurrency non-blocking chunk extraction (`asyncio.Semaphore` + `asyncio.to_thread`).
+        Returns per-chunk `(chunk, result_or_exception)` preserving input order so DLQ fault isolation
+        remains exact even when concurrent live LLM calls fail individually.
+        """
+        import asyncio
+
+        if not chunks:
+            return []
+        if not self.use_live_llm:
+            results: list[tuple[VectorChunkRecord, ChunkExtractionResult | Exception]] = []
+            for chk in chunks:
+                try:
+                    res = self.extract_from_chunk(
+                        chk, tbox=tbox, allow_dynamic_emergent=allow_dynamic_emergent
+                    )
+                    results.append((chk, res))
+                except Exception as exc:
+                    results.append((chk, exc))
+            return results
+
+        sem = asyncio.Semaphore(max(1, max_concurrency))
+
+        async def _run_one(
+            chk: VectorChunkRecord,
+        ) -> tuple[VectorChunkRecord, ChunkExtractionResult | Exception]:
+            async with sem:
+                try:
+                    res = await self.extract_from_chunk_async(
+                        chk, tbox=tbox, allow_dynamic_emergent=allow_dynamic_emergent
+                    )
+                    return chk, res
+                except Exception as exc:
+                    return chk, exc
+
+        return list(await asyncio.gather(*[_run_one(c) for c in chunks]))

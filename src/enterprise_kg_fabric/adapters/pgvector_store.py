@@ -9,8 +9,10 @@ from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Sequence
 
 from ..models import (
+    CommunitySummaryRecord,
     DLQFailedChunkRecord,
     EnterpriseCompiledTBox,
+    KBSourceType,
     KBWatermarkState,
     KGEntityNode,
     RetrievedChunkContext,
@@ -36,6 +38,7 @@ _FORBIDDEN_LEGACY_TABLES = {
     "enterprise_tbox_registry",
     "kg_sync_jobs",
     "kg_dlq_chunks",
+    "kg_community_summaries",
 }
 
 
@@ -211,6 +214,14 @@ CREATE TABLE IF NOT EXISTS kg_dlq_chunks (
 CREATE INDEX IF NOT EXISTS idx_kg_dlq_chunks_tenant
     ON kg_dlq_chunks (tenant_id, failed_at DESC);
 
+CREATE TABLE IF NOT EXISTS kg_community_summaries (
+    tenant_id TEXT NOT NULL,
+    community_id TEXT NOT NULL,
+    summary_json JSONB NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (tenant_id, community_id)
+);
+
 -- Fail-Closed Row-Level Security (RLS) across all multi-tenant tables
 -- Enforced automatically for non-superuser app roles (`NOBYPASSRLS`) via `SET LOCAL app.current_tenant_id`
 ALTER TABLE kb_federation_registry ENABLE ROW LEVEL SECURITY;
@@ -219,6 +230,7 @@ ALTER TABLE canonical_entity_embeddings ENABLE ROW LEVEL SECURITY;
 ALTER TABLE enterprise_tbox_registry ENABLE ROW LEVEL SECURITY;
 ALTER TABLE kg_sync_jobs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE kg_dlq_chunks ENABLE ROW LEVEL SECURITY;
+ALTER TABLE kg_community_summaries ENABLE ROW LEVEL SECURITY;
 
 DROP POLICY IF EXISTS rls_kb_federation_tenant ON kb_federation_registry;
 CREATE POLICY rls_kb_federation_tenant ON kb_federation_registry
@@ -285,6 +297,17 @@ CREATE POLICY rls_dlq_chunks_tenant ON kg_dlq_chunks
         current_setting('app.current_tenant_id', true) = '*'
         OR tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')
     );
+
+DROP POLICY IF EXISTS rls_community_summaries_tenant ON kg_community_summaries;
+CREATE POLICY rls_community_summaries_tenant ON kg_community_summaries
+    USING (
+        current_setting('app.current_tenant_id', true) = '*'
+        OR tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')
+    )
+    WITH CHECK (
+        current_setting('app.current_tenant_id', true) = '*'
+        OR tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')
+    );
 """.strip()
 
 
@@ -335,6 +358,30 @@ class PgVectorStorePort(ABC):
 
     async def list_dlq_records(self, tenant_id: str | None = None) -> list[DLQFailedChunkRecord]:
         return []
+
+    async def list_sync_jobs(
+        self, tenant_id: str | None = None, limit: int = 50, offset: int = 0
+    ) -> list[SyncJobRecord]:
+        return []
+
+    async def list_kb_documents(
+        self, tenant_id: str, kb_id: str, limit: int = 50, offset: int = 0
+    ) -> list[dict[str, Any]]:
+        return []
+
+    async def save_community_summaries(
+        self, tenant_id: str, summaries: Sequence[CommunitySummaryRecord]
+    ) -> None:
+        return None
+
+    async def load_community_summaries(self, tenant_id: str) -> list[CommunitySummaryRecord]:
+        return []
+
+    async def get_legacy_sync_cursor(self, kb_id: str) -> str | None:
+        return None
+
+    async def set_legacy_sync_cursor(self, kb_id: str, cursor_iso: str) -> None:
+        return None
 
     async def try_acquire_advisory_lock(self, lock_key: int) -> bool:
         return True
@@ -451,6 +498,8 @@ class InMemoryPgVectorStoreEmulator(PgVectorStorePort):
         self._tboxes: dict[str, EnterpriseCompiledTBox] = {}
         self._sync_jobs: dict[str, SyncJobRecord] = {}
         self._dlq_records: list[DLQFailedChunkRecord] = []
+        self._communities: dict[str, list[CommunitySummaryRecord]] = {}
+        self._legacy_cursors: dict[str, str] = {}
         self._advisory_locks: set[int] = set()
 
     async def try_acquire_advisory_lock(self, lock_key: int) -> bool:
@@ -481,6 +530,61 @@ class InMemoryPgVectorStoreEmulator(PgVectorStorePort):
         if tenant_id is None:
             return list(self._dlq_records)
         return [r for r in self._dlq_records if r.tenant_id == tenant_id]
+
+    async def list_sync_jobs(
+        self, tenant_id: str | None = None, limit: int = 50, offset: int = 0
+    ) -> list[SyncJobRecord]:
+        jobs = list(self._sync_jobs.values())
+        if tenant_id is not None:
+            jobs = [j for j in jobs if j.tenant_id == tenant_id]
+        jobs.sort(key=lambda j: j.created_at, reverse=True)
+        return jobs[offset : offset + limit]
+
+    async def list_kb_documents(
+        self, tenant_id: str, kb_id: str, limit: int = 50, offset: int = 0
+    ) -> list[dict[str, Any]]:
+        chunks = [
+            c
+            for c in self._kb_tables.get(kb_id, {}).values()
+            if c.tenant_id == tenant_id
+        ]
+        by_doc: dict[str, dict[str, Any]] = {}
+        for c in chunks:
+            entry = by_doc.setdefault(
+                c.doc_id,
+                {
+                    "doc_id": c.doc_id,
+                    "kb_id": kb_id,
+                    "tenant_id": tenant_id,
+                    "chunk_count": 0,
+                    "acl_groups": set(),
+                    "title": c.metadata.get("title", c.doc_id),
+                    "updated_at": c.updated_at,
+                },
+            )
+            entry["chunk_count"] += 1
+            entry["acl_groups"].update(c.acl_groups)
+            if c.updated_at > entry["updated_at"]:
+                entry["updated_at"] = c.updated_at
+        docs = [
+            {**d, "acl_groups": sorted(d["acl_groups"])}
+            for d in sorted(by_doc.values(), key=lambda x: x["doc_id"])
+        ]
+        return docs[offset : offset + limit]
+
+    async def save_community_summaries(
+        self, tenant_id: str, summaries: Sequence[CommunitySummaryRecord]
+    ) -> None:
+        self._communities[tenant_id] = list(summaries)
+
+    async def load_community_summaries(self, tenant_id: str) -> list[CommunitySummaryRecord]:
+        return list(self._communities.get(tenant_id, []))
+
+    async def get_legacy_sync_cursor(self, kb_id: str) -> str | None:
+        return self._legacy_cursors.get(kb_id)
+
+    async def set_legacy_sync_cursor(self, kb_id: str, cursor_iso: str) -> None:
+        self._legacy_cursors[kb_id] = cursor_iso
 
     async def register_kb(self, registration: VectorKBRegistration) -> None:
         existing = self._kb_registry.get(registration.kb_id)
@@ -796,18 +900,57 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
         canonical_dim: int = 256,
         auto_init_schema: bool = True,
         allowed_legacy_tables: Sequence[str] | None = None,
+        model_router: FederatedEmbeddingModelRouter | None = None,
+        dsn_aliases: dict[str, str] | None = None,
     ):
         self.dsn = dsn
         self.embedding_provider = embedding_provider
         self.canonical_dim = canonical_dim
         self.auto_init_schema = auto_init_schema
+        self.model_router = model_router or FederatedEmbeddingModelRouter(embedding_provider)
         if allowed_legacy_tables is not None:
             self.allowed_legacy_tables = [p.strip() for p in allowed_legacy_tables if p.strip()]
         else:
             raw_env = os.getenv("KG_FABRIC_ALLOWED_LEGACY_TABLES", "").strip()
             self.allowed_legacy_tables = [p.strip() for p in raw_env.split(",") if p.strip()]
+        if dsn_aliases is not None:
+            self.dsn_aliases = dict(dsn_aliases)
+        else:
+            raw_aliases = os.getenv("KG_FABRIC_PG_DSN_ALIASES", "").strip()
+            if raw_aliases.startswith("{"):
+                parsed = json.loads(raw_aliases)
+                self.dsn_aliases = {str(k): str(v) for k, v in parsed.items()} if isinstance(parsed, dict) else {}
+            else:
+                self.dsn_aliases = {}
         self._pool: Any = None
+        self._alias_pools: dict[str, Any] = {}
         self._advisory_lock_conns: dict[int, Any] = {}
+
+    async def _get_pool_for_alias(self, alias: str | None = None) -> Any:
+        key = (alias or "primary").strip()
+        if not key or key == "primary" or key not in self.dsn_aliases:
+            return await self._get_pool()
+        pool = self._alias_pools.get(key)
+        if pool is None:
+            import asyncpg
+
+            pool = await asyncpg.create_pool(dsn=self.dsn_aliases[key], min_size=1, max_size=6)
+            self._alias_pools[key] = pool
+        return pool
+
+    @asynccontextmanager
+    async def _scoped_alias_conn(
+        self, alias: str | None, tenant_id: str | None = "*"
+    ) -> AsyncIterator[Any]:
+        pool = await self._get_pool_for_alias(alias)
+        scope_val = tenant_id if tenant_id else "*"
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "SELECT set_config('app.current_tenant_id', $1, true)",
+                    scope_val,
+                )
+                yield conn
 
     async def _get_pool(self) -> Any:
         if self._pool is None:
@@ -1035,6 +1178,10 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
                 )
                 or 0
             )
+            await conn.execute(
+                "DELETE FROM kg_community_summaries WHERE tenant_id = $1",
+                tenant_id,
+            )
             return {
                 "kbs_removed": kbs_removed,
                 "chunks_removed": chunks_removed,
@@ -1083,6 +1230,12 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
         if self._pool is not None:
             await self._pool.close()
             self._pool = None
+        for a_pool in list(self._alias_pools.values()):
+            try:
+                await a_pool.close()
+            except Exception:
+                pass
+        self._alias_pools.clear()
 
     async def save_tbox(self, tbox: EnterpriseCompiledTBox) -> None:
         async with self._scoped_conn(tbox.tenant_id) as conn:
@@ -1171,47 +1324,170 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
                 for r in rows
             ]
 
+    async def list_sync_jobs(
+        self, tenant_id: str | None = None, limit: int = 50, offset: int = 0
+    ) -> list[SyncJobRecord]:
+        async with self._scoped_conn(tenant_id or "*") as conn:
+            if tenant_id is not None:
+                rows = await conn.fetch(
+                    "SELECT job_json FROM kg_sync_jobs WHERE tenant_id = $1 ORDER BY updated_at DESC LIMIT $2 OFFSET $3",
+                    tenant_id,
+                    limit,
+                    offset,
+                )
+            else:
+                rows = await conn.fetch(
+                    "SELECT job_json FROM kg_sync_jobs ORDER BY updated_at DESC LIMIT $1 OFFSET $2",
+                    limit,
+                    offset,
+                )
+            return [
+                SyncJobRecord.model_validate(self._parse_json_safe(r["job_json"]))
+                for r in rows
+            ]
+
+    async def list_kb_documents(
+        self, tenant_id: str, kb_id: str, limit: int = 50, offset: int = 0
+    ) -> list[dict[str, Any]]:
+        async with self._scoped_conn(tenant_id) as conn:
+            rows = await conn.fetch(
+                """
+                SELECT doc_id,
+                       count(*) AS chunk_count,
+                       MAX(updated_at) AS last_updated,
+                       MIN(metadata->>'title') AS title
+                FROM unified_rag_chunks
+                WHERE tenant_id = $1 AND kb_id = $2
+                GROUP BY doc_id
+                ORDER BY doc_id ASC
+                LIMIT $3 OFFSET $4
+                """,
+                tenant_id,
+                kb_id,
+                limit,
+                offset,
+            )
+            return [
+                {
+                    "doc_id": str(r["doc_id"]),
+                    "kb_id": kb_id,
+                    "tenant_id": tenant_id,
+                    "chunk_count": int(r["chunk_count"]),
+                    "title": r["title"] or str(r["doc_id"]),
+                    "updated_at": r["last_updated"].isoformat() if r["last_updated"] else utc_now_iso(),
+                }
+                for r in rows
+            ]
+
+    async def save_community_summaries(
+        self, tenant_id: str, summaries: Sequence[CommunitySummaryRecord]
+    ) -> None:
+        async with self._scoped_conn(tenant_id) as conn:
+            await conn.execute(
+                "DELETE FROM kg_community_summaries WHERE tenant_id = $1",
+                tenant_id,
+            )
+            if summaries:
+                rows = [
+                    (tenant_id, s.community_id, s.model_dump_json())
+                    for s in summaries
+                ]
+                await conn.executemany(
+                    """
+                    INSERT INTO kg_community_summaries (tenant_id, community_id, summary_json)
+                    VALUES ($1, $2, $3::jsonb)
+                    ON CONFLICT (tenant_id, community_id) DO UPDATE SET
+                        summary_json = EXCLUDED.summary_json,
+                        updated_at = NOW()
+                    """,
+                    rows,
+                )
+
+    async def load_community_summaries(self, tenant_id: str) -> list[CommunitySummaryRecord]:
+        async with self._scoped_conn(tenant_id) as conn:
+            rows = await conn.fetch(
+                "SELECT summary_json FROM kg_community_summaries WHERE tenant_id = $1 ORDER BY community_id ASC",
+                tenant_id,
+            )
+            return [
+                CommunitySummaryRecord.model_validate(self._parse_json_safe(r["summary_json"]))
+                for r in rows
+            ]
+
+    async def get_legacy_sync_cursor(self, kb_id: str) -> str | None:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            val = await conn.fetchval(
+                "SELECT content_sha256 FROM kb_ingestion_watermarks WHERE kb_id = $1 AND chunk_id = '__legacy_cursor__'",
+                kb_id,
+            )
+            return str(val) if val else None
+
+    async def set_legacy_sync_cursor(self, kb_id: str, cursor_iso: str) -> None:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO kb_ingestion_watermarks (kb_id, chunk_id, content_sha256, tbox_version)
+                VALUES ($1, '__legacy_cursor__', $2, 'cursor')
+                ON CONFLICT (kb_id, chunk_id) DO UPDATE SET
+                    content_sha256 = EXCLUDED.content_sha256,
+                    last_indexed_at = NOW()
+                """,
+                kb_id,
+                cursor_iso,
+            )
+
     async def reverse_hydrate_from_legacy_pgvector_table(
         self,
         registration: VectorKBRegistration,
         *,
         enforce_allowlist: bool = True,
+        since_updated_at: str | None = None,
     ) -> list[VectorChunkRecord]:
         """
         Directly reads an explicitly allowlisted legacy PostgreSQL `pgvector` table
-        (with its own schema, table name, column mapping, and native vector dimension)
+        (supporting multi-DB `postgres_dsn_alias` and incremental `updated_at_column` cursors)
         and reverse-hydrates `VectorChunkRecord`s inside a tenant-scoped transaction.
-
-        Security:
-          - Unconditionally blocks PostgreSQL system catalogs (`pg_catalog`, `information_schema`, etc.)
-            and all internal KG Fabric tables (`unified_rag_chunks`, etc.).
-          - When `enforce_allowlist=True` (default), requires `schema.table` to match
-            `self.allowed_legacy_tables` (`KG_FABRIC_ALLOWED_LEGACY_TABLES`).
         """
         cm = registration.column_mapping
+        col_list = [
+            cm.id_column,
+            cm.doc_id_column,
+            cm.text_column,
+            cm.embedding_column,
+            cm.metadata_column,
+        ]
+        if cm.updated_at_column:
+            col_list.append(cm.updated_at_column)
         validate_legacy_table_access(
             schema_name=registration.schema_name,
             table_name=registration.table_name,
-            column_names=[
-                cm.id_column,
-                cm.doc_id_column,
-                cm.text_column,
-                cm.embedding_column,
-                cm.metadata_column,
-            ],
+            column_names=col_list,
             allowed_patterns=self.allowed_legacy_tables,
             enforce_allowlist=enforce_allowlist,
         )
         schema_q = f'"{registration.schema_name}"'
         table_q = f'"{registration.table_name}"'
-        sql = (
+        upd_select = (
+            f', "{cm.updated_at_column}"::text AS upd_ts' if cm.updated_at_column else ""
+        )
+        base_sql = (
             f'SELECT "{cm.id_column}" AS cid, "{cm.doc_id_column}" AS did, '
             f'"{cm.text_column}" AS txt, "{cm.embedding_column}"::text AS emb, '
-            f'"{cm.metadata_column}" AS meta '
+            f'"{cm.metadata_column}" AS meta{upd_select} '
             f"FROM {schema_q}.{table_q}"
         )
-        async with self._scoped_conn(registration.tenant_id) as conn:
-            rows = await conn.fetch(sql)
+        async with self._scoped_alias_conn(
+            registration.postgres_dsn_alias, registration.tenant_id
+        ) as conn:
+            if cm.updated_at_column and since_updated_at:
+                rows = await conn.fetch(
+                    f'{base_sql} WHERE "{cm.updated_at_column}"::text > $1 ORDER BY "{cm.updated_at_column}" ASC',
+                    since_updated_at,
+                )
+            else:
+                rows = await conn.fetch(base_sql)
 
         hydrated: list[VectorChunkRecord] = []
         for r in rows:
@@ -1231,6 +1507,7 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
                     native_embedding_dim=len(native_vec) or registration.embedding_dim,
                     canonical_embedding=canon_vec,
                     metadata=meta if isinstance(meta, dict) else {},
+                    updated_at=str(r["upd_ts"]) if cm.updated_at_column and r.get("upd_ts") else utc_now_iso(),
                 )
             )
         return hydrated
@@ -1524,6 +1801,86 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
                 )
                 if len(results) >= top_k:
                     break
+
+            # Native-dimension vector fan-out over allowlisted legacy pgvector tables + RRF fusion
+            if self.allowed_legacy_tables:
+                try:
+                    kbs = await self.list_registered_kbs(tenant_id=tenant_id)
+                except Exception:
+                    kbs = []
+                legacy_kbs = [
+                    kb
+                    for kb in kbs
+                    if kb.source_type == KBSourceType.EXISTING_PGVECTOR_KB
+                    and (kb_filter is None or kb.kb_id in kb_filter)
+                    and (domain_filter is None or kb.domain_tag in domain_filter)
+                ]
+                if legacy_kbs:
+                    fused_map: dict[str, RetrievedChunkContext] = {r.chunk_id: r for r in results}
+                    for kb in legacy_kbs:
+                        cm = kb.column_mapping
+                        try:
+                            validate_legacy_table_access(
+                                schema_name=kb.schema_name,
+                                table_name=kb.table_name,
+                                column_names=[
+                                    cm.id_column,
+                                    cm.doc_id_column,
+                                    cm.text_column,
+                                    cm.embedding_column,
+                                    cm.metadata_column,
+                                ],
+                                allowed_patterns=self.allowed_legacy_tables,
+                                enforce_allowlist=True,
+                            )
+                            native_q_vec = self.model_router.embed_query_for_kb(query_text, kb)
+                            n_vec_str = "[" + ",".join(f"{v:.6f}" for v in native_q_vec) + "]"
+                            async with self._scoped_alias_conn(
+                                kb.postgres_dsn_alias, tenant_id
+                            ) as lconn:
+                                lrows = await lconn.fetch(
+                                    f'SELECT "{cm.id_column}" AS cid, "{cm.doc_id_column}" AS did, '
+                                    f'"{cm.text_column}" AS txt, "{cm.metadata_column}" AS meta '
+                                    f'FROM "{kb.schema_name}"."{kb.table_name}" '
+                                    f'ORDER BY "{cm.embedding_column}" <=> $1::vector LIMIT $2',
+                                    n_vec_str,
+                                    max(top_k * 2, 10),
+                                )
+                            chan_name = f"pgvector_native_{kb.embedding_model_id}({kb.embedding_dim}d)"
+                            for rank, lr in enumerate(lrows, start=1):
+                                cid = f"{tenant_id}::{kb.kb_id}::{lr['cid']}"
+                                meta = self._parse_json_safe(lr["meta"]) if lr["meta"] else {}
+                                l_acls = (
+                                    meta.get("acl_groups", ["public"])
+                                    if isinstance(meta, dict)
+                                    else ["public"]
+                                )
+                                if caller_acls is not None:
+                                    l_set = {str(g).lower() for g in l_acls}
+                                    if "public" not in l_set and not caller_acls.intersection(l_set):
+                                        continue
+                                boost = 1.0 / (60.0 + rank)
+                                if cid in fused_map:
+                                    fused_map[cid].rrf_score = round(fused_map[cid].rrf_score + boost, 5)
+                                    if chan_name not in fused_map[cid].retrieval_channels:
+                                        fused_map[cid].retrieval_channels.append(chan_name)
+                                else:
+                                    fused_map[cid] = RetrievedChunkContext(
+                                        chunk_id=cid,
+                                        kb_id=kb.kb_id,
+                                        domain_tag=kb.domain_tag,
+                                        doc_id=str(lr["did"]),
+                                        text=str(lr["txt"]),
+                                        rrf_score=round(boost, 5),
+                                        retrieval_channels=[chan_name],
+                                        acl_groups=[str(g) for g in l_acls],
+                                    )
+                        except Exception:
+                            continue
+                    results = sorted(
+                        fused_map.values(), key=lambda x: x.rrf_score, reverse=True
+                    )[:top_k]
+
             return results
 
     async def search_similar_entities(

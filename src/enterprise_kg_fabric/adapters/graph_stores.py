@@ -13,6 +13,7 @@ from ..models import (
     KGRelationEdge,
     OntologyStatus,
     RetrievedGraphFact,
+    UpperOntologyCategory,
 )
 
 
@@ -80,6 +81,65 @@ class PropertyGraphStorePort(ABC):
     ) -> tuple[list[str], int]:
         """Removes deleted chunks/KB from graph provenance; deletes orphaned edges & entities and narrows surviving ACLs."""
         return [], 0
+
+    async def get_entity_by_id(
+        self, tenant_id: str, entity_id: str
+    ) -> KGEntityNode | None:
+        all_ents = await self.get_all_entities(tenant_id)
+        return all_ents.get(entity_id)
+
+    async def search_entities_indexed(
+        self,
+        tenant_id: str,
+        query: str,
+        ontology_class: str | None = None,
+        limit: int = 10,
+        include_quarantined: bool = False,
+        caller_acl_groups: Sequence[str] | None = None,
+    ) -> list[KGEntityNode]:
+        all_ents = await self.get_all_entities(tenant_id)
+        q_low = query.strip().lower()
+        q_tokens = [t for t in re.findall(r"[A-Za-z0-9][A-Za-z0-9._-]{1,}", q_low) if len(t) >= 2]
+        out: list[KGEntityNode] = []
+        for ent in all_ents.values():
+            if not include_quarantined and ent.governance_bucket != OntologyStatus.APPROVED:
+                continue
+            if ontology_class and ent.ontology_class.lower() != ontology_class.lower():
+                continue
+            if not InMemoryOpenCypherGraphEmulator._is_acl_allowed(ent.acl_groups, caller_acl_groups):
+                continue
+            names = [ent.canonical_name.lower()] + [a.lower() for a in ent.aliases]
+            if (
+                not q_low
+                or any(q_low in n or n in q_low for n in names)
+                or any(tok in n for tok in q_tokens for n in names)
+            ):
+                out.append(ent)
+        return out[:limit]
+
+    async def fetch_ego_subgraph(
+        self,
+        tenant_id: str,
+        seed_entity_ids: Sequence[str],
+        max_hops: int = 2,
+        include_quarantined: bool = False,
+        as_of_iso: str | None = None,
+        caller_acl_groups: Sequence[str] | None = None,
+    ) -> tuple[dict[str, KGEntityNode], list[KGRelationEdge]]:
+        """Returns a bounded K-hop ego-subgraph around seed entities (avoids loading the full tenant graph)."""
+        all_ents = await self.get_all_entities(tenant_id)
+        all_edges = await self.get_all_edges(tenant_id, active_only=(as_of_iso is None))
+        return all_ents, all_edges
+
+    async def rename_concept_in_graph(
+        self, tenant_id: str, concept_kind: str, old_name: str, new_name: str
+    ) -> int:
+        return 0
+
+    async def update_concept_governance_bucket(
+        self, tenant_id: str, concept_kind: str, concept_name: str, new_status: OntologyStatus
+    ) -> int:
+        return 0
 
     async def purge_tenant(self, tenant_id: str) -> int:
         return 0
@@ -420,6 +480,97 @@ class InMemoryOpenCypherGraphEmulator(PropertyGraphStorePort):
                 }
             )
         return results[:25]
+
+    async def get_entity_by_id(
+        self, tenant_id: str, entity_id: str
+    ) -> KGEntityNode | None:
+        return self._entities.get(tenant_id, {}).get(entity_id)
+
+    async def fetch_ego_subgraph(
+        self,
+        tenant_id: str,
+        seed_entity_ids: Sequence[str],
+        max_hops: int = 2,
+        include_quarantined: bool = False,
+        as_of_iso: str | None = None,
+        caller_acl_groups: Sequence[str] | None = None,
+    ) -> tuple[dict[str, KGEntityNode], list[KGRelationEdge]]:
+        ent_store = self._entities.get(tenant_id, {})
+        edge_store = self._edges.get(tenant_id, {})
+        frontier = {
+            eid
+            for eid in seed_entity_ids
+            if eid in ent_store
+            and (include_quarantined or ent_store[eid].governance_bucket == OntologyStatus.APPROVED)
+            and self._is_acl_allowed(ent_store[eid].acl_groups, caller_acl_groups)
+        }
+        visited_nodes = set(frontier)
+        collected_edges: dict[str, KGRelationEdge] = {}
+        for _ in range(max(1, max_hops)):
+            next_frontier: set[str] = set()
+            for edge in edge_store.values():
+                if not include_quarantined and edge.governance_bucket != OntologyStatus.APPROVED:
+                    continue
+                if not self._is_edge_valid_at(edge, as_of_iso):
+                    continue
+                if not self._is_acl_allowed(edge.acl_groups, caller_acl_groups):
+                    continue
+                if edge.source_entity_id in frontier or edge.target_entity_id in frontier:
+                    other = (
+                        edge.target_entity_id
+                        if edge.source_entity_id in frontier
+                        else edge.source_entity_id
+                    )
+                    other_ent = ent_store.get(other)
+                    if other_ent is None:
+                        continue
+                    if not include_quarantined and other_ent.governance_bucket != OntologyStatus.APPROVED:
+                        continue
+                    if not self._is_acl_allowed(other_ent.acl_groups, caller_acl_groups):
+                        continue
+                    collected_edges[edge.edge_id] = edge
+                    if other not in visited_nodes:
+                        visited_nodes.add(other)
+                        next_frontier.add(other)
+            frontier = next_frontier
+            if not frontier:
+                break
+        return (
+            {eid: ent_store[eid] for eid in visited_nodes if eid in ent_store},
+            list(collected_edges.values()),
+        )
+
+    async def rename_concept_in_graph(
+        self, tenant_id: str, concept_kind: str, old_name: str, new_name: str
+    ) -> int:
+        updated = 0
+        if concept_kind.upper() == "CLASS":
+            for ent in self._entities.get(tenant_id, {}).values():
+                if ent.ontology_class == old_name:
+                    ent.ontology_class = new_name
+                    updated += 1
+        else:
+            for edge in self._edges.get(tenant_id, {}).values():
+                if edge.predicate == old_name:
+                    edge.predicate = new_name
+                    updated += 1
+        return updated
+
+    async def update_concept_governance_bucket(
+        self, tenant_id: str, concept_kind: str, concept_name: str, new_status: OntologyStatus
+    ) -> int:
+        updated = 0
+        if concept_kind.upper() == "CLASS":
+            for ent in self._entities.get(tenant_id, {}).values():
+                if ent.ontology_class == concept_name:
+                    ent.governance_bucket = new_status
+                    updated += 1
+        else:
+            for edge in self._edges.get(tenant_id, {}).values():
+                if edge.predicate == concept_name:
+                    edge.governance_bucket = new_status
+                    updated += 1
+        return updated
 
 
 class Neo4jOpenCypherGraphAdapter(PropertyGraphStorePort):
@@ -989,6 +1140,308 @@ class Neo4jOpenCypherGraphAdapter(PropertyGraphStorePort):
                 )
         return deleted_entities, deleted_edges
 
+    async def get_entity_by_id(
+        self, tenant_id: str, entity_id: str
+    ) -> KGEntityNode | None:
+        driver = self._get_driver()
+        async with driver.session() as session:
+            res = await session.run(
+                """
+                MATCH (n:Entity {tenant_id: $tenant_id, entity_id: $entity_id})
+                RETURN n.entity_id AS entity_id,
+                       n.tenant_id AS tenant_id,
+                       n.canonical_name AS canonical_name,
+                       n.ontology_class AS ontology_class,
+                       n.upper_category AS upper_category,
+                       coalesce(n.aliases, []) AS aliases,
+                       coalesce(n.summary, '') AS summary,
+                       coalesce(n.source_kb_ids, []) AS source_kb_ids,
+                       coalesce(n.source_chunk_ids, []) AS source_chunk_ids,
+                       coalesce(n.acl_groups, ['public']) AS acl_groups,
+                       coalesce(n.mention_count, 1) AS mention_count,
+                       coalesce(n.confidence, 0.9) AS confidence,
+                       coalesce(n.governance_bucket, 'APPROVED') AS governance_bucket
+                LIMIT 1
+                """,
+                tenant_id=tenant_id,
+                entity_id=entity_id,
+            )
+            r = await res.single()
+            if not r:
+                return None
+            return KGEntityNode(
+                entity_id=r["entity_id"],
+                tenant_id=r["tenant_id"],
+                canonical_name=r["canonical_name"],
+                ontology_class=r["ontology_class"],
+                upper_category=UpperOntologyCategory(r["upper_category"]),
+                aliases=list(r["aliases"]),
+                summary=r["summary"],
+                source_kb_ids=list(r["source_kb_ids"]),
+                source_chunk_ids=list(r["source_chunk_ids"]),
+                acl_groups=list(r["acl_groups"]) if r["acl_groups"] else ["public"],
+                mention_count=int(r["mention_count"]),
+                confidence=float(r["confidence"]),
+                governance_bucket=OntologyStatus(r["governance_bucket"]),
+            )
+
+    async def search_entities_indexed(
+        self,
+        tenant_id: str,
+        query: str,
+        ontology_class: str | None = None,
+        limit: int = 10,
+        include_quarantined: bool = False,
+        caller_acl_groups: Sequence[str] | None = None,
+    ) -> list[KGEntityNode]:
+        q_low = query.strip().lower()
+        q_tokens = [t for t in re.findall(r"[A-Za-z0-9][A-Za-z0-9._-]{1,}", q_low) if len(t) >= 2]
+        driver = self._get_driver()
+        async with driver.session() as session:
+            res = await session.run(
+                """
+                MATCH (n:Entity {tenant_id: $tenant_id})
+                WHERE ($include_q OR coalesce(n.governance_bucket, 'APPROVED') = 'APPROVED')
+                  AND ($cls IS NULL OR toLower(n.ontology_class) = toLower($cls))
+                  AND (
+                        $q = ''
+                        OR toLower(n.canonical_name) CONTAINS $q
+                        OR $q CONTAINS toLower(n.canonical_name)
+                        OR ANY(tok IN $tokens WHERE toLower(n.canonical_name) CONTAINS tok)
+                        OR ANY(a IN coalesce(n.aliases, []) WHERE toLower(a) CONTAINS $q OR $q CONTAINS toLower(a))
+                  )
+                RETURN n.entity_id AS entity_id,
+                       n.tenant_id AS tenant_id,
+                       n.canonical_name AS canonical_name,
+                       n.ontology_class AS ontology_class,
+                       n.upper_category AS upper_category,
+                       coalesce(n.aliases, []) AS aliases,
+                       coalesce(n.summary, '') AS summary,
+                       coalesce(n.source_kb_ids, []) AS source_kb_ids,
+                       coalesce(n.source_chunk_ids, []) AS source_chunk_ids,
+                       coalesce(n.acl_groups, ['public']) AS acl_groups,
+                       coalesce(n.mention_count, 1) AS mention_count,
+                       coalesce(n.confidence, 0.9) AS confidence,
+                       coalesce(n.governance_bucket, 'APPROVED') AS governance_bucket
+                LIMIT $lim
+                """,
+                tenant_id=tenant_id,
+                include_q=include_quarantined,
+                cls=ontology_class,
+                q=q_low,
+                tokens=q_tokens[:12],
+                lim=max(limit * 3, 25),
+            )
+            rows = await res.data()
+        out: list[KGEntityNode] = []
+        for r in rows:
+            acls = list(r["acl_groups"]) if r["acl_groups"] else ["public"]
+            if not InMemoryOpenCypherGraphEmulator._is_acl_allowed(acls, caller_acl_groups):
+                continue
+            out.append(
+                KGEntityNode(
+                    entity_id=r["entity_id"],
+                    tenant_id=r["tenant_id"],
+                    canonical_name=r["canonical_name"],
+                    ontology_class=r["ontology_class"],
+                    upper_category=UpperOntologyCategory(r["upper_category"]),
+                    aliases=list(r["aliases"]),
+                    summary=r["summary"],
+                    source_kb_ids=list(r["source_kb_ids"]),
+                    source_chunk_ids=list(r["source_chunk_ids"]),
+                    acl_groups=acls,
+                    mention_count=int(r["mention_count"]),
+                    confidence=float(r["confidence"]),
+                    governance_bucket=OntologyStatus(r["governance_bucket"]),
+                )
+            )
+            if len(out) >= limit:
+                break
+        return out
+
+    async def fetch_ego_subgraph(
+        self,
+        tenant_id: str,
+        seed_entity_ids: Sequence[str],
+        max_hops: int = 2,
+        include_quarantined: bool = False,
+        as_of_iso: str | None = None,
+        caller_acl_groups: Sequence[str] | None = None,
+    ) -> tuple[dict[str, KGEntityNode], list[KGRelationEdge]]:
+        if not seed_entity_ids:
+            return {}, []
+        hops = max(1, min(int(max_hops), 3))
+        driver = self._get_driver()
+        entities: dict[str, KGEntityNode] = {}
+        edges_by_id: dict[str, KGRelationEdge] = {}
+        async with driver.session() as session:
+            # Fetch bounded K-hop neighborhood in Neo4j instead of full tenant graph
+            res = await session.run(
+                f"""
+                MATCH (seed:Entity {{tenant_id: $tenant_id}})
+                WHERE seed.entity_id IN $seed_ids
+                OPTIONAL MATCH (seed)-[r:KG_RELATION*1..{hops}]-(nbr:Entity {{tenant_id: $tenant_id}})
+                WITH collect(DISTINCT seed) + collect(DISTINCT nbr) AS raw_nodes,
+                     reduce(acc = [], rels IN collect(r) | acc + coalesce(rels, [])) AS raw_rels
+                UNWIND raw_nodes AS n
+                WITH DISTINCT n, raw_rels
+                WHERE n IS NOT NULL
+                RETURN collect(DISTINCT {{
+                    entity_id: n.entity_id,
+                    tenant_id: n.tenant_id,
+                    canonical_name: n.canonical_name,
+                    ontology_class: n.ontology_class,
+                    upper_category: n.upper_category,
+                    aliases: coalesce(n.aliases, []),
+                    summary: coalesce(n.summary, ''),
+                    source_kb_ids: coalesce(n.source_kb_ids, []),
+                    source_chunk_ids: coalesce(n.source_chunk_ids, []),
+                    acl_groups: coalesce(n.acl_groups, ['public']),
+                    mention_count: coalesce(n.mention_count, 1),
+                    confidence: coalesce(n.confidence, 0.9),
+                    governance_bucket: coalesce(n.governance_bucket, 'APPROVED')
+                }}) AS nodes,
+                [rel IN raw_rels | {{
+                    edge_id: rel.edge_id,
+                    tenant_id: coalesce(rel.tenant_id, $tenant_id),
+                    source_entity_id: startNode(rel).entity_id,
+                    target_entity_id: endNode(rel).entity_id,
+                    predicate: rel.predicate,
+                    t_valid: rel.t_valid,
+                    t_invalid: rel.t_invalid,
+                    is_functional: coalesce(rel.is_functional, false),
+                    source_kb_ids: coalesce(rel.source_kb_ids, []),
+                    source_chunk_ids: coalesce(rel.source_chunk_ids, []),
+                    evidence_snippets: coalesce(rel.evidence_snippets, []),
+                    acl_groups: coalesce(rel.acl_groups, ['public']),
+                    qualifiers_json: coalesce(rel.qualifiers_json, '{{}}'),
+                    confidence: coalesce(rel.confidence, 0.9),
+                    governance_bucket: coalesce(rel.governance_bucket, 'APPROVED')
+                }}] AS rels
+                """,
+                tenant_id=tenant_id,
+                seed_ids=list(seed_entity_ids),
+            )
+            rec = await res.single()
+            if not rec:
+                return {}, []
+            for r in rec["nodes"] or []:
+                if not r.get("entity_id"):
+                    continue
+                gb = OntologyStatus(r["governance_bucket"])
+                if not include_quarantined and gb != OntologyStatus.APPROVED:
+                    continue
+                acls = list(r["acl_groups"]) if r["acl_groups"] else ["public"]
+                if not InMemoryOpenCypherGraphEmulator._is_acl_allowed(acls, caller_acl_groups):
+                    continue
+                entities[r["entity_id"]] = KGEntityNode(
+                    entity_id=r["entity_id"],
+                    tenant_id=r["tenant_id"],
+                    canonical_name=r["canonical_name"],
+                    ontology_class=r["ontology_class"],
+                    upper_category=UpperOntologyCategory(r["upper_category"]),
+                    aliases=list(r["aliases"]),
+                    summary=r["summary"],
+                    source_kb_ids=list(r["source_kb_ids"]),
+                    source_chunk_ids=list(r["source_chunk_ids"]),
+                    acl_groups=acls,
+                    mention_count=int(r["mention_count"]),
+                    confidence=float(r["confidence"]),
+                    governance_bucket=gb,
+                )
+            for er in rec["rels"] or []:
+                eid = er.get("edge_id")
+                if not eid or eid in edges_by_id:
+                    continue
+                if er["source_entity_id"] not in entities or er["target_entity_id"] not in entities:
+                    continue
+                gb = OntologyStatus(er["governance_bucket"])
+                if not include_quarantined and gb != OntologyStatus.APPROVED:
+                    continue
+                acls = list(er["acl_groups"]) if er["acl_groups"] else ["public"]
+                if not InMemoryOpenCypherGraphEmulator._is_acl_allowed(acls, caller_acl_groups):
+                    continue
+                edge = KGRelationEdge(
+                    edge_id=eid,
+                    tenant_id=er["tenant_id"],
+                    source_entity_id=er["source_entity_id"],
+                    target_entity_id=er["target_entity_id"],
+                    predicate=er["predicate"],
+                    t_valid=er["t_valid"],
+                    t_invalid=er["t_invalid"],
+                    is_functional=bool(er["is_functional"]),
+                    source_kb_ids=list(er["source_kb_ids"]),
+                    source_chunk_ids=list(er["source_chunk_ids"]),
+                    evidence_snippets=list(er["evidence_snippets"]),
+                    acl_groups=acls,
+                    qualifiers=json.loads(er["qualifiers_json"]) if er.get("qualifiers_json") else {},
+                    confidence=float(er["confidence"]),
+                    governance_bucket=gb,
+                )
+                if InMemoryOpenCypherGraphEmulator._is_edge_valid_at(edge, as_of_iso):
+                    edges_by_id[eid] = edge
+        return entities, list(edges_by_id.values())
+
+    async def rename_concept_in_graph(
+        self, tenant_id: str, concept_kind: str, old_name: str, new_name: str
+    ) -> int:
+        driver = self._get_driver()
+        async with driver.session() as session:
+            if concept_kind.upper() == "CLASS":
+                res = await session.run(
+                    """
+                    MATCH (n:Entity {tenant_id: $tenant_id, ontology_class: $old_name})
+                    SET n.ontology_class = $new_name
+                    RETURN count(n) AS cnt
+                    """,
+                    tenant_id=tenant_id,
+                    old_name=old_name,
+                    new_name=new_name,
+                )
+            else:
+                res = await session.run(
+                    """
+                    MATCH (:Entity {tenant_id: $tenant_id})-[r:KG_RELATION {predicate: $old_name}]->(:Entity {tenant_id: $tenant_id})
+                    SET r.predicate = $new_name
+                    RETURN count(r) AS cnt
+                    """,
+                    tenant_id=tenant_id,
+                    old_name=old_name,
+                    new_name=new_name,
+                )
+            rec = await res.single()
+            return int(rec["cnt"]) if rec and rec["cnt"] is not None else 0
+
+    async def update_concept_governance_bucket(
+        self, tenant_id: str, concept_kind: str, concept_name: str, new_status: OntologyStatus
+    ) -> int:
+        driver = self._get_driver()
+        async with driver.session() as session:
+            if concept_kind.upper() == "CLASS":
+                res = await session.run(
+                    """
+                    MATCH (n:Entity {tenant_id: $tenant_id, ontology_class: $cname})
+                    SET n.governance_bucket = $status
+                    RETURN count(n) AS cnt
+                    """,
+                    tenant_id=tenant_id,
+                    cname=concept_name,
+                    status=new_status.value,
+                )
+            else:
+                res = await session.run(
+                    """
+                    MATCH (:Entity {tenant_id: $tenant_id})-[r:KG_RELATION {predicate: $cname}]->(:Entity {tenant_id: $tenant_id})
+                    SET r.governance_bucket = $status
+                    RETURN count(r) AS cnt
+                    """,
+                    tenant_id=tenant_id,
+                    cname=concept_name,
+                    status=new_status.value,
+                )
+            rec = await res.single()
+            return int(rec["cnt"]) if rec and rec["cnt"] is not None else 0
+
     async def purge_tenant(self, tenant_id: str) -> int:
         driver = self._get_driver()
         async with driver.session() as session:
@@ -1454,6 +1907,52 @@ class NeptuneOpenCypherGraphAdapter(PropertyGraphStorePort):
                 {"tenant_id": tenant_id, "updates": upd_entities},
             )
         return del_entity_ids, len(del_edge_ids)
+
+    async def rename_concept_in_graph(
+        self, tenant_id: str, concept_kind: str, old_name: str, new_name: str
+    ) -> int:
+        if concept_kind.upper() == "CLASS":
+            res = await self._run_neptune_cypher(
+                """
+                MATCH (n:Entity {tenant_id: $tenant_id, ontology_class: $old_name})
+                SET n.ontology_class = $new_name
+                RETURN count(n) AS cnt
+                """,
+                {"tenant_id": tenant_id, "old_name": old_name, "new_name": new_name},
+            )
+        else:
+            res = await self._run_neptune_cypher(
+                """
+                MATCH (:Entity {tenant_id: $tenant_id})-[r:KG_RELATION {predicate: $old_name}]->(:Entity {tenant_id: $tenant_id})
+                SET r.predicate = $new_name
+                RETURN count(r) AS cnt
+                """,
+                {"tenant_id": tenant_id, "old_name": old_name, "new_name": new_name},
+            )
+        return int(res[0].get("cnt", 0)) if res else 0
+
+    async def update_concept_governance_bucket(
+        self, tenant_id: str, concept_kind: str, concept_name: str, new_status: OntologyStatus
+    ) -> int:
+        if concept_kind.upper() == "CLASS":
+            res = await self._run_neptune_cypher(
+                """
+                MATCH (n:Entity {tenant_id: $tenant_id, ontology_class: $cname})
+                SET n.governance_bucket = $status
+                RETURN count(n) AS cnt
+                """,
+                {"tenant_id": tenant_id, "cname": concept_name, "status": new_status.value},
+            )
+        else:
+            res = await self._run_neptune_cypher(
+                """
+                MATCH (:Entity {tenant_id: $tenant_id})-[r:KG_RELATION {predicate: $cname}]->(:Entity {tenant_id: $tenant_id})
+                SET r.governance_bucket = $status
+                RETURN count(r) AS cnt
+                """,
+                {"tenant_id": tenant_id, "cname": concept_name, "status": new_status.value},
+            )
+        return int(res[0].get("cnt", 0)) if res else 0
 
     async def purge_tenant(self, tenant_id: str) -> int:
         res = await self._run_neptune_cypher(

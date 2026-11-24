@@ -355,6 +355,14 @@ class GraphAnalyticsEngine:
                 f"Dominant relationships: {top_preds or ['standalone_concept']}. "
                 f"High-level themes: {', '.join(themes)}."
             )
+            member_entity_acls = {
+                e.canonical_name: sorted(set(e.acl_groups or ["public"]))
+                for e in member_ents
+            }
+            comm_acls = sorted(
+                {g for acls in member_entity_acls.values() for g in acls}
+            ) or ["public"]
+
             emb = self.embedding_provider.embed_text(
                 f"{title} {summary} {' '.join(themes)}", dim=self.canonical_dim
             )
@@ -370,11 +378,108 @@ class GraphAnalyticsEngine:
                     contributing_kb_ids=sorted(kbs),
                     top_predicates=top_preds,
                     high_level_themes=themes,
+                    acl_groups=comm_acls,
+                    member_entity_acls=member_entity_acls,
                     embedding=emb,
                 )
             )
 
         return summaries, engine_used
+
+    @staticmethod
+    def filter_communities_by_acl(
+        communities: Sequence[CommunitySummaryRecord],
+        caller_acl_groups: Sequence[str] | None = None,
+    ) -> list[CommunitySummaryRecord]:
+        """
+        Applies strict ABAC filtering over build-time persisted `CommunitySummaryRecord`s:
+        strips any member entities the caller cannot access and regenerates the title/summary
+        from only the permitted entities so confidential entity names NEVER leak.
+        """
+        if caller_acl_groups is None:
+            return list(communities)
+
+        filtered: list[CommunitySummaryRecord] = []
+        for idx, c in enumerate(communities, start=1):
+            if not _is_acl_allowed(c.acl_groups, caller_acl_groups):
+                continue
+            if c.member_entity_acls:
+                allowed_names = [
+                    name
+                    for name in c.member_entity_names
+                    if _is_acl_allowed(c.member_entity_acls.get(name, ["public"]), caller_acl_groups)
+                ]
+                if not allowed_names:
+                    continue
+                if len(allowed_names) < len(c.member_entity_names):
+                    hub_preview = ", ".join(allowed_names[:5])
+                    safe_title = f"Community #{idx}: {', '.join(c.member_classes[:2])} ({hub_preview})"
+                    safe_summary = (
+                        f"Cross-KB cluster spanning {len(c.contributing_kb_ids)} KB(s) with "
+                        f"{len(allowed_names)} entities ({', '.join(allowed_names[:8])}) across "
+                        f"classes {c.member_classes}. Dominant relationships: "
+                        f"{c.top_predicates or ['standalone_concept']}. "
+                        f"High-level themes: {', '.join(c.high_level_themes)}."
+                    )
+                    filtered.append(
+                        c.model_copy(
+                            update={
+                                "title": safe_title,
+                                "summary": safe_summary,
+                                "member_entity_names": allowed_names,
+                                "member_entity_acls": {
+                                    k: v for k, v in c.member_entity_acls.items() if k in allowed_names
+                                },
+                            }
+                        )
+                    )
+                else:
+                    filtered.append(c)
+            else:
+                filtered.append(c)
+        return filtered
+
+    def query_persisted_communities(
+        self,
+        tenant_id: str,
+        query: str,
+        persisted_communities: Sequence[CommunitySummaryRecord],
+        top_k_communities: int = 4,
+        caller_acl_groups: Sequence[str] | None = None,
+        engine_used: str = "persisted_community_cache",
+    ) -> GlobalCommunitySearchResponse:
+        """Serves Global Community Sensemaking in O(C) from persisted build-time communities (zero full-graph scan)."""
+        communities = self.filter_communities_by_acl(persisted_communities, caller_acl_groups)
+        if not communities:
+            return GlobalCommunitySearchResponse(
+                tenant_id=tenant_id,
+                query=query,
+                synthesized_global_answer="No communities available for this tenant / ACL scope.",
+                communities_matched=[],
+                engine_used=engine_used,
+            )
+
+        q_vec = self.embedding_provider.embed_text(query, dim=self.canonical_dim)
+        scored = [
+            (comm, cosine_similarity(q_vec, comm.embedding) + 0.05 * min(len(comm.contributing_kb_ids), 5))
+            for comm in communities
+        ]
+        scored.sort(key=lambda x: x[1], reverse=True)
+        top_comms = [c for c, _ in scored[:top_k_communities]]
+
+        lines = [f"### Global Sensemaking Synthesis ({engine_used} across {len(communities)} Graph Communities)"]
+        for c in top_comms:
+            lines.append(
+                f"- **{c.title}** *(KBs: {', '.join(c.contributing_kb_ids[:5])})*: {c.summary}"
+            )
+
+        return GlobalCommunitySearchResponse(
+            tenant_id=tenant_id,
+            query=query,
+            synthesized_global_answer="\n".join(lines),
+            communities_matched=top_comms,
+            engine_used=engine_used,
+        )
 
     def query_global_communities(
         self,

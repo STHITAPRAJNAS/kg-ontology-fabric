@@ -5,7 +5,7 @@ import math
 import os
 import re
 from abc import ABC, abstractmethod
-from typing import Sequence
+from typing import Any, Sequence
 
 from .models import VectorChunkRecord
 
@@ -132,14 +132,28 @@ class SemanticFeatureHashEmbeddingProvider(EmbeddingProvider):
         return normed
 
 
+def _fit_vector_dim(raw_vec: Sequence[float], target_dim: int) -> list[float]:
+    vec = [float(x) for x in raw_vec]
+    if len(vec) >= target_dim:
+        return l2_normalize(vec[:target_dim])
+    return l2_normalize(vec + [0.0] * (target_dim - len(vec)))
+
+
 class GeminiOrFallbackEmbeddingProvider(EmbeddingProvider):
     """
-    Uses live Google Gemini `text-embedding-004` when `GOOGLE_API_KEY` or `GEMINI_API_KEY`
-    is set and `use_live_gemini=True`, otherwise falls back to `SemanticFeatureHashEmbeddingProvider`.
+    Uses live Google Gemini `text-embedding-004` (or configured model) when `GOOGLE_API_KEY`
+    or `GEMINI_API_KEY` is set and `use_live_gemini=True`, otherwise falls back to
+    `SemanticFeatureHashEmbeddingProvider`.
     """
 
-    def __init__(self, default_dim: int = 256, use_live_gemini: bool = False):
+    def __init__(
+        self,
+        default_dim: int = 256,
+        use_live_gemini: bool = False,
+        model_name: str = "text-embedding-004",
+    ):
         self.default_dim = default_dim
+        self.model_name = model_name
         self.api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
         self.use_live_gemini = use_live_gemini and bool(self.api_key)
         self.fallback = SemanticFeatureHashEmbeddingProvider(default_dim=default_dim)
@@ -153,16 +167,155 @@ class GeminiOrFallbackEmbeddingProvider(EmbeddingProvider):
 
             client = genai.Client(api_key=self.api_key)
             resp = client.models.embed_content(
-                model="text-embedding-004",
+                model=self.model_name,
                 contents=text,
             )
-            raw_vec = list(resp.embeddings[0].values)
-            if len(raw_vec) >= target_dim:
-                return l2_normalize(raw_vec[:target_dim])
-            padded = raw_vec + [0.0] * (target_dim - len(raw_vec))
-            return l2_normalize(padded)
+            return _fit_vector_dim(resp.embeddings[0].values, target_dim)
         except Exception:
             return self.fallback.embed_text(text, dim=target_dim)
+
+
+class OpenAIEmbeddingProvider(EmbeddingProvider):
+    """Live OpenAI embeddings (`text-embedding-3-small` / `text-embedding-3-large`) with optional fallback."""
+
+    def __init__(
+        self,
+        default_dim: int = 256,
+        model_name: str = "text-embedding-3-small",
+        api_key: str | None = None,
+        fallback_on_error: bool = True,
+    ):
+        self.default_dim = default_dim
+        self.model_name = model_name
+        self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
+        self.fallback_on_error = fallback_on_error
+        self.fallback = SemanticFeatureHashEmbeddingProvider(default_dim=default_dim)
+
+    def embed_text(self, text: str, dim: int | None = None) -> list[float]:
+        target_dim = dim or self.default_dim
+        if not self.api_key:
+            if self.fallback_on_error:
+                return self.fallback.embed_text(text, dim=target_dim)
+            raise RuntimeError("OPENAI_API_KEY is required for OpenAIEmbeddingProvider.")
+        try:
+            from openai import OpenAI
+
+            client = OpenAI(api_key=self.api_key)
+            kwargs: dict[str, Any] = {"model": self.model_name, "input": text}
+            if "text-embedding-3" in self.model_name:
+                kwargs["dimensions"] = target_dim
+            resp = client.embeddings.create(**kwargs)
+            return _fit_vector_dim(resp.data[0].embedding, target_dim)
+        except Exception:
+            if self.fallback_on_error:
+                return self.fallback.embed_text(text, dim=target_dim)
+            raise
+
+
+class BedrockEmbeddingProvider(EmbeddingProvider):
+    """Live AWS Bedrock embeddings (`amazon.titan-embed-text-v2:0`, Cohere, etc.) with optional fallback."""
+
+    def __init__(
+        self,
+        default_dim: int = 256,
+        model_name: str = "amazon.titan-embed-text-v2:0",
+        region_name: str | None = None,
+        fallback_on_error: bool = True,
+    ):
+        self.default_dim = default_dim
+        self.model_name = model_name
+        self.region_name = region_name or os.environ.get("AWS_REGION", "us-east-1")
+        self.fallback_on_error = fallback_on_error
+        self.fallback = SemanticFeatureHashEmbeddingProvider(default_dim=default_dim)
+
+    def embed_text(self, text: str, dim: int | None = None) -> list[float]:
+        target_dim = dim or self.default_dim
+        try:
+            import json
+            import boto3
+
+            client = boto3.client("bedrock-runtime", region_name=self.region_name)
+            body = json.dumps({"inputText": text, "dimensions": target_dim, "normalize": True})
+            resp = client.invoke_model(
+                modelId=self.model_name,
+                body=body,
+                contentType="application/json",
+                accept="application/json",
+            )
+            payload = json.loads(resp["body"].read().decode("utf-8"))
+            vec = payload.get("embedding") or payload.get("embeddings", [[]])[0]
+            return _fit_vector_dim(vec, target_dim)
+        except Exception:
+            if self.fallback_on_error:
+                return self.fallback.embed_text(text, dim=target_dim)
+            raise
+
+
+class SentenceTransformerEmbeddingProvider(EmbeddingProvider):
+    """Local HuggingFace `sentence-transformers` embedding provider (zero external API keys)."""
+
+    def __init__(
+        self,
+        default_dim: int = 256,
+        model_name: str = "all-MiniLM-L6-v2",
+        fallback_on_error: bool = True,
+    ):
+        self.default_dim = default_dim
+        self.model_name = model_name
+        self.fallback_on_error = fallback_on_error
+        self.fallback = SemanticFeatureHashEmbeddingProvider(default_dim=default_dim)
+        self._model: Any = None
+
+    def embed_text(self, text: str, dim: int | None = None) -> list[float]:
+        target_dim = dim or self.default_dim
+        try:
+            if self._model is None:
+                from sentence_transformers import SentenceTransformer  # type: ignore
+
+                self._model = SentenceTransformer(self.model_name)
+            vec = self._model.encode(text, normalize_embeddings=True)
+            return _fit_vector_dim(vec.tolist() if hasattr(vec, "tolist") else list(vec), target_dim)
+        except Exception:
+            if self.fallback_on_error:
+                return self.fallback.embed_text(text, dim=target_dim)
+            raise
+
+
+def create_embedding_provider_from_env(default_dim: int = 256) -> EmbeddingProvider:
+    """
+    Factory wired into `EnterpriseKGOntologyService.from_env()`.
+    Reads `KG_FABRIC_EMBEDDING_PROVIDER` (`hash` | `gemini` | `openai` | `bedrock` | `sentence_transformers`)
+    and `KG_FABRIC_EMBEDDING_MODEL`.
+    """
+    provider = os.environ.get("KG_FABRIC_EMBEDDING_PROVIDER", "hash").strip().lower()
+    model_name = os.environ.get("KG_FABRIC_EMBEDDING_MODEL", "").strip()
+    if provider == "gemini":
+        return GeminiOrFallbackEmbeddingProvider(
+            default_dim=default_dim,
+            use_live_gemini=True,
+            model_name=model_name or "text-embedding-004",
+        )
+    if provider == "openai":
+        return OpenAIEmbeddingProvider(
+            default_dim=default_dim,
+            model_name=model_name or "text-embedding-3-small",
+        )
+    if provider == "bedrock":
+        return BedrockEmbeddingProvider(
+            default_dim=default_dim,
+            model_name=model_name or "amazon.titan-embed-text-v2:0",
+        )
+    if provider in ("sentence_transformers", "sentence-transformers", "local"):
+        return SentenceTransformerEmbeddingProvider(
+            default_dim=default_dim,
+            model_name=model_name or "all-MiniLM-L6-v2",
+        )
+    if provider in ("hash", "default", ""):
+        return SemanticFeatureHashEmbeddingProvider(default_dim=default_dim)
+    raise ValueError(
+        f"Invalid KG_FABRIC_EMBEDDING_PROVIDER='{provider}'. "
+        "Must be one of: hash, gemini, openai, bedrock, sentence_transformers."
+    )
 
 
 class SubLinearVectorCentroidSampler:

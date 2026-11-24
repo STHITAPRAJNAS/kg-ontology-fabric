@@ -151,10 +151,39 @@ class OntologyRelationDef(BaseModel):
     status: OntologyStatus = OntologyStatus.APPROVED
 
 
+class OntologyAuditEntry(BaseModel):
+    """Governance audit record for per-concept approve / reject / merge actions."""
+
+    entry_id: str
+    tenant_id: str
+    action: str  # "APPROVE" | "REJECT" | "MERGE"
+    concept_kind: str  # "CLASS" | "RELATION"
+    concept_name: str
+    target_name: str | None = None
+    actor: str = "system"
+    reason: str = ""
+    tbox_version: str = "1.0.0"
+    created_at: str = Field(default_factory=utc_now_iso)
+
+
+class OntologyConceptReviewRequest(BaseModel):
+    """Per-concept governance review request: approve, reject, or merge a class/relation."""
+
+    tenant_id: str = "enterprise_default"
+    concept_kind: str = Field(..., description="'CLASS' or 'RELATION'")
+    concept_name: str
+    action: str = Field(..., description="'approve', 'reject', or 'merge'")
+    target_name: str | None = Field(
+        default=None, description="Target canonical class/relation name when action='merge'"
+    )
+    reason: str = ""
+
+
 class EnterpriseCompiledTBox(BaseModel):
     """
     Compiled & aligned Enterprise Ontology across 100s of KBs.
-    Includes Approved classes/predicates, Quarantined candidates, and alias lookup maps.
+    Includes Approved classes/predicates, Quarantined candidates, alias lookup maps,
+    and an immutable per-concept governance audit trail.
     """
 
     tenant_id: str = "enterprise_default"
@@ -166,6 +195,7 @@ class EnterpriseCompiledTBox(BaseModel):
     relations: dict[str, OntologyRelationDef] = Field(default_factory=dict)
     class_alias_to_canonical: dict[str, str] = Field(default_factory=dict)
     relation_alias_to_canonical: dict[str, str] = Field(default_factory=dict)
+    audit_trail: list[OntologyAuditEntry] = Field(default_factory=list)
     updated_at: str = Field(default_factory=utc_now_iso)
 
     def resolve_class(self, raw_class_name: str) -> str:
@@ -328,6 +358,10 @@ class GraphRAGQueryRequest(BaseModel):
     as_of_iso: str | None = None
     use_adaptive_routing: bool = False
     use_ppr_ranking: bool = True
+    synthesize_with_llm: bool = Field(
+        default=False,
+        description="Optional grounded LLM answer synthesis with citations (default False for agent callers).",
+    )
 
 
 class RetrievedChunkContext(BaseModel):
@@ -459,6 +493,8 @@ class CommunitySummaryRecord(BaseModel):
     contributing_kb_ids: list[str] = Field(default_factory=list)
     top_predicates: list[str] = Field(default_factory=list)
     high_level_themes: list[str] = Field(default_factory=list)
+    acl_groups: list[str] = Field(default_factory=lambda: ["public"])
+    member_entity_acls: dict[str, list[str]] = Field(default_factory=dict)
     embedding: list[float] = Field(default_factory=list)
 
 
@@ -500,6 +536,7 @@ class SyncJobStatus(str, Enum):
     RUNNING = "RUNNING"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
 
 
 class DLQFailedChunkRecord(BaseModel):

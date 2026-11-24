@@ -115,6 +115,7 @@ class AuthConfig:
     mode: AuthMode = AuthMode.NONE
     api_keys: dict[str, dict[str, Any]] = field(default_factory=dict)
     jwt_secret: str = ""
+    jwks_url: str | None = None
     jwt_algorithms: list[str] = field(default_factory=lambda: ["HS256"])
     jwt_issuer: str | None = None
     jwt_audience: str | None = None
@@ -128,6 +129,7 @@ class AuthConfig:
         if (
             self.mode == AuthMode.JWT
             and self.custom_token_verifier is None
+            and not self.jwks_url
             and self.jwt_secret
             and len(self.jwt_secret.encode("utf-8")) < MIN_JWT_SECRET_BYTES
         ):
@@ -135,6 +137,8 @@ class AuthConfig:
                 f"KG_FABRIC_JWT_SECRET must be at least {MIN_JWT_SECRET_BYTES} bytes "
                 f"(got {len(self.jwt_secret.encode('utf-8'))} bytes)."
             )
+        if self.jwks_url and self.jwt_algorithms == ["HS256"]:
+            self.jwt_algorithms = ["RS256", "ES256"]
 
     @classmethod
     def from_env(cls) -> AuthConfig:
@@ -168,14 +172,19 @@ class AuthConfig:
                         }
 
         jwt_secret = os.getenv("KG_FABRIC_JWT_SECRET", "").strip()
-        jwt_algs_raw = os.getenv("KG_FABRIC_JWT_ALGORITHMS", "HS256").strip()
-        jwt_algs = [a.strip() for a in jwt_algs_raw.split(",") if a.strip()] or ["HS256"]
+        jwks_url = os.getenv("KG_FABRIC_JWKS_URL", "").strip() or None
+        default_algs = "RS256,ES256" if jwks_url else "HS256"
+        jwt_algs_raw = os.getenv("KG_FABRIC_JWT_ALGORITHMS", default_algs).strip()
+        jwt_algs = [a.strip() for a in jwt_algs_raw.split(",") if a.strip()] or (
+            ["RS256", "ES256"] if jwks_url else ["HS256"]
+        )
         rate_limit_rpm = int(os.getenv("KG_FABRIC_RATE_LIMIT_RPM", "0"))
 
         return cls(
             mode=mode,
             api_keys=api_keys,
             jwt_secret=jwt_secret,
+            jwks_url=jwks_url,
             jwt_algorithms=jwt_algs,
             jwt_issuer=os.getenv("KG_FABRIC_JWT_ISSUER") or None,
             jwt_audience=os.getenv("KG_FABRIC_JWT_AUDIENCE") or None,
@@ -202,11 +211,50 @@ def create_hs256_jwt(payload: dict[str, Any], secret: str) -> str:
     return f"{h_b64}.{p_b64}.{_b64url_encode(sig)}"
 
 
+_JWKS_CLIENTS: dict[str, Any] = {}
+
+
+def _get_jwks_client(jwks_url: str) -> Any:
+    client = _JWKS_CLIENTS.get(jwks_url)
+    if client is None:
+        import jwt as pyjwt  # type: ignore
+
+        client = pyjwt.PyJWKClient(jwks_url, cache_keys=True)
+        _JWKS_CLIENTS[jwks_url] = client
+    return client
+
+
 def verify_jwt_token(token: str, config: AuthConfig) -> dict[str, Any]:
+    # 1. Built-in OIDC / JWKS verification (Auth0, Okta, Cognito, Entra ID, Keycloak)
+    if config.jwks_url:
+        try:
+            import jwt as pyjwt  # type: ignore
+
+            jwk_client = _get_jwks_client(config.jwks_url)
+            signing_key = jwk_client.get_signing_key_from_jwt(token)
+            options = {"require": ["exp"]} if config.require_exp else {}
+            kwargs: dict[str, Any] = {
+                "algorithms": config.jwt_algorithms,
+                "options": options,
+            }
+            if config.jwt_issuer:
+                kwargs["issuer"] = config.jwt_issuer
+            if config.jwt_audience:
+                kwargs["audience"] = config.jwt_audience
+            claims = pyjwt.decode(token, signing_key.key, **kwargs)
+            return dict(claims)
+        except ImportError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail="JWKS auth requires PyJWT[crypto]. Install with: pip install 'enterprise-kg-ontology-fabric[auth]'",
+            ) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=401, detail=f"Invalid OIDC/JWKS JWT token: {exc}") from exc
+
     if not config.jwt_secret:
         raise HTTPException(
             status_code=500,
-            detail="JWT auth enabled but KG_FABRIC_JWT_SECRET is not configured",
+            detail="JWT auth enabled but KG_FABRIC_JWT_SECRET (or KG_FABRIC_JWKS_URL) is not configured",
         )
     if len(config.jwt_secret.encode("utf-8")) < MIN_JWT_SECRET_BYTES:
         raise HTTPException(

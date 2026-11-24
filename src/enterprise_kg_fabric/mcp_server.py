@@ -14,6 +14,7 @@ from .models import (
     EntitySearchRequest,
     GlobalCommunitySearchRequest,
     GraphRAGQueryRequest,
+    OntologyConceptReviewRequest,
     PPRSearchRequest,
     RawDocumentInput,
     ReadOnlyCypherSearchRequest,
@@ -47,6 +48,7 @@ class KGFabricMcpServer:
     }
     _ADMIN_TOOLS = {
         "promote_quarantined_ontology",
+        "review_ontology_concept",
     }
     _PLATFORM_ADMIN_TOOLS = {
         "execute_readonly_opencypher",
@@ -297,6 +299,27 @@ class KGFabricMcpServer:
                     },
                 },
             },
+            {
+                "name": "review_ontology_concept",
+                "title": "Per-Concept Ontology Review (Approve / Reject / Merge)",
+                "description": (
+                    "Approves, rejects (deprecates), or merges a specific TBox class or relation, "
+                    "updates Neo4j/Neptune entities/edges, bumps TBox version, and appends an immutable audit entry."
+                ),
+                "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False},
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "tenant_id": {"type": "string", "default": "enterprise_default"},
+                        "concept_kind": {"type": "string", "enum": ["CLASS", "RELATION"]},
+                        "concept_name": {"type": "string"},
+                        "action": {"type": "string", "enum": ["approve", "reject", "merge"]},
+                        "target_name": {"type": "string"},
+                        "reason": {"type": "string", "default": ""},
+                    },
+                    "required": ["concept_kind", "concept_name", "action"],
+                },
+            },
         ]
 
     @staticmethod
@@ -491,6 +514,11 @@ class KGFabricMcpServer:
             return await self.service.promote_quarantined_ontology_concepts(
                 tenant_id=args.get("tenant_id", "enterprise_default"),
                 min_confidence=float(args.get("min_confidence", 0.80)),
+            )
+
+        if tool_name == "review_ontology_concept":
+            return await self.service.review_ontology_concept(
+                OntologyConceptReviewRequest(**args)
             )
 
         raise ValueError(f"Unknown MCP tool: {tool_name}")
@@ -758,6 +786,146 @@ def create_fastmcp_server(service: EnterpriseKGOntologyService | None = None) ->
         return await mcp_engine.call_tool(
             "execute_readonly_opencypher",
             {"tenant_id": tenant_id, "cypher_query": cypher_query},
+        )
+
+    @fastmcp.tool()
+    async def search_ppr_subgraph(
+        seed_entities: list[str],
+        tenant_id: str = "enterprise_default",
+        top_k_facts: int = 15,
+        alpha: float = 0.85,
+        as_of_iso: str | None = None,
+    ) -> dict[str, Any]:
+        """HippoRAG 2 Personalized PageRank hub-damped subgraph retrieval."""
+        return await mcp_engine.call_tool(
+            "search_ppr_subgraph",
+            {
+                "tenant_id": tenant_id,
+                "seed_entities": seed_entities,
+                "top_k_facts": top_k_facts,
+                "alpha": alpha,
+                "as_of_iso": as_of_iso,
+            },
+        )
+
+    @fastmcp.tool()
+    async def query_global_communities(
+        query: str,
+        tenant_id: str = "enterprise_default",
+        top_k_communities: int = 4,
+    ) -> dict[str, Any]:
+        """Microsoft GraphRAG Leiden/Louvain Global Sensemaking over persisted communities."""
+        return await mcp_engine.call_tool(
+            "query_global_communities",
+            {
+                "tenant_id": tenant_id,
+                "query": query,
+                "top_k_communities": top_k_communities,
+            },
+        )
+
+    @fastmcp.tool()
+    async def check_answerable(
+        query: str,
+        tenant_id: str = "enterprise_default",
+    ) -> dict[str, Any]:
+        """Pre-flight ontology & multi-KB coverage check (ANSWERABLE | PARTIAL | UNANSWERABLE)."""
+        return await mcp_engine.call_tool(
+            "check_answerable", {"tenant_id": tenant_id, "query": query}
+        )
+
+    @fastmcp.tool()
+    async def audit_kg_quality(
+        tenant_id: str = "enterprise_default",
+        sample_size_faithfulness: int = 25,
+        use_llm_judge: bool = False,
+    ) -> dict[str, Any]:
+        """Runs the 4-dimension Ontology & Knowledge Graph Quality Scorecard."""
+        return await mcp_engine.call_tool(
+            "audit_kg_quality",
+            {
+                "tenant_id": tenant_id,
+                "sample_size_faithfulness": sample_size_faithfulness,
+                "use_llm_judge": use_llm_judge,
+            },
+        )
+
+    @fastmcp.tool()
+    async def register_vector_kbs(registrations: list[dict[str, Any]]) -> dict[str, Any]:
+        """Registers one or more vector KBs in the tenant federation registry."""
+        return await mcp_engine.call_tool(
+            "register_vector_kbs", {"registrations": registrations}
+        )
+
+    @fastmcp.tool()
+    async def ingest_raw_documents(
+        documents: list[dict[str, Any]],
+        native_kb_dim: int = 768,
+    ) -> dict[str, Any]:
+        """Ingests raw enterprise documents with PII scrubbing and hierarchical chunking."""
+        return await mcp_engine.call_tool(
+            "ingest_raw_documents",
+            {"documents": documents, "native_kb_dim": native_kb_dim},
+        )
+
+    @fastmcp.tool()
+    async def induce_and_align_ontology(
+        tenant_id: str = "enterprise_default",
+        tbox_version: str = "1.0.0",
+    ) -> dict[str, Any]:
+        """Induces and aligns the tenant's unified TBox ontology across registered KBs."""
+        return await mcp_engine.call_tool(
+            "induce_and_align_ontology",
+            {"tenant_id": tenant_id, "tbox_version": tbox_version},
+        )
+
+    @fastmcp.tool()
+    async def build_or_update_knowledge_graph(
+        tenant_id: str = "enterprise_default",
+        incremental: bool = True,
+        validate_shacl: bool = True,
+    ) -> dict[str, Any]:
+        """Builds or incrementally updates the tenant's Knowledge Graph and community cache."""
+        return await mcp_engine.call_tool(
+            "build_or_update_knowledge_graph",
+            {
+                "tenant_id": tenant_id,
+                "incremental": incremental,
+                "validate_shacl": validate_shacl,
+            },
+        )
+
+    @fastmcp.tool()
+    async def promote_quarantined_ontology(
+        tenant_id: str = "enterprise_default",
+        min_confidence: float = 0.80,
+    ) -> dict[str, Any]:
+        """Promotes high-confidence quarantined ontology concepts into APPROVED status."""
+        return await mcp_engine.call_tool(
+            "promote_quarantined_ontology",
+            {"tenant_id": tenant_id, "min_confidence": min_confidence},
+        )
+
+    @fastmcp.tool()
+    async def review_ontology_concept(
+        concept_kind: str,
+        concept_name: str,
+        action: str,
+        tenant_id: str = "enterprise_default",
+        target_name: str | None = None,
+        reason: str = "",
+    ) -> dict[str, Any]:
+        """Per-concept ontology review: approve, reject, or merge a specific class/relation with audit log."""
+        return await mcp_engine.call_tool(
+            "review_ontology_concept",
+            {
+                "tenant_id": tenant_id,
+                "concept_kind": concept_kind,
+                "concept_name": concept_name,
+                "action": action,
+                "target_name": target_name,
+                "reason": reason,
+            },
         )
 
     return fastmcp

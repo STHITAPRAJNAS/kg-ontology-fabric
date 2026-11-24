@@ -35,6 +35,8 @@ from .models import (
     GraphRAGQueryResponse,
     KGGraphBuildReport,
     KGQualityScorecardReport,
+    OntologyAuditEntry,
+    OntologyConceptReviewRequest,
     OntologyInductionReport,
     PPRSearchRequest,
     PPRSearchResponse,
@@ -80,6 +82,7 @@ class BuildGraphRequest(BaseModel):
     incremental: bool = True
     validate_shacl: bool = True
     allow_dynamic_emergent: bool = True
+    wait: bool = False
 
 
 class PromoteOntologyRequest(BaseModel):
@@ -129,7 +132,27 @@ _GOVERNANCE_UI_HTML = """<!doctype html>
     <div class="card"><h3>Health &amp; Worker</h3><pre id="health">Loading...</pre></div>
     <div class="card"><h3>KG &amp; Ontology Quality Scorecard</h3><pre id="quality">Click Refresh</pre></div>
     <div class="card"><h3>Tenant Telemetry</h3><pre id="telemetry">Click Refresh</pre></div>
+    <div class="card">
+      <h3>Per-Concept Ontology Review</h3>
+      <div style="display:flex; gap:6px; flex-wrap:wrap; margin-bottom:8px;">
+        <select id="revKind" style="padding:8px;border-radius:6px;background:#0f172a;color:#f8fafc;border:1px solid #475569;">
+          <option value="CLASS">CLASS</option>
+          <option value="RELATION">RELATION</option>
+        </select>
+        <input id="revConcept" placeholder="Concept name" style="width:140px;" />
+        <input id="revTarget" placeholder="Target (for merge)" style="width:140px;" />
+        <input id="revReason" placeholder="Reason" style="width:140px;" />
+      </div>
+      <div style="display:flex; gap:6px; margin-bottom:8px;">
+        <button onclick="submitReview('approve')">Approve</button>
+        <button onclick="submitReview('reject')" style="background:#dc2626;border-color:#dc2626;">Reject</button>
+        <button onclick="submitReview('merge')" style="background:#7c3aed;border-color:#7c3aed;">Merge</button>
+      </div>
+      <pre id="revResult">Ready for review actions</pre>
+    </div>
     <div class="card"><h3>Compiled TBox Ontology</h3><pre id="tbox">Click Refresh</pre></div>
+    <div class="card"><h3>Ontology Audit Trail</h3><pre id="audit">Click Refresh</pre></div>
+    <div class="card"><h3>Build Jobs</h3><pre id="jobs">Click Refresh</pre></div>
     <div class="card"><h3>Dead-Letter Queue (DLQ)</h3><pre id="dlq">Click Refresh</pre></div>
   </div>
   <script>
@@ -144,12 +167,34 @@ _GOVERNANCE_UI_HTML = """<!doctype html>
         document.getElementById(elId).textContent = JSON.stringify(await res.json(), null, 2);
       } catch (e) { document.getElementById(elId).textContent = String(e); }
     }
+    async function submitReview(action) {
+      const tid = document.getElementById('tenant').value || 'enterprise_default';
+      const body = {
+        tenant_id: tid,
+        concept_kind: document.getElementById('revKind').value,
+        concept_name: document.getElementById('revConcept').value.trim(),
+        action: action,
+        target_name: document.getElementById('revTarget').value.trim() || null,
+        reason: document.getElementById('revReason').value.trim(),
+      };
+      try {
+        const res = await fetch('/v1/ontology/review', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json', ...authHeaders()},
+          body: JSON.stringify(body),
+        });
+        document.getElementById('revResult').textContent = JSON.stringify(await res.json(), null, 2);
+        refreshAll();
+      } catch (e) { document.getElementById('revResult').textContent = String(e); }
+    }
     function refreshAll() {
       const tid = encodeURIComponent(document.getElementById('tenant').value || 'enterprise_default');
       loadJson('/health', 'health');
       loadJson('/v1/quality/report?tenant_id=' + tid, 'quality');
       loadJson('/v1/telemetry?tenant_id=' + tid, 'telemetry');
       loadJson('/v1/ontology/tbox?tenant_id=' + tid, 'tbox');
+      loadJson('/v1/ontology/audit?tenant_id=' + tid, 'audit');
+      loadJson('/v1/jobs?tenant_id=' + tid, 'jobs');
       loadJson('/v1/jobs/dlq?tenant_id=' + tid, 'dlq');
     }
     loadJson('/health', 'health');
@@ -548,7 +593,7 @@ def create_kg_fabric_app(
         req.caller_acl_groups = enforcer.enforce_acl_groups(p, req.caller_acl_groups)
         return await svc.query_global_communities(req)
 
-    @app.post("/v1/jobs/build", response_model=SyncJobRecord)
+    @app.post("/v1/jobs/build", response_model=SyncJobRecord, status_code=202)
     async def submit_build_job(
         req: BuildGraphRequest,
         principal: AuthPrincipal | None = Depends(get_principal),
@@ -556,10 +601,30 @@ def create_kg_fabric_app(
         p = _unwrap_principal(principal)
         enforcer.require_role(p, "writer")
         tenant = enforcer.enforce_tenant(p, req.tenant_id)
-        return await svc.execute_tracked_build_job(
+        if req.wait:
+            return await svc.execute_tracked_build_job(
+                tenant_id=tenant,
+                incremental=req.incremental,
+                validate_shacl=req.validate_shacl,
+            )
+        return await svc.submit_async_build_job(
             tenant_id=tenant,
             incremental=req.incremental,
             validate_shacl=req.validate_shacl,
+        )
+
+    @app.get("/v1/jobs", response_model=list[SyncJobRecord])
+    async def list_jobs(
+        tenant_id: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+        principal: AuthPrincipal | None = Depends(get_principal),
+    ) -> list[SyncJobRecord]:
+        p = _unwrap_principal(principal)
+        if p is not None and not p.is_platform_admin:
+            tenant_id = enforcer.enforce_tenant(p, tenant_id or p.tenant_id or "")
+        return await svc.list_sync_jobs_async(
+            tenant_id=tenant_id, limit=max(1, min(limit, 200)), offset=max(0, offset)
         )
 
     @app.get("/v1/jobs/dlq", response_model=list[DLQFailedChunkRecord])
@@ -583,6 +648,91 @@ def create_kg_fabric_app(
             raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
         enforcer.enforce_tenant(p, job.tenant_id)
         return job
+
+    @app.post("/v1/jobs/{job_id}/cancel", response_model=SyncJobRecord)
+    async def cancel_job(
+        job_id: str,
+        principal: AuthPrincipal | None = Depends(get_principal),
+    ) -> SyncJobRecord:
+        p = _unwrap_principal(principal)
+        enforcer.require_role(p, "writer")
+        job = await svc.get_sync_job_async(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
+        enforcer.enforce_tenant(p, job.tenant_id)
+        cancelled = await svc.cancel_sync_job(job_id)
+        assert cancelled is not None
+        return cancelled
+
+    @app.get("/v1/kbs", response_model=list[VectorKBRegistration])
+    async def list_kbs(
+        tenant_id: str = "enterprise_default",
+        limit: int = 50,
+        offset: int = 0,
+        principal: AuthPrincipal | None = Depends(get_principal),
+    ) -> list[VectorKBRegistration]:
+        p = _unwrap_principal(principal)
+        tenant = enforcer.enforce_tenant(p, tenant_id)
+        return await svc.list_registered_kbs_paginated(
+            tenant_id=tenant, limit=max(1, min(limit, 200)), offset=max(0, offset)
+        )
+
+    @app.get("/v1/kbs/{kb_id}/documents")
+    async def list_kb_docs(
+        kb_id: str,
+        tenant_id: str = "enterprise_default",
+        limit: int = 50,
+        offset: int = 0,
+        principal: AuthPrincipal | None = Depends(get_principal),
+    ) -> list[dict[str, Any]]:
+        p = _unwrap_principal(principal)
+        tenant = enforcer.enforce_tenant(p, tenant_id)
+        return await svc.list_kb_documents(
+            tenant_id=tenant, kb_id=kb_id, limit=max(1, min(limit, 200)), offset=max(0, offset)
+        )
+
+    @app.get("/v1/entities/{entity_id}")
+    async def get_entity(
+        entity_id: str,
+        tenant_id: str = "enterprise_default",
+        principal: AuthPrincipal | None = Depends(get_principal),
+    ) -> dict[str, Any]:
+        p = _unwrap_principal(principal)
+        tenant = enforcer.enforce_tenant(p, tenant_id)
+        acls = enforcer.enforce_acl_groups(p, None)
+        details = await svc.get_entity_details(
+            tenant_id=tenant, entity_id=entity_id, caller_acl_groups=acls
+        )
+        if details is None:
+            raise HTTPException(status_code=404, detail=f"Entity not found: {entity_id}")
+        return details
+
+    @app.post("/v1/ontology/review")
+    async def review_ontology_concept(
+        req: OntologyConceptReviewRequest,
+        principal: AuthPrincipal | None = Depends(get_principal),
+    ) -> dict[str, Any]:
+        p = _unwrap_principal(principal)
+        enforcer.require_role(p, "admin")
+        req.tenant_id = enforcer.enforce_tenant(p, req.tenant_id)
+        try:
+            return await svc.review_ontology_concept(req)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/v1/ontology/audit", response_model=list[OntologyAuditEntry])
+    async def get_ontology_audit(
+        tenant_id: str = "enterprise_default",
+        limit: int = 100,
+        principal: AuthPrincipal | None = Depends(get_principal),
+    ) -> list[OntologyAuditEntry]:
+        p = _unwrap_principal(principal)
+        tenant = enforcer.enforce_tenant(p, tenant_id)
+        return await svc.get_ontology_audit_trail(
+            tenant_id=tenant, limit=max(1, min(limit, 500))
+        )
 
     @app.post("/v1/eval/run", response_model=EvalSuiteReport)
     async def run_eval(

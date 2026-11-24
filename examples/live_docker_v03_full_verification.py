@@ -67,6 +67,7 @@ async def _reset_live_stores(admin_dsn: str) -> None:
     conn = await asyncpg.connect(admin_dsn)
     try:
         for tbl in (
+            "kg_community_summaries",
             "kg_dlq_chunks",
             "kg_sync_jobs",
             "enterprise_tbox_registry",
@@ -657,7 +658,7 @@ async def main() -> None:
             )
             assert r_mcp_list.status_code == 200
             mcp_tools = r_mcp_list.json()["result"]["tools"]
-            assert len(mcp_tools) == 14
+            assert len(mcp_tools) == 15
 
             r_qual = await client.get(
                 "/v1/quality/report",
@@ -770,7 +771,7 @@ async def main() -> None:
             assert r_mcp_call.status_code == 200
             assert "aurora-helios-merger-db" not in json.dumps(r_mcp_call.json())
 
-            print("[5] Verified LIVE Uvicorn HTTP + JWT + Anti-Smuggling + ABAC + PPR + Leiden + Answerability + 14 MCP Tools")
+            print("[5] Verified LIVE Uvicorn HTTP + JWT + Anti-Smuggling + ABAC + PPR + Leiden + Answerability + 15 MCP Tools")
 
         # 7. Cold-Start Multi-Pod Restart Verification (Brand-New Service, Zero RAM Cache -> Live Postgres + Neo4j)
         pod2_pg = PostgresPgVectorStoreAdapter(dsn=app_dsn, embedding_provider=emb, canonical_dim=256)

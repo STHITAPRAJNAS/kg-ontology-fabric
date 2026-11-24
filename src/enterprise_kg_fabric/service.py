@@ -48,6 +48,8 @@ from .models import (
     KBWatermarkState,
     KGGraphBuildReport,
     KGQualityScorecardReport,
+    OntologyAuditEntry,
+    OntologyConceptReviewRequest,
     OntologyInductionReport,
     OntologyStatus,
     PPRSearchRequest,
@@ -74,6 +76,7 @@ from .vector_clustering import (
     FederatedEmbeddingModelRouter,
     SemanticFeatureHashEmbeddingProvider,
     cosine_similarity,
+    create_embedding_provider_from_env,
 )
 
 try:
@@ -119,9 +122,12 @@ class EnterpriseKGOntologyService:
         min_chunk_support_for_approval: int = 2,
         use_live_llm: bool = False,
         domain_pack: DomainRulePack | str | None = None,
+        llm_concurrency: int = 8,
+        answer_synthesizer: Any | None = None,
     ):
         self.canonical_dim = canonical_embedding_dim
         self.domain_pack = resolve_domain_pack(domain_pack)
+        self.llm_concurrency = max(1, int(llm_concurrency))
         self.embedding_provider = embedding_provider or SemanticFeatureHashEmbeddingProvider(
             default_dim=canonical_embedding_dim
         )
@@ -139,6 +145,10 @@ class EnterpriseKGOntologyService:
             canonical_embedding_dim=canonical_embedding_dim,
             pii_redactor=self.pii_redactor,
         )
+        self.kg_extractor = llm_extractor or StructuredLLMExtractorAdapter(
+            use_live_llm=use_live_llm,
+            fallback_extractor=LlamaIndexSchemaAndDynamicExtractor(),
+        )
         self.ontology_inducer = AutomatedOntologyInducer(
             embedding_provider=self.embedding_provider,
             centroids_per_kb=centroids_per_kb,
@@ -146,10 +156,7 @@ class EnterpriseKGOntologyService:
             min_kb_support_for_approval=min_kb_support_for_approval,
             min_chunk_support_for_approval=min_chunk_support_for_approval,
             domain_pack=self.domain_pack,
-        )
-        self.kg_extractor = llm_extractor or StructuredLLMExtractorAdapter(
-            use_live_llm=use_live_llm,
-            fallback_extractor=LlamaIndexSchemaAndDynamicExtractor(),
+            llm_extractor=self.kg_extractor,
         )
         self.entity_resolver = CrossKBEntityResolver(
             embedding_provider=self.embedding_provider,
@@ -167,11 +174,14 @@ class EnterpriseKGOntologyService:
             graph_analytics=self.graph_analytics,
             reranker=self.reranker,
             canonical_dim=canonical_embedding_dim,
+            llm_extractor=self.kg_extractor,
+            answer_synthesizer=answer_synthesizer,
         )
         self._tboxes: dict[str, EnterpriseCompiledTBox] = {}
         self._cumulative_sibling_collisions_prevented: dict[str, int] = {}
         self._pii_redaction_audit_counts: dict[str, int] = {}
         self._sync_jobs: dict[str, SyncJobRecord] = {}
+        self._active_job_tasks: dict[str, asyncio.Task[Any]] = {}
         self._dlq_records: list[DLQFailedChunkRecord] = []
         self._sync_worker_task: asyncio.Task[Any] | None = None
         self._sync_worker_lock = asyncio.Lock()
@@ -213,8 +223,9 @@ class EnterpriseKGOntologyService:
         optional live LLM extraction, and pluggable DomainRulePack from environment variables.
         """
         canonical_dim = int(os.getenv("KG_FABRIC_CANONICAL_DIM", "256"))
-        embedding_provider = SemanticFeatureHashEmbeddingProvider(default_dim=canonical_dim)
+        embedding_provider = create_embedding_provider_from_env(default_dim=canonical_dim)
         model_router = FederatedEmbeddingModelRouter(embedding_provider)
+        llm_concurrency = int(os.getenv("KG_FABRIC_LLM_CONCURRENCY", "8"))
 
         pii_mode_raw = os.getenv("PII_REDACTION_MODE", "replace_tag").strip().lower()
         try:
@@ -245,6 +256,7 @@ class EnterpriseKGOntologyService:
                 dsn=pg_dsn,
                 embedding_provider=embedding_provider,
                 canonical_dim=canonical_dim,
+                model_router=model_router,
             )
         else:
             vector_store = InMemoryPgVectorStoreEmulator(
@@ -303,11 +315,16 @@ class EnterpriseKGOntologyService:
             canonical_embedding_dim=canonical_dim,
             use_live_llm=use_live_llm,
             domain_pack=domain_pack_name,
+            llm_concurrency=llm_concurrency,
         )
 
     async def close(self) -> None:
-        """Gracefully stops background workers and closes database pools and graph drivers."""
+        """Gracefully stops background workers, active build tasks, database pools, and graph drivers."""
         await self.stop_sync_worker()
+        for task in list(self._active_job_tasks.values()):
+            if not task.done():
+                task.cancel()
+        self._active_job_tasks.clear()
         await self.vector_store.close()
         await self.graph_store.close()
 
@@ -469,6 +486,7 @@ class EnterpriseKGOntologyService:
             remaining_chunk_acls=remaining_acls,
         )
         await self.vector_store.delete_canonical_entity_embeddings(safe_tenant, deleted_ent_ids)
+        await self.vector_store.save_community_summaries(safe_tenant, [])
         return {
             "tenant_id": safe_tenant,
             "kb_id": kb_id,
@@ -489,6 +507,7 @@ class EnterpriseKGOntologyService:
             remaining_chunk_acls=remaining_acls,
         )
         await self.vector_store.delete_canonical_entity_embeddings(safe_tenant, deleted_ent_ids)
+        await self.vector_store.save_community_summaries(safe_tenant, [])
         return {
             "tenant_id": safe_tenant,
             "kb_id": kb_id,
@@ -559,8 +578,13 @@ class EnterpriseKGOntologyService:
             if target_ids is not None and kb.kb_id not in target_ids:
                 continue
             try:
+                cursor = (
+                    await self.vector_store.get_legacy_sync_cursor(kb.kb_id)
+                    if kb.column_mapping.updated_at_column
+                    else None
+                )
                 legacy_chunks = await self.vector_store.reverse_hydrate_from_legacy_pgvector_table(
-                    kb, enforce_allowlist=True
+                    kb, enforce_allowlist=True, since_updated_at=cursor
                 )
             except (PermissionError, Exception):
                 continue
@@ -575,6 +599,13 @@ class EnterpriseKGOntologyService:
             ]
             if delta_legacy:
                 hydrated_total += await self.hydrate_existing_kb_chunks(kb.kb_id, delta_legacy)
+            if kb.column_mapping.updated_at_column:
+                max_ts = max(
+                    (c.updated_at for c in legacy_chunks if c.updated_at),
+                    default=None,
+                )
+                if max_ts:
+                    await self.vector_store.set_legacy_sync_cursor(kb.kb_id, max_ts)
         return hydrated_total
 
     async def ingest_raw_documents(
@@ -716,6 +747,7 @@ class EnterpriseKGOntologyService:
             registered_kbs = await self.vector_store.list_registered_kbs(tenant_id=safe_tenant)
             total_chunks_inspected = 0
             delta_chunks_to_extract: list[VectorChunkRecord] = []
+            modified_chunk_ids: list[str] = []
 
             for kb in registered_kbs:
                 all_kb_chunks = await self.vector_store.fetch_kb_chunks(
@@ -730,33 +762,58 @@ class EnterpriseKGOntologyService:
                         tenant_id=safe_tenant,
                     )
                     delta_chunks_to_extract.extend(delta)
+                    # Any delta chunk that already had graph provenance (changed text or TBox rebuild)
+                    # MUST have its stale facts retracted before re-extraction!
+                    for chk in delta:
+                        modified_chunk_ids.append(chk.chunk_id)
                 else:
                     delta_chunks_to_extract.extend(all_kb_chunks)
+                    for chk in all_kb_chunks:
+                        modified_chunk_ids.append(chk.chunk_id)
 
             skipped_chunks = total_chunks_inspected - len(delta_chunks_to_extract)
 
-            # Extract entities and relation triples with per-chunk DLQ fault isolation
+            # Retract stale graph facts produced by modified/re-extracted chunks BEFORE re-extracting
+            # so editing a document ("A depends on B" -> "A depends on C") does not leave zombie facts!
+            if modified_chunk_ids:
+                remaining_acls = await self.vector_store.fetch_tenant_chunk_acl_map(safe_tenant)
+                for mid in modified_chunk_ids:
+                    remaining_acls.pop(mid, None)
+                retracted_ent_ids, _ = await self.graph_store.delete_chunks_provenance(
+                    tenant_id=safe_tenant,
+                    chunk_ids=modified_chunk_ids,
+                    remaining_chunk_acls=remaining_acls,
+                )
+                if retracted_ent_ids:
+                    await self.vector_store.delete_canonical_entity_embeddings(
+                        safe_tenant, retracted_ent_ids
+                    )
+
+            # Extract entities and relation triples concurrently (bounded semaphore) with per-chunk DLQ fault isolation
             extractions: list[ChunkExtractionResult] = []
             succeeded_chunks: list[VectorChunkRecord] = []
             raw_entity_mentions = 0
-            for chk in delta_chunks_to_extract:
-                try:
-                    res = self.kg_extractor.extract_from_chunk(
-                        chk, tbox=tbox, allow_dynamic_emergent=allow_dynamic_emergent
-                    )
-                    raw_entity_mentions += len(res.entities) + (2 * len(res.triples))
-                    extractions.append(res)
-                    succeeded_chunks.append(chk)
-                except Exception as exc:
+            batch_results = await self.kg_extractor.extract_batch_async(
+                chunks=delta_chunks_to_extract,
+                tbox=tbox,
+                max_concurrency=self.llm_concurrency,
+                allow_dynamic_emergent=allow_dynamic_emergent,
+            )
+            for chk, outcome in batch_results:
+                if isinstance(outcome, Exception):
                     dlq_rec = DLQFailedChunkRecord(
                         dlq_id=f"dlq_{uuid.uuid4().hex[:10]}",
                         tenant_id=safe_tenant,
                         kb_id=chk.kb_id,
                         chunk_id=chk.chunk_id,
-                        error_message=str(exc),
+                        error_message=str(outcome),
                     )
                     self._dlq_records.append(dlq_rec)
                     await self.vector_store.append_dlq_record(dlq_rec)
+                else:
+                    raw_entity_mentions += len(outcome.entities) + (2 * len(outcome.triples))
+                    extractions.append(outcome)
+                    succeeded_chunks.append(chk)
 
             existing_entities = await self.graph_store.get_all_entities(safe_tenant)
             (
@@ -805,6 +862,18 @@ class EnterpriseKGOntologyService:
                 await self.vector_store.mark_chunks_watermarked(watermarks)
 
             active_edges = await self.graph_store.get_all_edges(safe_tenant, active_only=True)
+
+            # Materialize & persist Leiden/Louvain community summaries at build time so
+            # Global Sensemaking queries run in O(C) without loading the whole graph per query!
+            if succeeded_chunks or not (await self.vector_store.load_community_summaries(safe_tenant)):
+                full_ents_after = await self.graph_store.get_all_entities(safe_tenant)
+                built_comms, _ = self.graph_analytics.detect_communities_and_summarize(
+                    tenant_id=safe_tenant,
+                    entities=full_ents_after,
+                    edges=active_edges,
+                    caller_acl_groups=None,
+                )
+                await self.vector_store.save_community_summaries(safe_tenant, built_comms)
 
             return KGGraphBuildReport(
                 tenant_id=safe_tenant,
@@ -861,6 +930,143 @@ class EnterpriseKGOntologyService:
         await self.vector_store.save_sync_job(job)
         return job
 
+    async def submit_async_build_job(
+        self,
+        tenant_id: str = "enterprise_default",
+        incremental: bool = True,
+        validate_shacl: bool = True,
+    ) -> SyncJobRecord:
+        """
+        Immediately queues a background graph build job (`QUEUED`), returns the `SyncJobRecord`
+        without blocking the HTTP request, and executes the build on an async worker task.
+        """
+        from .auth import reset_current_principal, set_current_principal
+
+        safe_tenant, _ = self._enforce_service_principal(tenant_id, required_role="writer")
+        caller_principal = get_current_principal()
+        job_id = f"job_{uuid.uuid4().hex[:12]}"
+        job = SyncJobRecord(
+            job_id=job_id,
+            tenant_id=safe_tenant,
+            status=SyncJobStatus.QUEUED,
+            incremental=incremental,
+        )
+        self._sync_jobs[job_id] = job
+        await self.vector_store.save_sync_job(job)
+
+        async def _worker() -> None:
+            tok = set_current_principal(caller_principal)
+            dlq_before = len(self._dlq_records)
+            try:
+                job.status = SyncJobStatus.RUNNING
+                await self.vector_store.save_sync_job(job)
+                report = await self.build_or_update_knowledge_graph(
+                    tenant_id=safe_tenant,
+                    incremental=incremental,
+                    validate_shacl=validate_shacl,
+                )
+                job.report = report
+                job.dlq_count = len(self._dlq_records) - dlq_before
+                job.status = SyncJobStatus.COMPLETED
+                job.completed_at = utc_now_iso()
+            except asyncio.CancelledError:
+                job.status = SyncJobStatus.CANCELLED
+                job.error = "Cancelled by user"
+                job.completed_at = utc_now_iso()
+                await self.vector_store.save_sync_job(job)
+                raise
+            except Exception as exc:
+                job.status = SyncJobStatus.FAILED
+                job.error = str(exc)
+                job.completed_at = utc_now_iso()
+            finally:
+                reset_current_principal(tok)
+                self._active_job_tasks.pop(job_id, None)
+            await self.vector_store.save_sync_job(job)
+
+        self._active_job_tasks[job_id] = asyncio.create_task(_worker())
+        return job
+
+    async def list_sync_jobs_async(
+        self,
+        tenant_id: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[SyncJobRecord]:
+        p = get_current_principal()
+        if p is not None and not p.is_platform_admin:
+            tenant_id = self._principal_enforcer.enforce_tenant(p, tenant_id or p.tenant_id or "")
+        persisted = await self.vector_store.list_sync_jobs(
+            tenant_id=tenant_id, limit=limit, offset=offset
+        )
+        if persisted:
+            return persisted
+        jobs = list(self._sync_jobs.values())
+        if tenant_id is not None:
+            jobs = [j for j in jobs if j.tenant_id == tenant_id]
+        jobs.sort(key=lambda j: j.created_at, reverse=True)
+        return jobs[offset : offset + limit]
+
+    async def cancel_sync_job(self, job_id: str) -> SyncJobRecord | None:
+        job = await self.get_sync_job_async(job_id)
+        if job is None:
+            return None
+        self._enforce_service_principal(job.tenant_id, required_role="writer")
+        task = self._active_job_tasks.get(job_id)
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        elif job.status in (SyncJobStatus.QUEUED, SyncJobStatus.RUNNING):
+            job.status = SyncJobStatus.CANCELLED
+            job.error = "Cancelled by user"
+            job.completed_at = utc_now_iso()
+            await self.vector_store.save_sync_job(job)
+        return job
+
+    async def list_registered_kbs_paginated(
+        self, tenant_id: str = "enterprise_default", limit: int = 50, offset: int = 0
+    ) -> list[VectorKBRegistration]:
+        safe_tenant, _ = self._enforce_service_principal(tenant_id, required_role="reader")
+        kbs = await self.vector_store.list_registered_kbs(tenant_id=safe_tenant)
+        return kbs[offset : offset + limit]
+
+    async def list_kb_documents(
+        self, tenant_id: str, kb_id: str, limit: int = 50, offset: int = 0
+    ) -> list[dict[str, Any]]:
+        safe_tenant, _ = self._enforce_service_principal(tenant_id, required_role="reader")
+        return await self.vector_store.list_kb_documents(
+            tenant_id=safe_tenant, kb_id=kb_id, limit=limit, offset=offset
+        )
+
+    async def get_entity_details(
+        self,
+        tenant_id: str,
+        entity_id: str,
+        caller_acl_groups: list[str] | None = None,
+    ) -> dict[str, Any] | None:
+        safe_tenant, safe_acls = self._enforce_service_principal(
+            tenant_id, caller_acl_groups, required_role="reader"
+        )
+        ent = await self.graph_store.get_entity_by_id(safe_tenant, entity_id)
+        if ent is None or not _is_acl_allowed(ent.acl_groups, safe_acls):
+            return None
+        facts, bridges = await self.graph_store.expand_k_hop_subgraph(
+            tenant_id=safe_tenant,
+            seed_entity_ids=[ent.entity_id],
+            max_hops=1,
+            include_quarantined=True,
+            caller_acl_groups=safe_acls,
+        )
+        return {
+            "entity": ent.model_dump(exclude={"embedding"}),
+            "is_cross_kb_bridge": len(ent.source_kb_ids) >= 2,
+            "connected_facts": [f.model_dump() for f in facts],
+            "cross_kb_bridge_entities": bridges,
+        }
+
     def get_sync_job(self, job_id: str) -> SyncJobRecord | None:
         return self._sync_jobs.get(job_id)
 
@@ -915,6 +1121,34 @@ class EnterpriseKGOntologyService:
             parts = tbox.version.split(".")
             if len(parts) == 3 and parts[1].isdigit():
                 tbox.version = f"{parts[0]}.{int(parts[1]) + 1}.0"
+            p_cur = get_current_principal()
+            actor = p_cur.subject if p_cur is not None else "local_admin"
+            for cname in promoted_classes:
+                tbox.audit_trail.append(
+                    OntologyAuditEntry(
+                        entry_id=f"aud_{uuid.uuid4().hex[:10]}",
+                        tenant_id=safe_tenant,
+                        action="APPROVE",
+                        concept_kind="CLASS",
+                        concept_name=cname,
+                        actor=actor,
+                        reason=f"Bulk confidence promotion (>= {min_confidence})",
+                        tbox_version=tbox.version,
+                    )
+                )
+            for pname in promoted_relations:
+                tbox.audit_trail.append(
+                    OntologyAuditEntry(
+                        entry_id=f"aud_{uuid.uuid4().hex[:10]}",
+                        tenant_id=safe_tenant,
+                        action="APPROVE",
+                        concept_kind="RELATION",
+                        concept_name=pname,
+                        actor=actor,
+                        reason=f"Bulk confidence promotion (>= {min_confidence})",
+                        tbox_version=tbox.version,
+                    )
+                )
             self._tboxes[safe_tenant] = tbox
             await self.vector_store.save_tbox(tbox)
             await self.graph_store.persist_ontology_tbox(tbox)
@@ -968,6 +1202,127 @@ class EnterpriseKGOntologyService:
         tbox = self.get_tbox(tenant_id)
         return OWLSHACLCompiler.export_turtle(tbox)
 
+    async def review_ontology_concept(
+        self, req: OntologyConceptReviewRequest
+    ) -> dict[str, Any]:
+        """
+        Per-concept ontology governance review: approve, reject, or merge a specific
+        TBox class or relation, propagate changes to Neo4j/Neptune, bump the TBox version,
+        and append an immutable `OntologyAuditEntry`.
+        """
+        safe_tenant, _ = self._enforce_service_principal(req.tenant_id, required_role="admin")
+        tbox = await self.load_or_get_tbox(safe_tenant)
+        kind = req.concept_kind.strip().upper()
+        action = req.action.strip().lower()
+        if kind not in {"CLASS", "RELATION"}:
+            raise ValueError("concept_kind must be 'CLASS' or 'RELATION'.")
+        if action not in {"approve", "reject", "merge"}:
+            raise ValueError("action must be 'approve', 'reject', or 'merge'.")
+
+        p_cur = get_current_principal()
+        actor = p_cur.subject if p_cur is not None else "local_admin"
+        graph_items_updated = 0
+
+        if kind == "CLASS":
+            if req.concept_name not in tbox.classes:
+                raise KeyError(f"Ontology class not found: {req.concept_name}")
+            src_cls = tbox.classes[req.concept_name]
+            if action == "approve":
+                src_cls.status = OntologyStatus.APPROVED
+                graph_items_updated = await self.graph_store.update_concept_governance_bucket(
+                    safe_tenant, "CLASS", req.concept_name, OntologyStatus.APPROVED
+                )
+            elif action == "reject":
+                src_cls.status = OntologyStatus.DEPRECATED
+                graph_items_updated = await self.graph_store.update_concept_governance_bucket(
+                    safe_tenant, "CLASS", req.concept_name, OntologyStatus.DEPRECATED
+                )
+            elif action == "merge":
+                if not req.target_name or req.target_name not in tbox.classes:
+                    raise ValueError(f"Valid target_name class required for merge: {req.target_name}")
+                if req.target_name == req.concept_name:
+                    raise ValueError("Cannot merge a class into itself.")
+                tgt_cls = tbox.classes[req.target_name]
+                for syn in [req.concept_name] + list(src_cls.synonyms):
+                    if syn != req.target_name and syn not in tgt_cls.synonyms:
+                        tgt_cls.synonyms.append(syn)
+                    norm = syn.strip().lower().replace(" ", "").replace("_", "").replace("-", "")
+                    tbox.class_alias_to_canonical[norm] = req.target_name
+                for kb in src_cls.source_kb_ids:
+                    if kb not in tgt_cls.source_kb_ids:
+                        tgt_cls.source_kb_ids.append(kb)
+                tgt_cls.support_chunk_count += src_cls.support_chunk_count
+                del tbox.classes[req.concept_name]
+                graph_items_updated = await self.graph_store.rename_concept_in_graph(
+                    safe_tenant, "CLASS", req.concept_name, req.target_name
+                )
+        else:
+            if req.concept_name not in tbox.relations:
+                raise KeyError(f"Ontology relation not found: {req.concept_name}")
+            src_rel = tbox.relations[req.concept_name]
+            if action == "approve":
+                src_rel.status = OntologyStatus.APPROVED
+                graph_items_updated = await self.graph_store.update_concept_governance_bucket(
+                    safe_tenant, "RELATION", req.concept_name, OntologyStatus.APPROVED
+                )
+            elif action == "reject":
+                src_rel.status = OntologyStatus.DEPRECATED
+                graph_items_updated = await self.graph_store.update_concept_governance_bucket(
+                    safe_tenant, "RELATION", req.concept_name, OntologyStatus.DEPRECATED
+                )
+            elif action == "merge":
+                if not req.target_name or req.target_name not in tbox.relations:
+                    raise ValueError(f"Valid target_name relation required for merge: {req.target_name}")
+                if req.target_name == req.concept_name:
+                    raise ValueError("Cannot merge a relation into itself.")
+                tgt_rel = tbox.relations[req.target_name]
+                for syn in [req.concept_name] + list(src_rel.synonyms):
+                    if syn != req.target_name and syn not in tgt_rel.synonyms:
+                        tgt_rel.synonyms.append(syn)
+                    norm = syn.strip().upper().replace(" ", "_").replace("-", "_")
+                    tbox.relation_alias_to_canonical[norm] = req.target_name
+                for kb in src_rel.source_kb_ids:
+                    if kb not in tgt_rel.source_kb_ids:
+                        tgt_rel.source_kb_ids.append(kb)
+                tgt_rel.support_chunk_count += src_rel.support_chunk_count
+                del tbox.relations[req.concept_name]
+                graph_items_updated = await self.graph_store.rename_concept_in_graph(
+                    safe_tenant, "RELATION", req.concept_name, req.target_name
+                )
+
+        parts = tbox.version.split(".")
+        if len(parts) == 3 and parts[1].isdigit():
+            tbox.version = f"{parts[0]}.{int(parts[1]) + 1}.0"
+        tbox.updated_at = utc_now_iso()
+        entry = OntologyAuditEntry(
+            entry_id=f"aud_{uuid.uuid4().hex[:10]}",
+            tenant_id=safe_tenant,
+            action=action.upper(),
+            concept_kind=kind,
+            concept_name=req.concept_name,
+            target_name=req.target_name,
+            actor=actor,
+            reason=req.reason,
+            tbox_version=tbox.version,
+        )
+        tbox.audit_trail.append(entry)
+        self._tboxes[safe_tenant] = tbox
+        await self.vector_store.save_tbox(tbox)
+        await self.graph_store.persist_ontology_tbox(tbox)
+        return {
+            "tenant_id": safe_tenant,
+            "new_tbox_version": tbox.version,
+            "graph_items_updated": graph_items_updated,
+            "audit_entry": entry.model_dump(),
+        }
+
+    async def get_ontology_audit_trail(
+        self, tenant_id: str = "enterprise_default", limit: int = 100
+    ) -> list[OntologyAuditEntry]:
+        safe_tenant, _ = self._enforce_service_principal(tenant_id, required_role="reader")
+        tbox = await self.load_or_get_tbox(safe_tenant)
+        return list(reversed(tbox.audit_trail))[:limit]
+
     async def query_graph_rag(self, request: GraphRAGQueryRequest) -> GraphRAGQueryResponse:
         with _otel_span("kg_fabric.query_graph_rag"):
             safe_tenant, safe_acls = self._enforce_service_principal(
@@ -993,7 +1348,13 @@ class EnterpriseKGOntologyService:
         )
         self._metrics["answerability_checks_total"] += 1
         tbox = await self.load_or_get_tbox(safe_tenant)
-        all_entities = await self.graph_store.get_all_entities(safe_tenant)
+        indexed_entities = await self.graph_store.search_entities_indexed(
+            tenant_id=safe_tenant,
+            query=request.query,
+            limit=25,
+            include_quarantined=False,
+            caller_acl_groups=safe_acls,
+        )
 
         q_lower = request.query.lower()
         stop_words = {
@@ -1015,11 +1376,7 @@ class EnterpriseKGOntologyService:
 
         matched_entities: list[str] = []
         covered_tokens: set[str] = set()
-        for ent in all_entities.values():
-            if ent.governance_bucket != OntologyStatus.APPROVED:
-                continue
-            if not _is_acl_allowed(ent.acl_groups, safe_acls):
-                continue
+        for ent in indexed_entities:
             names = [ent.canonical_name.lower()] + [a.lower() for a in ent.aliases]
             if any(n in q_lower for n in names if len(n) >= 3):
                 matched_entities.append(ent.canonical_name)
@@ -1111,35 +1468,86 @@ class EnterpriseKGOntologyService:
         )
         return self.reranker.rerank_chunks(request.query, chunks, top_k=request.top_k)
 
+    async def _resolve_seed_names_indexed(
+        self,
+        tenant_id: str,
+        seed_entities: Sequence[str],
+        include_quarantined: bool = True,
+        caller_acl_groups: Sequence[str] | None = None,
+    ) -> list[str]:
+        resolved_ids: list[str] = []
+        for seed in seed_entities:
+            s_clean = seed.strip()
+            if not s_clean:
+                continue
+            direct = await self.graph_store.get_entity_by_id(tenant_id, s_clean)
+            if direct is not None:
+                if direct.entity_id not in resolved_ids:
+                    resolved_ids.append(direct.entity_id)
+                continue
+            found = await self.graph_store.search_entities_indexed(
+                tenant_id=tenant_id,
+                query=s_clean,
+                limit=5,
+                include_quarantined=include_quarantined,
+                caller_acl_groups=caller_acl_groups,
+            )
+            for ent in found:
+                if ent.entity_id not in resolved_ids:
+                    resolved_ids.append(ent.entity_id)
+        return resolved_ids
+
     async def search_kg_entities(
         self, request: EntitySearchRequest
     ) -> list[EntitySearchMatch]:
         safe_tenant, safe_acls = self._enforce_service_principal(
             request.tenant_id, request.caller_acl_groups
         )
-        all_entities = await self.graph_store.get_all_entities(safe_tenant)
         q_lower = request.query.strip().lower()
         q_vec = self.embedding_provider.embed_text(request.query, dim=self.canonical_dim)
 
-        matches: list[EntitySearchMatch] = []
-        for ent in all_entities.values():
-            if not request.include_quarantined and ent.governance_bucket != OntologyStatus.APPROVED:
-                continue
-            if not _is_acl_allowed(ent.acl_groups, safe_acls):
-                continue
-            if (
-                request.ontology_class_filter
-                and ent.ontology_class.lower() != request.ontology_class_filter.lower()
-            ):
-                continue
+        # Combine indexed lexical graph lookup + pgvector HNSW canonical entity similarity (no full scan!)
+        candidates_by_id: dict[str, Any] = {}
+        lexical_hits = await self.graph_store.search_entities_indexed(
+            tenant_id=safe_tenant,
+            query=request.query,
+            ontology_class=request.ontology_class_filter,
+            limit=max(request.top_k * 2, 20),
+            include_quarantined=request.include_quarantined,
+            caller_acl_groups=safe_acls,
+        )
+        for ent in lexical_hits:
+            candidates_by_id[ent.entity_id] = ent
 
+        vec_hits = await self.vector_store.search_similar_entities(
+            tenant_id=safe_tenant,
+            query_embedding=q_vec,
+            top_k=max(request.top_k * 2, 16),
+        )
+        for sim_ent, _ in vec_hits:
+            if sim_ent.entity_id not in candidates_by_id:
+                full_ent = await self.graph_store.get_entity_by_id(safe_tenant, sim_ent.entity_id)
+                ent = full_ent or sim_ent
+                if not request.include_quarantined and ent.governance_bucket != OntologyStatus.APPROVED:
+                    continue
+                if not _is_acl_allowed(ent.acl_groups, safe_acls):
+                    continue
+                if (
+                    request.ontology_class_filter
+                    and ent.ontology_class.lower() != request.ontology_class_filter.lower()
+                ):
+                    continue
+                candidates_by_id[ent.entity_id] = ent
+
+        matches: list[EntitySearchMatch] = []
+        for ent in candidates_by_id.values():
             names = [ent.canonical_name] + list(ent.aliases)
             lexical_boost = 0.0
             for n in names:
                 nl = n.lower()
                 if nl == q_lower:
                     lexical_boost = max(lexical_boost, 1.0)
-                elif q_lower in nl or nl in q_lower:
+                elif q_lower and (q_lower in nl or nl in q_lower):
                     lexical_boost = max(lexical_boost, 0.75)
 
             ent_vec = ent.embedding or self.embedding_provider.embed_text(
@@ -1172,8 +1580,12 @@ class EnterpriseKGOntologyService:
         safe_tenant, safe_acls = self._enforce_service_principal(
             request.tenant_id, request.caller_acl_groups
         )
-        all_entities = await self.graph_store.get_all_entities(safe_tenant)
-        resolved_ids = self._resolve_seed_names_to_ids(all_entities, request.seed_entities)
+        resolved_ids = await self._resolve_seed_names_indexed(
+            tenant_id=safe_tenant,
+            seed_entities=request.seed_entities,
+            include_quarantined=request.include_quarantined,
+            caller_acl_groups=safe_acls,
+        )
 
         facts, bridges = await self.graph_store.expand_k_hop_subgraph(
             tenant_id=safe_tenant,
@@ -1195,20 +1607,29 @@ class EnterpriseKGOntologyService:
         )
 
     async def search_ppr_subgraph(self, request: PPRSearchRequest) -> PPRSearchResponse:
-        """HippoRAG 2 Personalized PageRank hub-damped subgraph retrieval."""
+        """HippoRAG 2 Personalized PageRank hub-damped retrieval over a bounded ego-subgraph (zero full-graph load)."""
         safe_tenant, safe_acls = self._enforce_service_principal(
             request.tenant_id, request.caller_acl_groups
         )
         self._metrics["ppr_searches_total"] += 1
-        all_entities = await self.graph_store.get_all_entities(safe_tenant)
-        all_edges = await self.graph_store.get_all_edges(
-            safe_tenant, active_only=(request.as_of_iso is None)
+        resolved_ids = await self._resolve_seed_names_indexed(
+            tenant_id=safe_tenant,
+            seed_entities=request.seed_entities,
+            include_quarantined=False,
+            caller_acl_groups=safe_acls,
         )
-        resolved_ids = self._resolve_seed_names_to_ids(all_entities, request.seed_entities)
+        ego_entities, ego_edges = await self.graph_store.fetch_ego_subgraph(
+            tenant_id=safe_tenant,
+            seed_entity_ids=resolved_ids,
+            max_hops=3,
+            include_quarantined=False,
+            as_of_iso=request.as_of_iso,
+            caller_acl_groups=safe_acls,
+        )
         return self.graph_analytics.search_ppr_subgraph(
             tenant_id=safe_tenant,
-            entities=all_entities,
-            edges=all_edges,
+            entities=ego_entities,
+            edges=ego_edges,
             seed_entity_ids=resolved_ids,
             top_k_facts=request.top_k_facts,
             alpha=request.alpha,
@@ -1219,20 +1640,37 @@ class EnterpriseKGOntologyService:
     async def query_global_communities(
         self, request: GlobalCommunitySearchRequest
     ) -> GlobalCommunitySearchResponse:
-        """Microsoft GraphRAG Leiden/Louvain Hierarchical Community Global Sensemaking."""
+        """Microsoft GraphRAG Leiden/Louvain Global Sensemaking backed by build-time persisted communities."""
         safe_tenant, safe_acls = self._enforce_service_principal(
             request.tenant_id, request.caller_acl_groups
         )
         self._metrics["global_searches_total"] += 1
+        persisted = await self.vector_store.load_community_summaries(safe_tenant)
+        if persisted:
+            return self.graph_analytics.query_persisted_communities(
+                tenant_id=safe_tenant,
+                query=request.query,
+                persisted_communities=persisted,
+                top_k_communities=request.top_k_communities,
+                caller_acl_groups=safe_acls,
+            )
         all_entities = await self.graph_store.get_all_entities(safe_tenant)
         all_edges = await self.graph_store.get_all_edges(safe_tenant, active_only=True)
-        return self.graph_analytics.query_global_communities(
+        built_comms, eng = self.graph_analytics.detect_communities_and_summarize(
             tenant_id=safe_tenant,
-            query=request.query,
             entities=all_entities,
             edges=all_edges,
+            caller_acl_groups=None,
+        )
+        if built_comms:
+            await self.vector_store.save_community_summaries(safe_tenant, built_comms)
+        return self.graph_analytics.query_persisted_communities(
+            tenant_id=safe_tenant,
+            query=request.query,
+            persisted_communities=built_comms,
             top_k_communities=request.top_k_communities,
             caller_acl_groups=safe_acls,
+            engine_used=eng,
         )
 
     async def run_eval_suite(
