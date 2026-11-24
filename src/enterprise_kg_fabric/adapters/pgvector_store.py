@@ -1856,7 +1856,13 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
         async with self._scoped_conn(tenant_id) as conn:
             rows = await conn.fetch(
                 """
-                WITH dense AS (
+                WITH q_ts AS (
+                    SELECT CASE
+                        WHEN plainto_tsquery('english', $3)::text = '' THEN plainto_tsquery('english', $3)
+                        ELSE replace(plainto_tsquery('english', $3)::text, ' & ', ' | ')::tsquery
+                    END AS tsq
+                ),
+                dense AS (
                     SELECT chunk_id, kb_id, domain_tag, doc_id, text, acl_groups, metadata,
                            ROW_NUMBER() OVER (ORDER BY canonical_embedding <=> $2::vector) AS dense_rank
                     FROM unified_rag_chunks
@@ -1868,15 +1874,17 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
                     LIMIT $4
                 ),
                 lexical AS (
-                    SELECT chunk_id, kb_id, domain_tag, doc_id, text, acl_groups, metadata,
-                           ROW_NUMBER() OVER (ORDER BY ts_rank_cd(tsv, plainto_tsquery('english', $3)) DESC) AS lex_rank
-                    FROM unified_rag_chunks
-                    WHERE tenant_id = $1
-                      AND ($5::text[] IS NULL OR kb_id = ANY($5::text[]))
-                      AND ($6::text[] IS NULL OR domain_tag = ANY($6::text[]))
-                      AND ($8::text[] IS NULL OR acl_groups ? 'public' OR acl_groups ?| $8::text[])
-                      AND tsv @@ plainto_tsquery('english', $3)
-                    ORDER BY ts_rank_cd(tsv, plainto_tsquery('english', $3)) DESC
+                    SELECT c.chunk_id, c.kb_id, c.domain_tag, c.doc_id, c.text, c.acl_groups, c.metadata,
+                           ROW_NUMBER() OVER (ORDER BY ts_rank_cd(c.tsv, q_ts.tsq) DESC) AS lex_rank
+                    FROM unified_rag_chunks c
+                    CROSS JOIN q_ts
+                    WHERE c.tenant_id = $1
+                      AND ($5::text[] IS NULL OR c.kb_id = ANY($5::text[]))
+                      AND ($6::text[] IS NULL OR c.domain_tag = ANY($6::text[]))
+                      AND ($8::text[] IS NULL OR c.acl_groups ? 'public' OR c.acl_groups ?| $8::text[])
+                      AND q_ts.tsq::text <> ''
+                      AND c.tsv @@ q_ts.tsq
+                    ORDER BY ts_rank_cd(c.tsv, q_ts.tsq) DESC
                     LIMIT $4
                 ),
                 fused AS (
@@ -1972,7 +1980,9 @@ class PostgresPgVectorStoreAdapter(PgVectorStorePort):
                                 allowed_patterns=self.allowed_legacy_tables,
                                 enforce_allowlist=True,
                             )
-                            native_q_vec = self.model_router.embed_query_for_kb(query_text, kb)
+                            native_q_vec = self.model_router.embed_query_for_model(
+                                query_text, kb.embedding_model_id, kb.embedding_dim
+                            )
                             n_vec_str = "[" + ",".join(f"{v:.6f}" for v in native_q_vec) + "]"
                             async with self._scoped_alias_conn(
                                 kb.postgres_dsn_alias, tenant_id

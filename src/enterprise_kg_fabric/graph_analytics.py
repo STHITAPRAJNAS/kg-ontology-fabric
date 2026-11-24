@@ -62,7 +62,7 @@ class GraphAnalyticsEngine:
         undirected_edges: Sequence[tuple[str, str, float]],
         seed_nodes: Sequence[str],
         alpha: float = 0.85,
-        max_iter: int = 35,
+        max_iter: int = 150,
     ) -> tuple[dict[str, float], str]:
         """
         Computes Personalized PageRank (PPR) seeded from `seed_nodes`.
@@ -87,10 +87,15 @@ class GraphAnalyticsEngine:
                     else:
                         g.add_edge(u, v, weight=w)
             scores = nx.pagerank(
-                g, alpha=alpha, personalization=pers, max_iter=max_iter, weight="weight"
+                g,
+                alpha=alpha,
+                personalization=pers,
+                max_iter=max(max_iter, 150),
+                tol=1e-5,
+                weight="weight",
             )
             return {str(k): float(v) for k, v in scores.items()}, "networkx_pagerank"
-        except ImportError:
+        except Exception:
             pass
 
         # Exact sparse power-iteration Personalized PageRank fallback

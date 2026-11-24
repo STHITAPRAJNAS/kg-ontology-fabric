@@ -88,6 +88,76 @@ class PropertyGraphStorePort(ABC):
         all_ents = await self.get_all_entities(tenant_id)
         return all_ents.get(entity_id)
 
+    _QUERY_STOPWORDS: frozenset[str] = frozenset(
+        {
+            "what",
+            "which",
+            "where",
+            "when",
+            "who",
+            "whom",
+            "whose",
+            "why",
+            "how",
+            "are",
+            "is",
+            "was",
+            "were",
+            "be",
+            "been",
+            "being",
+            "the",
+            "and",
+            "for",
+            "with",
+            "from",
+            "into",
+            "onto",
+            "that",
+            "this",
+            "these",
+            "those",
+            "connect",
+            "connected",
+            "connects",
+            "behind",
+            "between",
+            "across",
+            "about",
+            "does",
+            "did",
+            "can",
+            "could",
+            "should",
+            "would",
+            "have",
+            "has",
+            "had",
+            "to",
+            "in",
+            "on",
+            "of",
+            "by",
+            "at",
+            "or",
+            "as",
+            "an",
+            "all",
+            "any",
+        }
+    )
+
+    @classmethod
+    def _extract_entity_query_tokens(cls, q_low: str) -> list[str]:
+        raw = re.findall(r"[A-Za-z0-9][A-Za-z0-9._-]{1,}", q_low)
+        seen: list[str] = []
+        for tok in raw:
+            if len(tok) >= 3 and tok not in cls._QUERY_STOPWORDS and tok not in seen:
+                seen.append(tok)
+        # Prioritize compound identifiers (e.g. `payments-svc-01`, `cve-2026-4010`) first
+        seen.sort(key=lambda t: ("-" in t or "_" in t or any(ch.isdigit() for ch in t), len(t)), reverse=True)
+        return seen[:16]
+
     async def search_entities_indexed(
         self,
         tenant_id: str,
@@ -99,8 +169,8 @@ class PropertyGraphStorePort(ABC):
     ) -> list[KGEntityNode]:
         all_ents = await self.get_all_entities(tenant_id)
         q_low = query.strip().lower()
-        q_tokens = [t for t in re.findall(r"[A-Za-z0-9][A-Za-z0-9._-]{1,}", q_low) if len(t) >= 2]
-        out: list[KGEntityNode] = []
+        q_tokens = self._extract_entity_query_tokens(q_low)
+        scored: list[tuple[int, int, int, KGEntityNode]] = []
         for ent in all_ents.values():
             if not include_quarantined and ent.governance_bucket != OntologyStatus.APPROVED:
                 continue
@@ -108,14 +178,25 @@ class PropertyGraphStorePort(ABC):
                 continue
             if not InMemoryOpenCypherGraphEmulator._is_acl_allowed(ent.acl_groups, caller_acl_groups):
                 continue
-            names = [ent.canonical_name.lower()] + [a.lower() for a in ent.aliases]
-            if (
-                not q_low
-                or any(q_low in n or n in q_low for n in names)
-                or any(tok in n for tok in q_tokens for n in names)
-            ):
-                out.append(ent)
-        return out[:limit]
+            cname = ent.canonical_name.lower()
+            aliases = [a.lower() for a in ent.aliases]
+            names = [cname] + aliases
+            if not q_low:
+                tier = 1
+            elif cname == q_low or q_low in aliases:
+                tier = 5
+            elif len(cname) >= 3 and cname in q_low:
+                tier = 4
+            elif any(len(a) >= 3 and a in q_low for a in aliases) or q_low in cname:
+                tier = 3
+            else:
+                tok_hits = sum(1 for tok in q_tokens if any(tok in n for n in names))
+                if tok_hits == 0:
+                    continue
+                tier = min(2, tok_hits)
+            scored.append((tier, len(cname), ent.mention_count, ent))
+        scored.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+        return [item[3] for item in scored[:limit]]
 
     async def fetch_ego_subgraph(
         self,
@@ -1199,13 +1280,12 @@ class Neo4jOpenCypherGraphAdapter(PropertyGraphStorePort):
     ) -> list[KGEntityNode]:
         raw_q = query.strip()
         q_low = raw_q.lower()
-        q_tokens = [t for t in re.findall(r"[A-Za-z0-9][A-Za-z0-9._-]{1,}", q_low) if len(t) >= 2]
+        q_tokens = self._extract_entity_query_tokens(q_low)
         acl_low = [g.lower() for g in caller_acl_groups] if caller_acl_groups is not None else None
         driver = self._get_driver()
         async with driver.session() as session:
-            # ABAC filter is pushed directly into Cypher BEFORE `LIMIT` so restricted nodes
-            # can never crowd out accessible nodes! Uses Neo4j TEXT INDEX on canonical_name
-            # for exact/STARTS WITH/CONTAINS predicates.
+            # ABAC filter + match_tier ranking pushed directly into Cypher BEFORE `LIMIT` so
+            # neither restricted nodes nor noisy partial token hits can crowd out exact mentions!
             res = await session.run(
                 """
                 MATCH (n:Entity {tenant_id: $tenant_id})
@@ -1221,10 +1301,20 @@ class Neo4jOpenCypherGraphAdapter(PropertyGraphStorePort):
                         OR n.canonical_name STARTS WITH $raw_q
                         OR n.canonical_name CONTAINS $raw_q
                         OR toLower(n.canonical_name) CONTAINS $q
-                        OR $q CONTAINS toLower(n.canonical_name)
+                        OR (size(n.canonical_name) >= 3 AND $q CONTAINS toLower(n.canonical_name))
                         OR ANY(tok IN $tokens WHERE toLower(n.canonical_name) CONTAINS tok)
-                        OR ANY(a IN coalesce(n.aliases, []) WHERE toLower(a) CONTAINS $q OR $q CONTAINS toLower(a))
+                        OR ANY(a IN coalesce(n.aliases, []) WHERE size(a) >= 3 AND (toLower(a) CONTAINS $q OR $q CONTAINS toLower(a)))
                   )
+                WITH n,
+                     CASE
+                       WHEN toLower(n.canonical_name) = $q THEN 5
+                       WHEN size(n.canonical_name) >= 3 AND $q CONTAINS toLower(n.canonical_name) THEN 4
+                       WHEN ANY(a IN coalesce(n.aliases, []) WHERE size(a) >= 3 AND $q CONTAINS toLower(a))
+                            OR toLower(n.canonical_name) CONTAINS $q THEN 3
+                       ELSE size([tok IN $tokens WHERE toLower(n.canonical_name) CONTAINS tok])
+                     END AS match_tier
+                ORDER BY match_tier DESC, size(n.canonical_name) DESC, coalesce(n.mention_count, 1) DESC
+                LIMIT $lim
                 RETURN n.entity_id AS entity_id,
                        n.tenant_id AS tenant_id,
                        n.canonical_name AS canonical_name,
@@ -1238,7 +1328,6 @@ class Neo4jOpenCypherGraphAdapter(PropertyGraphStorePort):
                        coalesce(n.mention_count, 1) AS mention_count,
                        coalesce(n.confidence, 0.9) AS confidence,
                        coalesce(n.governance_bucket, 'APPROVED') AS governance_bucket
-                LIMIT $lim
                 """,
                 tenant_id=tenant_id,
                 include_q=include_quarantined,
@@ -1246,7 +1335,7 @@ class Neo4jOpenCypherGraphAdapter(PropertyGraphStorePort):
                 acls=acl_low,
                 raw_q=raw_q,
                 q=q_low,
-                tokens=q_tokens[:12],
+                tokens=q_tokens,
                 lim=limit,
             )
             rows = await res.data()
@@ -1464,11 +1553,9 @@ class Neo4jOpenCypherGraphAdapter(PropertyGraphStorePort):
         async with driver.session() as session:
             res = await session.run(
                 """
-                MATCH (n {tenant_id: $tenant_id})
-                WITH count(n) AS cnt
                 MATCH (m {tenant_id: $tenant_id})
                 DETACH DELETE m
-                RETURN cnt
+                RETURN count(m) AS cnt
                 """,
                 tenant_id=tenant_id,
             )
@@ -1974,11 +2061,9 @@ class NeptuneOpenCypherGraphAdapter(PropertyGraphStorePort):
     async def purge_tenant(self, tenant_id: str) -> int:
         res = await self._run_neptune_cypher(
             """
-            MATCH (n {tenant_id: $tenant_id})
-            WITH count(n) AS cnt
             MATCH (m {tenant_id: $tenant_id})
             DETACH DELETE m
-            RETURN cnt
+            RETURN count(m) AS cnt
             """,
             {"tenant_id": tenant_id},
         )

@@ -701,14 +701,17 @@ class KGFabricMcpServer:
 
 def create_fastmcp_server(service: EnterpriseKGOntologyService | None = None) -> Any:
     """
-    Creates an official `mcp.server.fastmcp.FastMCP` instance for `stdio` or `sse` transport
-    (compatible with Claude Desktop, Cursor, Windsurf, and Google Antigravity).
+    Creates an official MCP SDK server instance (`MCPServer` on `mcp>=2.0`, `FastMCP` on `mcp 1.x`)
+    for `stdio` or `sse` transport (compatible with Claude Desktop, Cursor, Windsurf, and Google Antigravity).
     """
-    from mcp.server.fastmcp import FastMCP
+    try:
+        from mcp.server.mcpserver import MCPServer as _MCPServerCls
+    except ImportError:
+        from mcp.server.fastmcp import FastMCP as _MCPServerCls  # type: ignore[no-redef]
 
     svc = service or EnterpriseKGOntologyService()
     mcp_engine = KGFabricMcpServer(svc)
-    fastmcp = FastMCP("enterprise-kg-ontology-fabric")
+    fastmcp = _MCPServerCls("enterprise-kg-ontology-fabric")
 
     @fastmcp.tool()
     async def query_hybrid_graph_rag(

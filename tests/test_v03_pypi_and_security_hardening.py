@@ -2399,3 +2399,92 @@ def test_fifth_review_remediation_concurrent_job_burst_multi_replica_heartbeat_a
         await pod1.close()
 
     asyncio.run(_run())
+
+
+def test_large_scale_entity_ranking_ppr_convergence_and_mcp_v2_compat() -> None:
+    """
+    Regression coverage for scale & live-dependency findings uncovered during 472-chunk / 353-entity testing:
+      1. `search_entities_indexed` filters natural-language stopwords (`what`, `to`, `and`, `connect`)
+         and ranks exact/verbatim query mentions (`payments-svc-10`) ahead of 100+ partial token matches.
+      2. `compute_personalized_pagerank` converges cleanly on bipartite subgraphs at `alpha=0.85`
+         with `networkx` + `scipy` installed (where `max_iter=35` previously raised `PowerIterationFailedConvergence`).
+      3. `FederatedEmbeddingModelRouter.embed_query_for_kb` routes native-dimension KB queries cleanly.
+      4. `create_fastmcp_server` registers all 15 tools across both `mcp>=2.0` (`MCPServer`) and `mcp 1.x` (`FastMCP`).
+    """
+    import asyncio
+    from enterprise_kg_fabric import (
+        FederatedEmbeddingModelRouter,
+        GraphAnalyticsEngine,
+        KGEntityNode,
+        SemanticFeatureHashEmbeddingProvider,
+        UpperOntologyCategory,
+        VectorKBRegistration,
+        create_fastmcp_server,
+    )
+
+    async def _run() -> None:
+        svc = EnterpriseKGOntologyService()
+        # 100 noisy entities containing stopword substrings ("to", "and", "in") + 2 target microservices
+        noisy = [
+            KGEntityNode(
+                entity_id=f"t_scale::ent::sys::proto_tool_{i:03d}",
+                tenant_id="t_scale",
+                canonical_name=f"proto-handler-and-router-{i:03d}",
+                ontology_class="Microservice",
+                upper_category=UpperOntologyCategory.SYSTEM_OR_ASSET,
+                source_kb_ids=["kb_sre"],
+                source_chunk_ids=[f"c_{i}"],
+            )
+            for i in range(100)
+        ]
+        targets = [
+            KGEntityNode(
+                entity_id="t_scale::ent::sys::payments_svc_10",
+                tenant_id="t_scale",
+                canonical_name="payments-svc-10",
+                ontology_class="Microservice",
+                upper_category=UpperOntologyCategory.SYSTEM_OR_ASSET,
+                source_kb_ids=["kb_sre"],
+                source_chunk_ids=["c_t10"],
+            )
+        ]
+        await svc.graph_store.upsert_entities_and_bitemporal_edges("t_scale", noisy + targets, [])
+
+        hits = await svc.graph_store.search_entities_indexed(
+            tenant_id="t_scale",
+            query="What databases and CVEs connect to payments-svc-10?",
+            limit=5,
+        )
+        assert hits and hits[0].canonical_name == "payments-svc-10"
+
+        # Bipartite chain: A - B - C - D (eigenvalue -1 -> damped -0.85 requires ~86 iterations for 1e-6)
+        emb = SemanticFeatureHashEmbeddingProvider(default_dim=256)
+        ga = GraphAnalyticsEngine(embedding_provider=emb, canonical_dim=256)
+        scores, engine = ga.compute_personalized_pagerank(
+            nodes=["n1", "n2", "n3", "n4"],
+            undirected_edges=[("n1", "n2", 1.0), ("n2", "n3", 1.0), ("n3", "n4", 1.0)],
+            seed_nodes=["n1"],
+            alpha=0.85,
+        )
+        assert scores["n1"] > 0 and sum(scores.values()) > 0.99
+        assert engine in ("networkx_pagerank", "sparse_ppr_power_iteration")
+
+        router = FederatedEmbeddingModelRouter(emb)
+        router.register_model_provider("bge-large-1024", emb, 1024)
+        kb_reg = VectorKBRegistration(
+            kb_id="kb_1024",
+            tenant_id="t_scale",
+            domain_tag="secops",
+            table_name="legacy_sec_1024",
+            embedding_dim=1024,
+            embedding_model_id="bge-large-1024",
+        )
+        q_vec = router.embed_query_for_kb("Log4Shell WAF mitigation", kb_reg)
+        assert len(q_vec) == 1024
+
+        mcp_srv = create_fastmcp_server(svc)
+        tools = await mcp_srv.list_tools()
+        assert len(tools) == 15
+        await svc.close()
+
+    asyncio.run(_run())

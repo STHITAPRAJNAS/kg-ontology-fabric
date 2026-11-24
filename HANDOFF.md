@@ -1,14 +1,16 @@
 # Session Handoff — `enterprise-kg-ontology-fabric`
 
-1. **Last Updated**: 2026-11-24 14:34 EST (`Windows`)
+1. **Last Updated**: 2026-11-24 17:08 EST (`Windows`)
 2. **Current Goal & Status**:
-   - Completed **ALL 5 External Red-Team Security & Concurrency Reviews (33 total findings)** AND **BOTH Feature Milestones (Milestones A & B)** on `v0.3.0` (no PyPI tag pushed yet).
-   - **`ruff check src tests` — 0 errors** (`All checks passed!`).
-   - **`23 / 23` pytest tests pass**, including `test_fifth_review_remediation_concurrent_job_burst_multi_replica_heartbeat_and_immediate_cancel`.
-3. **Recent Changes (Review #5 + Architecture Explorer)**:
-   - `enterprise-kg-ontology-fabric/docs/design_and_architecture.html` & `README.md`: Added self-contained interactive HTML Design & Architecture explorer (6-stage clickable pipeline inspector, SVG topology diagram, Adaptive 4-Path GraphRAG query router simulator, Multi-Tenant Security & Concurrency matrix, and storage/REST/15-MCP catalog).
-   - `enterprise-kg-ontology-fabric/src/enterprise_kg_fabric/models.py` & `adapters/pgvector_store.py`: Added `heartbeat_at` to `SyncJobRecord` and `kg_sync_jobs`, added PostgreSQL partial unique index `uq_kg_sync_jobs_active_tenant ON kg_sync_jobs (tenant_id) WHERE status IN ('QUEUED', 'RUNNING')`, and implemented atomic `try_enqueue_sync_job` + `is_job_heartbeat_stale`.
-   - `enterprise-kg-ontology-fabric/src/enterprise_kg_fabric/service.py`: Added `_job_submit_lock`, worker heartbeat lease refresh loop, heartbeat-based `_reconcile_orphaned_job` (preventing second replicas from mislabeling active jobs as `FAILED`), authoritative `vector_store`-first `get_sync_job_async`, and unconditional `CANCELLED` state transition in `cancel_sync_job` (fixing `0ms` post-submit cancel).
-   - `enterprise-kg-ontology-fabric/tests/test_v03_pypi_and_security_hardening.py` & `examples/live_docker_v03_full_verification.py`: Added 5x concurrent burst (`1x 202` + `4x 409`), multi-replica heartbeat & concurrency, immediate `0ms` cancel, and live persisted-community ACL checks.
+   - Completed **ALL 5 External Red-Team Security & Concurrency Reviews (33 total findings)**, **BOTH Feature Milestones (Milestones A & B)**, **Interactive HTML Architecture Explorer**, AND **Large-Scale Realistic All-Surface Live Benchmark** on `v0.3.0` (no PyPI tag pushed yet).
+   - **`ruff check src tests examples/live_docker_large_scale_all_surfaces_e2e.py` — 0 errors** (`All checks passed!`).
+   - **`24 / 24` pytest tests pass**, plus live large-scale benchmark (`examples/live_docker_large_scale_all_surfaces_e2e.py`) verified against PostgreSQL 16 `NOBYPASSRLS` (`kg_app_user`), Neo4j 5 `TEXT INDEX`, `sentence-transformers/all-MiniLM-L6-v2` real neural embeddings, 31 live Wikipedia articles (`235,744` chars / `242` legacy chunks across `384d`/`768d`/`1024d`/`1536d`) + `230` multi-tenant enterprise docs (`472` total chunks, `262` entities / `478` active edges / `93` cross-KB merges / `4,434` sibling collisions blocked in `t_global_enterprise`), live RS256 OIDC/JWKS server, 2 Uvicorn replicas (`10x` burst -> `[202, 409 x9]`), `88.26 (A-)` quality scorecard, `+26.25%` GraphRAG multi-hop recall lift (`95.0%` vs `68.75%` vector-only), and 15-tool HTTP + `stdio` MCP (`mcp` v2 `MCPServer` & v1 `FastMCP`).
+3. **Recent Changes (Large-Scale Verification & Scale Hardening)**:
+   - `enterprise-kg-ontology-fabric/examples/live_docker_large_scale_all_surfaces_e2e.py`: Added comprehensive 6-surface large-scale benchmark with real `all-MiniLM-L6-v2` embeddings, 31 live Wikipedia articles across 5 heterogeneous `pgvector` tables, 3 tenants, live RS256 JWKS server, 2 Uvicorn pods, 20-case eval suite, quality scorecard, and HTTP + `stdio` MCP.
+   - `enterprise-kg-ontology-fabric/src/enterprise_kg_fabric/adapters/graph_stores.py`: Added query stopword filtering + `match_tier` ranking (`ORDER BY match_tier DESC, size(canonical_name) DESC`) in `search_entities_indexed` (InMemory & Neo4j) so exact mentions are never crowded out at scale; simplified `purge_tenant` Cypher `RETURN count(m) AS cnt` for single-record aggregation.
+   - `enterprise-kg-ontology-fabric/src/enterprise_kg_fabric/adapters/pgvector_store.py` & `vector_clustering.py`: Fixed native-vector RRF fan-out call (`embed_query_for_model` + `embed_query_for_kb`) and upgraded `hybrid_search_chunks` lexical CTE to disjunctive `tsquery` ranked by `ts_rank_cd`.
+   - `enterprise-kg-ontology-fabric/src/enterprise_kg_fabric/graph_analytics.py`: Raised `compute_personalized_pagerank` `max_iter` to `150` (`tol=1e-5`) with clean fallback to sparse power iteration for bipartite subgraphs under `networkx` + `scipy`.
+   - `enterprise-kg-ontology-fabric/src/enterprise_kg_fabric/mcp_server.py`: Added seamless `mcp>=2.0` (`mcp.server.mcpserver.MCPServer`) and `mcp 1.x` (`FastMCP`) support in `create_fastmcp_server`.
+   - `enterprise-kg-ontology-fabric/tests/test_v03_pypi_and_security_hardening.py`: Added `test_large_scale_entity_ranking_ppr_convergence_and_mcp_v2_compat`.
 4. **Next Steps / Blockers**:
    - Push `git tag v0.3.0 && git push origin v0.3.0` for PyPI release whenever ready.

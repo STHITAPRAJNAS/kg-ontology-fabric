@@ -453,6 +453,13 @@ class FederatedEmbeddingModelRouter:
             return prov.embed_text(query_text, dim=dim)
         return self.default_provider.embed_text(query_text, dim=embedding_dim)
 
+    def embed_query_for_kb(self, query_text: str, kb: Any) -> list[float]:
+        return self.embed_query_for_model(
+            query_text,
+            str(getattr(kb, "embedding_model_id", "")),
+            int(getattr(kb, "embedding_dim", 256)),
+        )
+
     def embed_query_per_model_group(
         self,
         query_text: str,
